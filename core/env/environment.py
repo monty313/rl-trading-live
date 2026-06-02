@@ -159,11 +159,23 @@ class BatchedFTMOEnv:
         abs_i = int(self._abs_idx()[0].item())
         if not self._tf_indicators:
             return out
-        base_idx = self._raw_ohlcv.index[min(abs_i, len(self._raw_ohlcv) - 1)]
+        raw_i = min(abs_i, len(self._raw_ohlcv) - 1)
+        base_idx = self._raw_ohlcv.index[raw_i]
         for tf, df_ind in self._tf_indicators.items():
             pos = df_ind.index.searchsorted(base_idx, side="right") - 1
             pos = max(0, min(pos, len(df_ind) - 1))
             out[tf] = df_ind.iloc[pos].to_dict()
+
+        # ── one-time diagnostic on step 1 (remove after confirming gate fires) ──
+        if abs_i == int(self._start[0].item()) + 1:
+            r1 = out.get(1, {})
+            r2 = out.get(15, {})
+            print(
+                f"[gate-diag] bar={abs_i}  base_ts={base_idx}"
+                f"  1m cci30={r1.get('cci30','?'):.1f}  cci100={r1.get('cci100','?'):.1f}"
+                f"  15m cci30={r2.get('cci30','?'):.1f}  cci100={r2.get('cci100','?'):.1f}",
+                flush=True,
+            )
         return out
 
     # ── reset ──────────────────────────────────────────────────────────────────
