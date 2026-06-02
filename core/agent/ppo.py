@@ -111,7 +111,11 @@ class PPOAgent:
         self._fwd = self.net
         if bool(cfg.get("USE_TORCH_COMPILE", True)) and device.type == "cuda":
             try:
-                self._fwd = torch.compile(self.net, mode="reduce-overhead")
+                # mode="default" compiles without CUDA Graphs. "reduce-overhead"
+                # reuses the same memory buffer every forward pass, overwriting
+                # rollout buffer tensors mid-episode and crashing torch.stack()
+                # in update(). "default" still gives a significant A100 speedup.
+                self._fwd = torch.compile(self.net, mode="default")
             except Exception:                                  # pragma: no cover
                 self._fwd = self.net
 

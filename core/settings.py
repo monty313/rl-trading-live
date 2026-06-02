@@ -84,7 +84,9 @@ CFG = {
         "max_grad_norm": 0.5,
     },
 
-    # torch.compile / AMP toggles (auto-disabled on CPU)
+    # torch.compile / AMP toggles (auto-disabled on CPU).
+    # compile uses mode="default" — NOT "reduce-overhead" which uses CUDA Graphs
+    # and overwrites rollout buffer tensors, crashing torch.stack() in update().
     "USE_TORCH_COMPILE": True,
     "USE_AMP":           True,
 
