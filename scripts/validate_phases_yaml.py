@@ -23,8 +23,11 @@ import yaml  # noqa: E402
 
 from core.env import conditions_engine as CE  # noqa: E402
 
-REQUIRED_FIELDS = ["name", "order", "instruments", "entry_conditions", "max_episodes"]
+# Every phase needs these. A phase must ALSO define a gate via EITHER a named
+# mask (mask + mask_type) OR string entry_conditions OR be explicitly free.
+REQUIRED_FIELDS = ["name", "order", "instruments"]
 VALID_INSTRUMENTS = {"EURUSD", "GBPUSD", "XAUUSD", "US30"}
+VALID_MASK_TYPES = {"force_in_and_gate", "open_gate", "free"}
 
 
 def validate_phase(phase: dict) -> list:
@@ -48,13 +51,37 @@ def validate_phase(phase: dict) -> list:
                 f"'{inst}' to INSTRUMENT_DATA_FILES + VALID_INSTRUMENTS.\n"
                 f"**CONCLUSION**: Re-run validate_phases_yaml.py — phase should PASS."
             )
-    ec = phase.get("entry_conditions", {}) or {}
-    for side in ("buy", "sell"):
-        cond = ec.get(side, "any")
-        try:
-            CE.validate_condition(cond, name)
-        except CE.ConfigError as exc:
-            errors.append(str(exc))
+    # Gate validation: named mask OR string conditions OR free.
+    mask_name = phase.get("mask")
+    mask_type = phase.get("mask_type")
+    has_strings = "entry_conditions" in phase
+    if mask_name:
+        if mask_name not in CE.MASK_REGISTRY:
+            errors.append(
+                f"**ISSUE**: Phase '{name}' references unknown mask '{mask_name}'.\n"
+                f"**RULE**: mask must be one of {sorted(CE.MASK_REGISTRY)} or null.\n"
+                f"**APPLICATION**: fix 'mask:' in phases.yaml or add the function to "
+                f"conditions_engine.MASK_REGISTRY.\n**CONCLUSION**: re-run validator.")
+        if mask_type and mask_type not in VALID_MASK_TYPES:
+            errors.append(
+                f"**ISSUE**: Phase '{name}' has invalid mask_type '{mask_type}'.\n"
+                f"**RULE**: mask_type must be one of {sorted(VALID_MASK_TYPES)}.\n"
+                f"**APPLICATION**: fix 'mask_type:' in phases.yaml.\n"
+                f"**CONCLUSION**: re-run validator.")
+    elif has_strings:
+        ec = phase.get("entry_conditions", {}) or {}
+        for side in ("buy", "sell"):
+            try:
+                CE.validate_condition(ec.get(side, "any"), name)
+            except CE.ConfigError as exc:
+                errors.append(str(exc))
+    elif mask_type != "free":
+        errors.append(
+            f"**ISSUE**: Phase '{name}' defines no gate (no mask, no "
+            f"entry_conditions, and mask_type != free).\n"
+            f"**RULE**: a phase must declare a named mask, string entry_conditions, "
+            f"or mask_type: free.\n**APPLICATION**: add one of those to the phase.\n"
+            f"**CONCLUSION**: re-run validator.")
     return errors
 
 

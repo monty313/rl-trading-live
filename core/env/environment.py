@@ -27,8 +27,12 @@ from typing import Dict, Optional, Tuple
 import numpy as np
 import torch
 
+import pandas as pd
+
 from core.agent.action_space import NUM_ACTIONS, BUY, SELL, HOLD, decode
-from core.env.indicators import build_feature_matrix, NUM_FEATURES, COL, feature_row_dict
+from core.env.indicators import (build_feature_matrix, NUM_FEATURES, COL,
+                                 feature_row_dict, compute_indicators,
+                                 resample_ohlcv)
 from core.env import conditions_engine
 
 _NEG_INF = -1e9
@@ -66,6 +70,16 @@ class BatchedFTMOEnv:
         self.state_dim = self.lkbk * self.F + 6
         self._alloc_episode_tensors()
 
+        # ── Per-timeframe indicator rows for phase gating ────────────────────
+        # Phase masks gate on TF pairs (e.g. [1m,15m]). We precompute the full
+        # indicator DataFrame per gate timeframe from the raw 1m OHLCV so the
+        # conditions engine can read named columns per bar. Built lazily from
+        # the raw series passed in (or skipped when only a feature matrix exists).
+        self._tf_indicators: Dict[int, pd.DataFrame] = {}
+        self._raw_ohlcv = self._extract_raw_ohlcv(features)
+        if self._raw_ohlcv is not None:
+            self._build_tf_indicators()
+
     # ── helpers ──────────────────────────────────────────────────────────────
     def _ensure_feature_matrix(self, features) -> torch.Tensor:
         """Accept either a prebuilt (N,F) feature matrix or raw (N,5) OHLCV."""
@@ -93,6 +107,48 @@ class BatchedFTMOEnv:
 
     def _abs_idx(self) -> torch.Tensor:
         return (self._start + self._step_i).clamp(0, self.T - 1)
+
+    # ── multi-timeframe indicator support ────────────────────────────────────
+    def _extract_raw_ohlcv(self, features):
+        """Return a 1m OHLCV DataFrame from raw (N,>=5) input, or None if a
+        prebuilt feature matrix was passed (no raw OHLC available)."""
+        t = features if isinstance(features, torch.Tensor) else torch.as_tensor(
+            np.asarray(features, dtype=np.float32))
+        if t.ndim == 2 and t.shape[1] >= 5 and t.shape[1] != NUM_FEATURES:
+            arr = t[:, :5].detach().cpu().numpy()
+            idx = pd.date_range("2024-01-01", periods=arr.shape[0], freq="1min")
+            return pd.DataFrame(arr, columns=["open", "high", "low", "close",
+                                              "volume"], index=idx)
+        return None
+
+    def _build_tf_indicators(self):
+        """Precompute indicator DataFrames for every gate timeframe (1 + others).
+        Gate timeframes are read from the active phase; default to [1,15,30,60]."""
+        tfs = set([1])
+        gt = (self.phase or {}).get("gate_timeframes", []) or []
+        tfs.update(gt)
+        tfs.update([15, 30, 60])   # common gates; cheap on synthetic/test data
+        for tf in tfs:
+            try:
+                df_tf = resample_ohlcv(self._raw_ohlcv, tf)
+                if len(df_tf) > 0:
+                    self._tf_indicators[tf] = compute_indicators(df_tf)
+            except Exception:
+                pass
+
+    def _rows_by_tf(self) -> Dict[int, dict]:
+        """Return {tf_minutes: feature_row_dict} aligned to the current 1m bar.
+        For higher TFs, picks the most recent completed bar at/under current time."""
+        out = {}
+        abs_i = int(self._abs_idx()[0].item())
+        if not self._tf_indicators:
+            return out
+        base_idx = self._raw_ohlcv.index[min(abs_i, len(self._raw_ohlcv) - 1)]
+        for tf, df_ind in self._tf_indicators.items():
+            pos = df_ind.index.searchsorted(base_idx, side="right") - 1
+            pos = max(0, min(pos, len(df_ind) - 1))
+            out[tf] = df_ind.iloc[pos].to_dict()
+        return out
 
     # ── reset ──────────────────────────────────────────────────────────────────
     def reset(self) -> torch.Tensor:
@@ -138,18 +194,25 @@ class BatchedFTMOEnv:
 
     # ── action mask (RULE 12) ──────────────────────────────────────────────────
     def current_action_mask(self) -> torch.Tensor:
-        """
-        (B, NUM_ACTIONS) float mask for the current bar. Conditions are evaluated
-        on the leader batch item's features (all batch items share the same phase
-        and instrument, so they share the mask). 1.0 allowed, 0.0 masked.
-        """
-        abs_idx = self._abs_idx()
-        # use the first batch item's current bar for condition evaluation
-        row = self.features[abs_idx[0]]
-        feat_dict = feature_row_dict(row)
-        mask_1d = conditions_engine.compute_action_mask(
-            self.phase, feat_dict, self.device, self.num_actions)
+        """(B, NUM_ACTIONS) float mask for the current bar (see current_mask_and_force)."""
+        mask_1d, _ = self.current_mask_and_force()
         return mask_1d.unsqueeze(0).expand(self.B, -1).contiguous()
+
+    def current_mask_and_force(self) -> Tuple[torch.Tensor, bool]:
+        """
+        Returns (mask (NUM_ACTIONS,), must_enter). Uses per-TF indicator rows when
+        available (named phase masks); falls back to the compact feature row for
+        string-condition phases. must_enter=True (force entry) only for
+        force_in_and_gate when the gate holds and the agent is flat.
+        """
+        is_flat = bool((self._position[0] == 0).item())
+        rows = self._rows_by_tf()
+        if not rows:
+            # fallback: single compact row at TF=1 for string-condition phases
+            abs_idx = self._abs_idx()
+            rows = {1: feature_row_dict(self.features[abs_idx[0]])}
+        return conditions_engine.compute_action_mask(
+            self.phase, rows, self.device, self.num_actions, is_flat=is_flat)
 
     def apply_mask_to_q(self, q_values: torch.Tensor) -> torch.Tensor:
         """Add -1e9 to masked Q-values so argmax never selects them."""

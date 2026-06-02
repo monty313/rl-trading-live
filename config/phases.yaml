@@ -1,48 +1,90 @@
 # rl-trading-live/config/phases.yaml
 # ────────────────────────────────────────────────────────────────────────────
-# HOW TO ADD A NEW STRATEGY (NO PYTHON CODE REQUIRED):
-#   1. Add a new block to the "phases" list below.
-#   2. Set order: to any integer (phases run in ascending order).
-#   3. Set entry_conditions using variables from the VARIABLE_REGISTRY
-#      (defined in core/env/conditions_engine.py). Run:
-#         python scripts/validate_phases_yaml.py
-#      to verify your conditions before training.
-#   4. Set instruments to one or more of: [EURUSD, GBPUSD, XAUUSD, US30].
-#   5. Restart training (Colab CELL 6) — it resumes from your last checkpoint
-#      and begins the new phase automatically.
+# AUTHORITATIVE 8-phase curriculum (ported from REPO1 / training_config.yaml).
+# Each phase references a NAMED mask function in core/env/conditions_engine.py
+# (MASK_REGISTRY) plus a mask_type and the timeframes the gate evaluates on.
 #
-#   If you reference a variable the system does not recognize, the validator
-#   prints EXACT instructions (IRAC format) on what to add and where.
-#   Standard strategies need ZERO code changes.
+# mask_type semantics (HARD RULE 12 + REPO1 _eval_mask):
+#   force_in_and_gate : when the condition is TRUE the agent MUST be in a trade
+#                       (forced entry if flat; agent chooses direction + lot).
+#                       When FALSE, opening new trades is blocked.
+#   open_gate         : the condition GATES opening new trades only (never forces).
+#                       Existing positions may stay open; agent learns when to exit.
+#   free              : no masking — agent trades freely (Phase 7 / live_improve).
+#
+# HOW TO ADD A STRATEGY (no code for string conditions): add a phase that uses
+#   entry_conditions: {buy: "...", sell: "..."}  (validated against VARIABLE_REGISTRY)
+# OR reference an existing named mask via  mask: <name>.
+# Run: python scripts/validate_phases_yaml.py
 # ────────────────────────────────────────────────────────────────────────────
+
+advance_consecutive_pass_days: 5
+max_episodes_per_phase: 500
 
 phases:
 
-  - name: ftmo_baseline
-    order: 1
+  - name: phase0_cci_extreme
+    order: 0
+    mask: phase0_cci_extreme
+    mask_type: force_in_and_gate
+    gate_timeframes: [1, 15]
     instruments: [EURUSD]
-    entry_conditions:
-      buy:  "cci_14 < -100 and close > sma_20"
-      sell: "cci_14 > 100 and close < sma_20"
-    max_episodes: 500
-    advance_criteria:
-      consecutive_pass_days: 5
 
-  - name: breakout_momentum
+  - name: phase1_cci_align
+    order: 1
+    mask: phase1_cci_align
+    mask_type: open_gate           # gate entries only; agent learns exits
+    gate_timeframes: [1, 15]
+    instruments: [EURUSD]
+
+  - name: phase2_hilo_trend
     order: 2
-    instruments: [EURUSD, GBPUSD]
-    entry_conditions:
-      buy:  "close > rolling_high_20 and atr_14 > atr_14_ma"
-      sell: "close < rolling_low_20 and atr_14 > atr_14_ma"
-    max_episodes: 500
-    advance_criteria:
-      consecutive_pass_days: 5
+    mask: phase2_hilo_trend
+    mask_type: force_in_and_gate
+    gate_timeframes: [1, 30]
+    instruments: [EURUSD]
 
+  - name: phase3_hilo_counter
+    order: 3
+    mask: phase3_hilo_counter
+    mask_type: force_in_and_gate
+    gate_timeframes: [1, 15]
+    instruments: [EURUSD]
+
+  - name: phase4_bb_position
+    order: 4
+    mask: phase4_bb_position
+    mask_type: force_in_and_gate
+    gate_timeframes: [1, 15]
+    instruments: [EURUSD]
+
+  - name: phase5_sma_stack
+    order: 5
+    mask: phase5_sma_stack
+    mask_type: force_in_and_gate
+    gate_timeframes: [1, 60]
+    instruments: [EURUSD]
+
+  - name: phase6_atr_expansion
+    order: 6
+    mask: phase6_atr_expansion
+    mask_type: force_in_and_gate
+    gate_timeframes: [1, 60]
+    instruments: [EURUSD]
+
+  - name: phase7_full_ftmo
+    order: 7
+    mask: null
+    mask_type: free
+    gate_timeframes: []
+    instruments: [EURUSD, GBPUSD, XAUUSD, US30]
+
+  # Infinite continuation after the curriculum completes (free trading).
   - name: live_improve
     order: 999
+    mask: null
+    mask_type: free
+    gate_timeframes: []
     instruments: [EURUSD, GBPUSD, XAUUSD, US30]
-    entry_conditions:
-      buy:  "any"
-      sell: "any"
-    max_episodes: -1          # -1 = infinite; runs forever until manually stopped
-    advance_criteria: null    # never advances
+    max_episodes: -1          # -1 = infinite; runs until manually stopped
+    advance_criteria: null

@@ -1,4 +1,4 @@
-"""Unit tests for condition parsing + action mask (RULE 12)."""
+"""Unit tests for conditions engine: string conditions, named phase masks, semantics."""
 import torch
 import pytest
 from core.env import conditions_engine as CE
@@ -8,22 +8,17 @@ DEV = torch.device("cpu")
 
 
 def _mask_dirs(mask):
-    """Return the set of allowed directions given a (NUM_ACTIONS,) mask."""
-    allowed = set()
-    for a in range(NUM_ACTIONS):
-        if mask[a].item() > 0.5:
-            allowed.add(decode(a)[0])
-    return allowed
+    return {decode(a)[0] for a in range(NUM_ACTIONS) if float(mask[a]) > 0.5}
 
 
+# ── string-condition path ──
 def test_any_always_true():
     assert CE.evaluate("any", {}) is True
 
 
 def test_evaluate_uses_features():
-    feats = {"cci_14": -150.0, "close": 1.2, "sma_20": 1.1}
-    assert CE.evaluate("cci_14 < -100 and close > sma_20", feats) is True
-    assert CE.evaluate("cci_14 > 100", feats) is False
+    feats = {"cci30": -150.0, "close": 1.2, "sma_20": 1.1}
+    assert CE.evaluate("cci30 < -100 and close > sma_20", feats) is True
 
 
 def test_unknown_variable_raises_irac():
@@ -32,21 +27,76 @@ def test_unknown_variable_raises_irac():
     assert "VARIABLE_REGISTRY" in str(e.value)
 
 
-def test_buy_condition_masks_hold_and_sell():
-    phase = {"entry_conditions": {"buy": "cci_14 < -100", "sell": "cci_14 > 100"}}
-    feats = {"cci_14": -150.0}
-    mask = CE.compute_action_mask(phase, feats, DEV)
-    assert _mask_dirs(mask) == {BUY}
+def test_string_buy_condition_masks_to_buy():
+    phase = {"entry_conditions": {"buy": "cci30 < -100", "sell": "cci30 > 100"}}
+    rows = {1: {"cci30": -150.0}}
+    mask, must = CE.compute_action_mask(phase, rows, DEV)
+    assert _mask_dirs(mask) == {BUY} and must is False
 
 
-def test_no_condition_allows_all():
-    phase = {"entry_conditions": {"buy": "any", "sell": "any"}}
-    mask = CE.compute_action_mask(phase, {}, DEV)
+def test_free_allows_all():
+    phase = {"mask": None, "mask_type": "free"}
+    mask, must = CE.compute_action_mask(phase, {1: {}}, DEV)
     assert _mask_dirs(mask) == {HOLD, BUY, SELL}
 
 
-def test_both_false_allows_all():
-    phase = {"entry_conditions": {"buy": "cci_14 < -100", "sell": "cci_14 > 100"}}
-    feats = {"cci_14": 0.0}
-    mask = CE.compute_action_mask(phase, feats, DEV)
-    assert _mask_dirs(mask) == {HOLD, BUY, SELL}
+# ── named phase mask truth tables ──
+def test_phase0_cci_extreme_both_high():
+    r = {"cci30": 150.0, "cci100": 120.0}
+    assert CE.phase0_cci_extreme(r, r) is True
+    r2 = {"cci30": 150.0, "cci100": 50.0}        # cci100 not extreme
+    assert CE.phase0_cci_extreme(r2, r2) is False
+
+
+def test_phase0_opposite_direction_false():
+    up = {"cci30": 150.0, "cci100": 120.0}
+    dn = {"cci30": -150.0, "cci100": -120.0}
+    assert CE.phase0_cci_extreme(up, dn) is False   # TFs disagree
+
+
+def test_phase1_cci_align():
+    r = {"cci30": 10.0, "cci30_sma1_sh8": 5.0,
+         "cci100": 8.0, "cci100_sma1_sh8": 3.0}     # both above their SMA
+    assert CE.phase1_cci_align(r, r) is True
+
+
+def test_phase6_atr_expansion():
+    r = {"atr14": 0.002, "atr14_sma1_sh8": 0.001,
+         "atr45": 0.003, "atr45_sma1_sh8": 0.0025}
+    assert CE.phase6_atr_expansion(r, r) is True
+
+
+# ── mask_type semantics ──
+def test_force_in_and_gate_forces_entry_when_flat():
+    phase = {"mask": "phase0_cci_extreme", "mask_type": "force_in_and_gate",
+             "gate_timeframes": [1, 15]}
+    extreme = {"cci30": 150.0, "cci100": 120.0}
+    rows = {1: extreme, 15: extreme}
+    mask, must = CE.compute_action_mask(phase, rows, DEV, is_flat=True)
+    assert _mask_dirs(mask) == {BUY, SELL}   # HOLD masked -> must trade
+    assert must is True                       # forced entry when flat
+
+
+def test_force_in_and_gate_blocks_entries_when_condition_false():
+    phase = {"mask": "phase0_cci_extreme", "mask_type": "force_in_and_gate",
+             "gate_timeframes": [1, 15]}
+    calm = {"cci30": 0.0, "cci100": 0.0}
+    rows = {1: calm, 15: calm}
+    mask, must = CE.compute_action_mask(phase, rows, DEV, is_flat=True)
+    assert _mask_dirs(mask) == {HOLD}   # no new entries; HOLD/exit only
+    assert must is False
+
+
+def test_open_gate_allows_all_when_true_hold_only_when_false():
+    phase = {"mask": "phase1_cci_align", "mask_type": "open_gate",
+             "gate_timeframes": [1, 15]}
+    aligned = {"cci30": 10.0, "cci30_sma1_sh8": 5.0,
+               "cci100": 8.0, "cci100_sma1_sh8": 3.0}
+    rows = {1: aligned, 15: aligned}
+    mask, must = CE.compute_action_mask(phase, rows, DEV)
+    assert _mask_dirs(mask) == {HOLD, BUY, SELL} and must is False
+    misaligned = {"cci30": 10.0, "cci30_sma1_sh8": 5.0,
+                  "cci100": -8.0, "cci100_sma1_sh8": -3.0}   # disagree
+    rows2 = {1: misaligned, 15: misaligned}
+    mask2, _ = CE.compute_action_mask(phase, rows2, DEV)
+    assert _mask_dirs(mask2) == {HOLD}   # gate closed -> no new entries

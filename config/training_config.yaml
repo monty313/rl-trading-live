@@ -1,0 +1,155 @@
+# rl-trading-live/config/training_config.yaml
+# AUTHORITATIVE training config — ported from REPO1 (gpu_rl_trading curriculum).
+# This file defines the canonical 8-phase curriculum (phase0..phase7), reward
+# weights, FTMO profile, symbols + csv_map, and DQN hyperparameters.
+# NOTE: CCI(300) and CCI(900) are intentionally NOT computed (too slow on 1m).
+
+
+# ── Symbols to train on ────────────────────────────────────────────────────────
+symbols:
+  - EURUSD
+  - GBPUSD
+  - XAUUSD
+  - US30
+
+# ── CSV file map ───────────────────────────────────────────────────────────────
+csv_map:
+  EURUSD: "EURUSD_M1_202101131130_202605270000_2020_2026.csv"
+  GBPUSD: "GBPUSD_M1_202101131952_202605270000.csv"
+  XAUUSD: "XAUUSD_M1_202009230753_202605262259.csv"
+  US30:   "US30_M1_202007231046_202605262359.csv"
+
+# Optional explicit folder to search first (leave null to use project root)
+data_dir: null
+
+# ── Date splits ────────────────────────────────────────────────────────────────
+dates:
+  train_start: "2021-02-01"
+  train_end:   "2024-06-30"
+  val_start:   "2024-07-01"
+  val_end:     "2025-03-31"
+  fwd_start:   "2025-04-01"
+  fwd_end:     null
+
+# ── FTMO profile ───────────────────────────────────────────────────────────────
+TRADING_MODE: "ftmo"
+FTMO:
+  daily_profit_target_pct: 0.025
+  daily_max_drawdown_pct:  0.010
+  training_mode: true
+  position_scale_factor: 0.33
+
+# ── Reward weights ─────────────────────────────────────────────────────────────
+REWARD:
+  pass_day_bonus:        2.0
+  ok_day_bonus:          0.5
+  fail_day_penalty:      -2.0
+  streak_scale:          0.1
+  low_dd_threshold:      0.005
+  low_dd_bonus:          0.3
+  sharpe_bonus_enabled:  false
+  sharpe_bonus_scale:    0.1
+  sharpe_ath_bonus:      0.2
+
+# ── Kill switches ───────────────────────────────────────────────────────────────
+KILL_THRESHOLDS:
+  equity_dd_pct:          5.0
+  consecutive_losses:     5
+  daily_loss_pct:         3.0
+
+# ── Alert webhook ───────────────────────────────────────────────────────────────
+ALERTS:
+  webhook_url: null
+  log_to_file: true
+
+# ── DQN hyper-parameters ──────────────────────────────────────────────────────
+RL:
+  LKBK:            20
+  HIDDEN_MULT:     2
+  ACTIVATION_FUN:  relu
+  LEARNING_RATE:   0.0005
+  LOSS_FUNCTION:   mse
+  MAX_MEM:         50000
+  DISCOUNT_RATE:   0.95
+  EPSILON:         0.9
+  EPS_MIN:         0.05
+  BATCH_SIZE:      64
+  UPDATE_QR:       true
+  PRELOAD:         false
+  TEST_MODE:       false
+  TRAIN_EVERY:     4
+  compute_heavy_indicators: false
+  CHECKPOINT_EVERY: 10          # save model weights every N episodes
+  RESUME_FROM_CHECKPOINT: false # set true to load latest checkpoint on start
+
+# ── Action / risk ──────────────────────────────────────────────────────────────
+ACTIONS:
+  num_actions: 7
+  risk_fractions:
+    small: 0.005
+    med:   0.010
+    large: 0.020
+
+# ── Curriculum ─────────────────────────────────────────────────────────────────
+CURRICULUM:
+  advance_consecutive_pass_days: 5
+  max_episodes_per_phase: 500
+  max_episode_steps: 5000
+  max_trades_per_day: 800
+
+  phases:
+    - id: 0
+      name: "CCI Extreme Gate"
+      mask: "phase0_cci_extreme"
+      mask_type: "force_in_and_gate"
+      tfs: [1, 15]
+
+    - id: 1
+      name: "CCI Directional Alignment"
+      mask: "phase1_cci_align"
+      mask_type: "open_gate"
+      tfs: [1, 15]
+
+    - id: 2
+      name: "Lagged High/Low SMA - Trend"
+      mask: "phase2_hilo_trend"
+      mask_type: "force_in_and_gate"
+      tfs: [1, 30]
+
+    - id: 3
+      name: "Lagged High/Low SMA - Counter TF"
+      mask: "phase3_hilo_counter"
+      mask_type: "force_in_and_gate"
+      tfs: [1, 15]
+
+    - id: 4
+      name: "Bollinger Band Position"
+      mask: "phase4_bb_position"
+      mask_type: "force_in_and_gate"
+      tfs: [1, 15]
+
+    - id: 5
+      name: "SMA Stack Alignment"
+      mask: "phase5_sma_stack"
+      mask_type: "force_in_and_gate"
+      tfs: [1, 60]
+
+    - id: 6
+      name: "ATR Expansion"
+      mask: "phase6_atr_expansion"
+      mask_type: "force_in_and_gate"
+      tfs: [1, 60]
+
+    - id: 7
+      name: "Full FTMO - No Mask"
+      mask: null
+      mask_type: "free"
+      tfs: []
+
+# ── Output paths ───────────────────────────────────────────────────────────────
+PATHS:
+  weights_dir:    "checkpoints"
+  trade_logs_dir: "trade_logs"
+  shap_logs_dir:  "shap_logs"
+  data_cache_dir: "data_cache"
+  metrics_file:   "outputs/metrics.csv"

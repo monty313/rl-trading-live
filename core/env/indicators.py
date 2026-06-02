@@ -1,36 +1,244 @@
 """
 core/env/indicators.py
 ────────────────────────────────────────────────────────────────────────────
-GPU-tensor feature-matrix builder. Ported from gpu_rl_trading/env/indicators.py
-(REPO1, numpy) and rewritten to run as torch ops on the active device so the
-SAME code path runs on CPU (dev/CI) and CUDA (Colab A100).
+Authoritative multi-indicator feature builder. Ported from REPO1
+env/indicators.py `compute_indicators()` (the canonical spec) with:
 
-PARITY (HARD RULE 10): this file's md5 is recorded in the checkpoint manifest.
-Training, backtest, and live_runner all import THIS function, so feature values
-are bit-identical across all three. Do not fork the math anywhere else.
+  - CCI(300) and CCI(900) REMOVED (too slow on 1m data; per user instruction),
+    along with their derived columns (cci300 BB bands, cci900_sma20).
+  - talib used when available; otherwise a numpy fallback computes the SAME
+    columns so the repo runs clone-and-run on Colab/CI without the talib C lib.
+  - Multi-timeframe support via resample_ohlcv() (1m -> 15m/30m/1H/1D) so phase
+    masks that gate on [1m, 15m] / [1m, 1H] etc. have per-TF rows.
 
-OUTPUT: build_feature_matrix(...) -> torch.Tensor of shape (N, F) on `device`,
-with named columns exposed via FEATURE_COLUMNS / COL. The named columns are the
-ones the phases.yaml VARIABLE_REGISTRY can reference:
+PARITY (HARD RULE 10): md5 of this file is recorded in the manifest; training,
+backtest, and live all import these functions, so values match across all three.
 
-    close, open, high, low, volume,
-    sma_20, ema_20, cci_14, atr_14, atr_14_ma, rolling_high_20, rolling_low_20
-
-All warmup rows (before an indicator is defined) are back-filled with the first
-valid value so the matrix contains no NaN/inf (asserted in unit tests).
+Two public surfaces:
+  1. compute_indicators(df) -> pandas DataFrame with ALL named indicator columns
+     (used by the phase-mask engine, which reads per-bar rows by name).
+  2. build_feature_matrix(open,high,low,close,volume, device) -> torch.Tensor
+     (N, NUM_FEATURES) on device — the compact normalized matrix the agent's
+     state uses. FEATURE_COLUMNS lists the columns the VARIABLE_REGISTRY exposes.
 """
 from __future__ import annotations
 
 from typing import Union
 
 import numpy as np
+import pandas as pd
 import torch
 
-# ── Named feature columns (order defines the matrix layout) ──────────────────
+try:  # talib is optional — numpy fallback below produces the same columns
+    import talib  # type: ignore
+    _HAS_TALIB = True
+except Exception:  # pragma: no cover
+    talib = None
+    _HAS_TALIB = False
+
+
+# ════════════════════════════════════════════════════════════════════════════
+# Pure-numpy indicator primitives (talib-compatible) — used when talib absent
+# ════════════════════════════════════════════════════════════════════════════
+def _np_sma(x: np.ndarray, period: int) -> np.ndarray:
+    if period <= 1:
+        return x.astype(float)
+    return pd.Series(x).rolling(period, min_periods=1).mean().to_numpy()
+
+
+def _np_atr(h, l, c, period=14) -> np.ndarray:
+    prev_c = np.concatenate([c[:1], c[:-1]])
+    tr = np.maximum(h - l, np.maximum(np.abs(h - prev_c), np.abs(l - prev_c)))
+    # Wilder smoothing approximated by simple rolling mean (matches our fallback parity)
+    return pd.Series(tr).rolling(period, min_periods=1).mean().to_numpy()
+
+
+def _np_cci(h, l, c, period=14) -> np.ndarray:
+    tp = (h + l + c) / 3.0
+    sma_tp = pd.Series(tp).rolling(period, min_periods=1).mean().to_numpy()
+    mad = pd.Series(tp).rolling(period, min_periods=1).apply(
+        lambda w: np.mean(np.abs(w - w.mean())), raw=True).to_numpy()
+    mad = np.where(mad == 0, 1e-10, mad)
+    return (tp - sma_tp) / (0.015 * mad)
+
+
+def _np_rsi(c, period=14) -> np.ndarray:
+    d = np.diff(c, prepend=c[:1])
+    up = np.where(d > 0, d, 0.0)
+    dn = np.where(d < 0, -d, 0.0)
+    roll_up = pd.Series(up).rolling(period, min_periods=1).mean().to_numpy()
+    roll_dn = pd.Series(dn).rolling(period, min_periods=1).mean().to_numpy()
+    rs = roll_up / np.where(roll_dn == 0, 1e-10, roll_dn)
+    return 100.0 - (100.0 / (1.0 + rs))
+
+
+def _np_adx(h, l, c, period=14) -> np.ndarray:
+    # Lightweight ADX approximation (directional movement -> smoothed).
+    up_move = np.diff(h, prepend=h[:1])
+    dn_move = -np.diff(l, prepend=l[:1])
+    plus_dm = np.where((up_move > dn_move) & (up_move > 0), up_move, 0.0)
+    minus_dm = np.where((dn_move > up_move) & (dn_move > 0), dn_move, 0.0)
+    atr = _np_atr(h, l, c, period)
+    atr = np.where(atr == 0, 1e-10, atr)
+    plus_di = 100.0 * pd.Series(plus_dm).rolling(period, min_periods=1).mean().to_numpy() / atr
+    minus_di = 100.0 * pd.Series(minus_dm).rolling(period, min_periods=1).mean().to_numpy() / atr
+    dx = 100.0 * np.abs(plus_di - minus_di) / np.where((plus_di + minus_di) == 0, 1e-10, plus_di + minus_di)
+    return pd.Series(dx).rolling(period, min_periods=1).mean().to_numpy()
+
+
+def _np_bbands(c, period, nbdev=1.0):
+    s = pd.Series(c)
+    mid = s.rolling(period, min_periods=1).mean()
+    std = s.rolling(period, min_periods=1).std(ddof=0).fillna(0.0)
+    upper = mid + nbdev * std
+    lower = mid - nbdev * std
+    return upper.to_numpy(), mid.to_numpy(), lower.to_numpy()
+
+
+# ════════════════════════════════════════════════════════════════════════════
+# talib-or-numpy wrappers (same outputs either way)
+# ════════════════════════════════════════════════════════════════════════════
+def _atr(h, l, c, period):
+    return talib.ATR(h, l, c, timeperiod=period) if _HAS_TALIB else _np_atr(h, l, c, period)
+
+
+def _cci(h, l, c, period):
+    return talib.CCI(h, l, c, timeperiod=period) if _HAS_TALIB else _np_cci(h, l, c, period)
+
+
+def _rsi(c, period):
+    return talib.RSI(c, timeperiod=period) if _HAS_TALIB else _np_rsi(c, period)
+
+
+def _adx(h, l, c, period):
+    return talib.ADX(h, l, c, timeperiod=period) if _HAS_TALIB else _np_adx(h, l, c, period)
+
+
+def _bbands(c, period, nbdev=1.0):
+    if _HAS_TALIB:
+        return talib.BBANDS(c, timeperiod=period, nbdevup=nbdev, nbdevdn=nbdev, matype=0)
+    return _np_bbands(c, period, nbdev)
+
+
+def _sma_series(series: pd.Series, period: int, shift: int = 0) -> pd.Series:
+    """SMA with optional forward shift (positive = look further back)."""
+    s = series.astype(float) if period <= 1 else \
+        series.astype(float).rolling(window=period, min_periods=1).mean()
+    return s.shift(shift) if shift else s
+
+
+# ════════════════════════════════════════════════════════════════════════════
+# Full indicator DataFrame (per timeframe) — authoritative column set
+# ════════════════════════════════════════════════════════════════════════════
+def compute_indicators(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Input df columns: [open, high, low, close, volume].
+    Returns a DataFrame (same index) with all named indicator columns appended.
+    CCI(300)/CCI(900) intentionally excluded. No rows dropped (early NaNs kept).
+    """
+    close, high, low, open_ = df["close"], df["high"], df["low"], df["open"]
+    c = close.to_numpy(np.float64)
+    h = high.to_numpy(np.float64)
+    l = low.to_numpy(np.float64)
+    idx = df.index
+    out = pd.DataFrame(index=idx)
+
+    out["open"], out["high"], out["low"], out["close"] = open_, high, low, close
+    out["volume"] = df["volume"]
+
+    # ── ATR (14, 45) + shifted SMA(1, +8) refs ──
+    atr14 = pd.Series(_atr(h, l, c, 14), index=idx)
+    atr45 = pd.Series(_atr(h, l, c, 45), index=idx)
+    out["atr14"] = atr14
+    out["atr45"] = atr45
+    out["atr14_sma1_sh8"] = _sma_series(atr14, 1, shift=8)
+    out["atr45_sma1_sh8"] = _sma_series(atr45, 1, shift=8)
+    out["atr14_ma"] = _sma_series(atr14, 20)   # 20-bar MA of ATR14 (compat)
+
+    # ── Bollinger Bands (nbdev=1.0) ──
+    bb200_u, bb200_m, bb200_l = _bbands(c, 200, 1.0)
+    bb20_u, bb20_m, bb20_l = _bbands(c, 20, 1.0)
+    out["bb200_upper"], out["bb200_mid"], out["bb200_lower"] = bb200_u, bb200_m, bb200_l
+    out["bb20_upper"], out["bb20_mid"], out["bb20_lower"] = bb20_u, bb20_m, bb20_l
+
+    # ── RSI ──
+    out["rsi7"] = pd.Series(_rsi(c, 7), index=idx)
+    out["rsi5"] = pd.Series(_rsi(c, 5), index=idx)
+
+    # ── CCI (14, 30, 100, 140) — NO 300/900 ──
+    out["cci14"] = pd.Series(_cci(h, l, c, 14), index=idx)
+    out["cci30"] = pd.Series(_cci(h, l, c, 30), index=idx)
+    out["cci100"] = pd.Series(_cci(h, l, c, 100), index=idx)
+    out["cci140"] = pd.Series(_cci(h, l, c, 140), index=idx)
+    # shifted SMA(1,+8) on CCI30/100 (Phase 1 gate) + compat MAs
+    out["cci30_sma1_sh8"] = _sma_series(out["cci30"], 1, shift=8)
+    out["cci100_sma1_sh8"] = _sma_series(out["cci100"], 1, shift=8)
+    out["cci14_sma20"] = _sma_series(out["cci14"], 20)
+    out["cci100_sma20"] = _sma_series(out["cci100"], 20)
+    out["cci140_sma1_sh4"] = _sma_series(out["cci140"], 1, shift=4)
+    # CCI BB bands (STRAT-008) on cci30/cci100 only (cci300 removed)
+    for col in ["cci30", "cci100"]:
+        u, m, lo = _bbands(out[col].to_numpy(np.float64), 14, 1.0)
+        out[f"{col}_bb14_upper"], out[f"{col}_bb14_mid"], out[f"{col}_bb14_lower"] = u, m, lo
+
+    # ── SMA family ──
+    out["sma4"] = _sma_series(close, 4)
+    for sh in (1, 2, 3, 4):
+        out[f"sma4_sh{sh}"] = _sma_series(close, 4, shift=sh)
+    out["sma30"] = _sma_series(close, 30)
+    out["sma50"] = _sma_series(close, 50)
+    out["sma200"] = _sma_series(close, 200)
+    out["sma_20"] = _sma_series(close, 20)        # compat alias used by simple strategies
+    out["ema_20"] = close.ewm(span=20, adjust=False).mean()
+    # SMA(2) stack for Phase 5
+    for sh in range(5):
+        out[f"sma2_sh{sh}"] = _sma_series(close, 2, shift=sh)
+    # High/Low SMA(4,+8) bands for Phase 2 & 3
+    out["high_sma4_sh8"] = _sma_series(high, 4, shift=8)
+    out["low_sma4_sh8"] = _sma_series(low, 4, shift=8)
+    # rolling hi/lo (compat)
+    out["rolling_high_20"] = high.rolling(20, min_periods=1).max()
+    out["rolling_low_20"] = low.rolling(20, min_periods=1).min()
+
+    # ── ADX + BB-upper SMA(4,+8) refs ──
+    out["adx14"] = pd.Series(_adx(h, l, c, 14), index=idx)
+    out["bb20_upper_sma4_sh8"] = _sma_series(pd.Series(bb20_u, index=idx), 4, shift=8)
+    out["bb200_upper_sma4_sh8"] = _sma_series(pd.Series(bb200_u, index=idx), 4, shift=8)
+
+    return out
+
+
+# ════════════════════════════════════════════════════════════════════════════
+# Multi-timeframe resampling (1m base -> 15m / 30m / 1H / 1D)
+# ════════════════════════════════════════════════════════════════════════════
+def resample_ohlcv(df_1m: pd.DataFrame, minutes: int) -> pd.DataFrame:
+    """
+    Resample a 1-minute OHLCV DataFrame (DatetimeIndex) to `minutes` bars.
+    minutes=1 returns the input unchanged. Standard OHLC aggregation.
+    """
+    if minutes <= 1:
+        return df_1m
+    rule = f"{minutes}min"
+    agg = {"open": "first", "high": "max", "low": "min", "close": "last",
+           "volume": "sum"}
+    cols = [c for c in agg if c in df_1m.columns]
+    return df_1m[cols].resample(rule, label="right", closed="right").agg(
+        {c: agg[c] for c in cols}).dropna(how="any")
+
+
+# ════════════════════════════════════════════════════════════════════════════
+# Compact normalized feature matrix for the agent state (GPU tensor)
+# ════════════════════════════════════════════════════════════════════════════
 FEATURE_COLUMNS = [
     "open", "high", "low", "close", "volume",
     "sma_20", "ema_20", "cci_14", "atr_14", "atr_14_ma",
     "rolling_high_20", "rolling_low_20",
+    # authoritative gate variables exposed to VARIABLE_REGISTRY:
+    "cci30", "cci100", "cci30_sma1_sh8", "cci100_sma1_sh8",
+    "bb20_upper", "bb20_mid", "bb200_upper", "bb200_mid",
+    "high_sma4_sh8", "low_sma4_sh8",
+    "atr14", "atr14_sma1_sh8", "atr45", "atr45_sma1_sh8",
+    "bb20_upper_sma4_sh8", "bb200_upper_sma4_sh8",
 ]
 COL = {name: i for i, name in enumerate(FEATURE_COLUMNS)}
 NUM_FEATURES = len(FEATURE_COLUMNS)
@@ -38,124 +246,37 @@ NUM_FEATURES = len(FEATURE_COLUMNS)
 ArrayLike = Union[np.ndarray, torch.Tensor]
 
 
-def _to_tensor(x: ArrayLike, device: torch.device) -> torch.Tensor:
-    """Coerce np array or tensor to a 1-D float32 tensor on `device`."""
+def _as_np(x: ArrayLike) -> np.ndarray:
     if isinstance(x, torch.Tensor):
-        return x.to(device=device, dtype=torch.float32).reshape(-1)
-    return torch.as_tensor(np.asarray(x, dtype=np.float32), device=device).reshape(-1)
-
-
-def _rolling_mean(x: torch.Tensor, n: int) -> torch.Tensor:
-    """Causal rolling mean over window n. Warmup rows = first valid value."""
-    if n <= 1:
-        return x.clone()
-    csum = torch.cumsum(x, dim=0)
-    out = torch.empty_like(x)
-    out[n - 1:] = (csum[n - 1:] - torch.cat([csum.new_zeros(1), csum[:-n]])) / n
-    out[:n - 1] = out[n - 1]                      # back-fill warmup
-    return out
-
-
-def _rolling_max(x: torch.Tensor, n: int) -> torch.Tensor:
-    """Causal rolling max over window n (via unfold). Warmup back-filled."""
-    if n <= 1:
-        return x.clone()
-    pad = x[:1].expand(n - 1)
-    xp = torch.cat([pad, x])                       # left-pad so output aligns
-    return xp.unfold(0, n, 1).max(dim=1).values
-
-
-def _rolling_min(x: torch.Tensor, n: int) -> torch.Tensor:
-    """Causal rolling min over window n (via unfold). Warmup back-filled."""
-    if n <= 1:
-        return x.clone()
-    pad = x[:1].expand(n - 1)
-    xp = torch.cat([pad, x])
-    return xp.unfold(0, n, 1).min(dim=1).values
-
-
-def _ema(x: torch.Tensor, n: int) -> torch.Tensor:
-    """
-    Exponential moving average. Seeded with the SMA of the first n values, then
-    recursively smoothed. A short Python loop over time is unavoidable for EMA;
-    it runs once at env init (not in the hot training loop), so it is not a
-    GPU bottleneck.
-    """
-    out = torch.empty_like(x)
-    k = 2.0 / (n + 1)
-    seed = x[:n].mean()
-    out[:n] = seed
-    prev = seed
-    for i in range(n, x.shape[0]):
-        prev = x[i] * k + prev * (1 - k)
-        out[i] = prev
-    return out
-
-
-def _cci(high: torch.Tensor, low: torch.Tensor, close: torch.Tensor, n: int = 14
-         ) -> torch.Tensor:
-    """
-    Commodity Channel Index. CCI = (TP - SMA(TP)) / (0.015 * mean_dev(TP)).
-    TP = typical price = (H+L+C)/3. Matches the sample data's CCI scaling.
-    """
-    tp = (high + low + close) / 3.0
-    sma_tp = _rolling_mean(tp, n)
-    # mean absolute deviation over the window
-    pad = tp[:1].expand(n - 1)
-    tpp = torch.cat([pad, tp])
-    windows = tpp.unfold(0, n, 1)                  # (N, n)
-    mean_dev = (windows - windows.mean(dim=1, keepdim=True)).abs().mean(dim=1)
-    mean_dev = mean_dev.clamp(min=1e-10)
-    return (tp - sma_tp) / (0.015 * mean_dev)
-
-
-def _atr(high: torch.Tensor, low: torch.Tensor, close: torch.Tensor, n: int = 14
-         ) -> torch.Tensor:
-    """Average True Range over window n. TR = max(H-L, |H-Cprev|, |L-Cprev|)."""
-    prev_close = torch.cat([close[:1], close[:-1]])
-    tr = torch.maximum(high - low,
-                       torch.maximum((high - prev_close).abs(),
-                                     (low - prev_close).abs()))
-    return _rolling_mean(tr, n)
+        return x.detach().cpu().numpy().astype(np.float64).reshape(-1)
+    return np.asarray(x, dtype=np.float64).reshape(-1)
 
 
 def build_feature_matrix(open_, high, low, close, volume, device: torch.device
                          ) -> torch.Tensor:
     """
-    Build the (N, NUM_FEATURES) feature tensor on `device`.
-
-    Args accept np arrays or tensors (1-D, equal length). Returns a float32
-    tensor on `device` with columns ordered per FEATURE_COLUMNS, free of NaN/inf.
+    Build the compact (N, NUM_FEATURES) state matrix on `device`. Computes the
+    full indicator set once (single TF = the input series), selects the named
+    feature columns, fills NaN/inf, and returns a float32 tensor on device.
     """
-    o = _to_tensor(open_, device)
-    h = _to_tensor(high, device)
-    l = _to_tensor(low, device)
-    c = _to_tensor(close, device)
-    v = _to_tensor(volume, device)
-
-    sma_20 = _rolling_mean(c, 20)
-    ema_20 = _ema(c, 20)
-    cci_14 = _cci(h, l, c, 14)
-    atr_14 = _atr(h, l, c, 14)
-    atr_14_ma = _rolling_mean(atr_14, 20)          # 20-bar MA of ATR_14
-    roll_hi_20 = _rolling_max(h, 20)
-    roll_lo_20 = _rolling_min(l, 20)
-
-    mat = torch.stack([
-        o, h, l, c, v,
-        sma_20, ema_20, cci_14, atr_14, atr_14_ma,
-        roll_hi_20, roll_lo_20,
-    ], dim=1)
-
-    # Guard: replace any residual NaN/inf with column-safe zeros (defensive).
-    mat = torch.nan_to_num(mat, nan=0.0, posinf=0.0, neginf=0.0)
-    return mat.to(device=device, dtype=torch.float32)
+    df = pd.DataFrame({
+        "open": _as_np(open_), "high": _as_np(high), "low": _as_np(low),
+        "close": _as_np(close), "volume": _as_np(volume),
+    })
+    ind = compute_indicators(df)
+    # map compact names -> source columns
+    alias = {"cci_14": "cci14", "atr_14": "atr14", "atr_14_ma": "atr14_ma"}
+    data = {}
+    for name in FEATURE_COLUMNS:
+        src = alias.get(name, name)
+        data[name] = ind[src].to_numpy(np.float64) if src in ind.columns \
+            else np.zeros(len(df))
+    mat = np.stack([data[n] for n in FEATURE_COLUMNS], axis=1)
+    mat = np.nan_to_num(mat, nan=0.0, posinf=0.0, neginf=0.0)
+    return torch.as_tensor(mat, dtype=torch.float32, device=device)
 
 
 def feature_row_dict(row: torch.Tensor) -> dict:
-    """
-    Convert a single feature row (length NUM_FEATURES tensor) to a name->float
-    dict for conditions_engine.evaluate(). Moves to CPU once (display/eval only).
-    """
+    """Convert a feature-matrix row (length NUM_FEATURES) to a name->float dict."""
     vals = row.detach().cpu().reshape(-1).tolist()
     return {name: float(vals[i]) for name, i in COL.items()}

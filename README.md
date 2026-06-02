@@ -67,10 +67,21 @@ as passing). On the A100 in Colab those become ✅.
 4. Commit + push. Re-run Colab CELL 4 (pull) and CELL 6 (training resumes + new phase).
 
 If you reference a variable the system doesn't recognize, the validator prints
-**exact** IRAC instructions on what to add and where. The allowed variables are in
-`core/env/conditions_engine.py` `VARIABLE_REGISTRY` (derived from
-`core/env/indicators.py` `FEATURE_COLUMNS`): `close, open, high, low, volume,
-sma_20, ema_20, cci_14, atr_14, atr_14_ma, rolling_high_20, rolling_low_20`.
+**exact** IRAC instructions on what to add and where. The allowed variables are in `core/env/conditions_engine.py` `VARIABLE_REGISTRY`
+(derived from `core/env/indicators.py` `FEATURE_COLUMNS`) and include the
+multi-timeframe gate variables: `cci30, cci100, cci30_sma1_sh8, cci100_sma1_sh8,
+bb20_upper/mid, bb200_upper/mid, high_sma4_sh8, low_sma4_sh8, atr14,
+atr14_sma1_sh8, atr45, atr45_sma1_sh8, bb20_upper_sma4_sh8` plus the basics
+(`close, open, high, low, volume, sma_20, ema_20, cci_14, atr_14`). CCI(300) and
+CCI(900) are intentionally excluded (too slow on 1m).
+
+### Curriculum (authoritative)
+The canonical curriculum is the **8-phase** system in `config/training_config.yaml`
+and `config/phases.yaml` (phase0 CCI Extreme → … → phase7 Full FTMO → infinite
+`live_improve`), with `force_in_and_gate` / `open_gate` / `free` mask semantics.
+Indicators are computed per timeframe (1m resampled to 15m/30m/1H/1D internally).
+If `talib` is installed it is used; otherwise a numpy fallback computes the same
+columns so the repo runs clone-and-run on Colab/CI. See `SPEC_STRATEGY.md`.
 
 ## Promoting a Model to Live
 
