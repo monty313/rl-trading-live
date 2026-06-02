@@ -218,6 +218,88 @@ def train(args) -> int:
     return 0
 
 
+_KNOWN_ERRORS = [
+    (
+        "CUDAGraphs that has been overwritten",
+        "ISSUE  : torch.compile CUDA Graph overwrote a rollout buffer tensor.\n"
+        "RULE   : ActorCritic.forward() must .clone() every output tensor.\n"
+        "FIX    : Run Cell 4 (git reset --hard) then re-run Cell 6.\n"
+        "         If it persists, add USE_TORCH_COMPILE: false to CFG.",
+    ),
+    (
+        "No such file or directory: 'training/train.py'",
+        "ISSUE  : Working directory is not the repo root.\n"
+        "RULE   : Cell 6 must run from /content/rl-trading-live.\n"
+        "FIX    : Re-run Cell 4 to reset the repo, then re-run Cell 6.",
+    ),
+    (
+        "No module named 'training'",
+        "ISSUE  : Python cannot find the training package.\n"
+        "RULE   : %cd /content/rl-trading-live must run before training starts.\n"
+        "FIX    : Re-run Cell 4, then Cell 6 (it starts with %cd).",
+    ),
+    (
+        "No such file or directory.*requirements.txt",
+        "ISSUE  : pip cannot find requirements.txt — wrong working directory.\n"
+        "RULE   : Cell 3 must run after Cell 4 has cloned the repo.\n"
+        "FIX    : Run Cell 4 first, then re-run Cell 3, then Cell 6.",
+    ),
+    (
+        "ResolutionImpossible",
+        "ISSUE  : pip dependency conflict — likely numpy>=2.0 vs faiss-cpu.\n"
+        "RULE   : requirements.txt pins numpy>=1.26,<2.0.\n"
+        "FIX    : Re-run Cell 3 from the repo root (after Cell 4).",
+    ),
+    (
+        "assert.*vram_gb > 30",
+        "ISSUE  : GPU is not an A100 (or no GPU at all).\n"
+        "RULE   : Training requires an A100 runtime (>30GB VRAM).\n"
+        "FIX    : Runtime → Change runtime type → A100 GPU.",
+    ),
+    (
+        "PRIMARY DATA FILE NOT FOUND",
+        "ISSUE  : The EURUSD CSV is missing from Google Drive.\n"
+        "RULE   : CSV must exist at RL-Trading-Data/EURUSD_M1_...csv.\n"
+        "FIX    : Re-upload the CSV to your Drive at that exact path.",
+    ),
+    (
+        "FileNotFoundError.*eurusd_gpu",
+        "ISSUE  : Checkpoint manager tried to load a deleted DQN checkpoint.\n"
+        "RULE   : Manifest must only list files that exist on Drive.\n"
+        "FIX    : Re-run Cell 4b to clean the manifest, then re-run Cell 6.",
+    ),
+    (
+        "weights_only",
+        "ISSUE  : torch.load failed loading a checkpoint (PyTorch version mismatch).\n"
+        "RULE   : Checkpoints must be loadable with weights_only=False.\n"
+        "FIX    : Run Cell 8 (crash recovery) to find the best valid checkpoint.",
+    ),
+]
+
+
+def _diagnose(exc: Exception) -> str:
+    """Match the exception message against known errors and return a fix."""
+    import re
+    msg = str(exc)
+    tb = ""
+    try:
+        import traceback
+        tb = traceback.format_exc()
+    except Exception:
+        pass
+    full = msg + tb
+    for pattern, advice in _KNOWN_ERRORS:
+        if re.search(pattern, full, re.IGNORECASE):
+            return advice
+    return (
+        "ISSUE  : Unexpected error (not in known-error list).\n"
+        "RULE   : Check the full traceback above for the root cause.\n"
+        "FIX    : Run Cell 4 (git reset --hard) to ensure latest code,\n"
+        "         then re-run Cell 5 (inspect_system) to find the failure,\n"
+        "         then re-run Cell 6."
+    )
+
+
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--csv", required=False, default=None)
@@ -227,7 +309,18 @@ def main() -> int:
     ap.add_argument("--resume", action="store_true")
     ap.add_argument("--start-phase", type=int, default=0)
     ap.add_argument("--force-fresh", action="store_true")
-    return train(ap.parse_args())
+    try:
+        return train(ap.parse_args())
+    except Exception as exc:
+        import traceback
+        print("\n" + "═" * 70, flush=True)
+        print("  ❌ TRAINING CRASHED", flush=True)
+        print("═" * 70, flush=True)
+        traceback.print_exc()
+        print("\n" + "─" * 70, flush=True)
+        print(_diagnose(exc), flush=True)
+        print("─" * 70 + "\n", flush=True)
+        return 1
 
 
 if __name__ == "__main__":
