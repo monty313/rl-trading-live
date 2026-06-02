@@ -57,14 +57,13 @@ def _resolve_features(cfg: dict) -> np.ndarray:
         return cfg["FEATURES"]
     csv_path = cfg.get("DATA_CSV_EURUSD")
     if csv_path:
-        try:
-            return load_ohlcv_csv(csv_path)
-        except Exception as exc:
-            print(f"[pipeline] CSV load failed ({exc}); using synthetic fixture",
-                  flush=True)
+        data = load_ohlcv_csv(csv_path)
+        print(f"[pipeline] Loaded {len(data):,} bars from {csv_path}", flush=True)
+        return data
+    # Synthetic fallback — tests and smoke scripts only (no CSV path supplied).
     from tests.fixtures.sample_candles import make_synthetic_ohlcv_array
-    print("[pipeline] Drive/CSV not available — using synthetic fixture data. "
-          "Results are for testing only.", flush=True)
+    print("[pipeline] WARNING: no CSV path supplied — using synthetic fixture data. "
+          "Phase gate masks will NOT reflect real market conditions.", flush=True)
     return make_synthetic_ohlcv_array(n=int(cfg.get("SYNTH_BARS", 2000)))
 
 

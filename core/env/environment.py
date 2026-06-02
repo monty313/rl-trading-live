@@ -136,12 +136,14 @@ class BatchedFTMOEnv:
         return None
 
     def _build_tf_indicators(self):
-        """Precompute indicator DataFrames for every gate timeframe (1 + others).
-        Gate timeframes are read from the active phase; default to [1,15,30,60]."""
+        """Build indicator DataFrames for all required timeframes by resampling
+        the 1m OHLCV bars. The raw 1m data from the CSV is the single source of
+        truth — all higher timeframes (15m, 30m, 60m, etc.) are derived from it.
+        No separate higher-TF CSV is needed."""
         tfs = set([1])
         gt = (self.phase or {}).get("gate_timeframes", []) or []
         tfs.update(gt)
-        tfs.update([15, 30, 60])   # common gates; cheap on synthetic/test data
+        tfs.update([15, 30, 60])   # all phase gate TFs used across the curriculum
         for tf in tfs:
             try:
                 df_tf = resample_ohlcv(self._raw_ohlcv, tf)
@@ -299,8 +301,11 @@ class BatchedFTMOEnv:
         self._entry_px = torch.where(opening, close, self._entry_px)
 
         # mark-to-market with next close
+        # PnL = price_move * lots * contract_size * pip_value
+        # EURUSD: contract_size=100000, pip=0.0001 → factor = 100000 * 0.0001 = 10
+        # Leverage 1:100 affects margin requirement only, not PnL per lot.
         mtm = (next_close - self._entry_px) * torch.sign(self._position) * \
-            self._position.abs() * 1000.0
+            self._position.abs() * 100_000.0 * 0.0001
         equity_now = self._equity + torch.where(self._position != 0, mtm,
                                                 torch.zeros_like(mtm))
         self._day_high_eq = torch.maximum(self._day_high_eq, equity_now)

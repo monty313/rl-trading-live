@@ -66,6 +66,9 @@ CFG = {
     "DAILY_MAX_DD_PCT":   0.010,  # 1% trailing DD
     "INITIAL_EQUITY":     100_000.0,
     "MAX_TRADES_PER_DAY": 800,
+    "LEVERAGE":           100,    # 1:100 FTMO leverage. Affects margin only —
+                                  # PnL per lot is always price_move * lots * 10
+                                  # (EURUSD: 100000 units * 0.0001 pip = $10/pip/lot)
 
     # Agent / training — PURE PPO (DQN deprecated; see DESIGN_DECISIONS.md #1)
     "STATE_DIM":       None,      # filled at runtime from env.state_dim
