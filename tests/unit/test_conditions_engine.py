@@ -72,12 +72,12 @@ def test_force_in_and_gate_active_masks_flat_always():
              "gate_timeframes": [1, 15]}
     extreme = {"cci30": 150.0, "cci100": 120.0}
     rows = {1: extreme, 15: extreme}
-    # flat -> must_enter True, FLAT masked
+    # flat + gate active -> must open (BUY or SELL only, no FLAT)
     mask, must = CE.compute_action_mask(phase, rows, DEV, is_flat=True)
     assert _mask_dirs(mask) == {BUY, SELL} and must is True
-    # already in a position -> FLAT still masked (no hold while active), no force
+    # already in a position + gate active -> can hold (FLAT), flip, or stay — agent decides
     mask2, must2 = CE.compute_action_mask(phase, rows, DEV, is_flat=False)
-    assert _mask_dirs(mask2) == {BUY, SELL} and must2 is False
+    assert _mask_dirs(mask2) == {FLAT, BUY, SELL} and must2 is False
 
 
 def test_force_in_and_gate_blocks_entries_when_condition_false():
@@ -85,9 +85,13 @@ def test_force_in_and_gate_blocks_entries_when_condition_false():
              "gate_timeframes": [1, 15]}
     calm = {"cci30": 0.0, "cci100": 0.0}
     rows = {1: calm, 15: calm}
+    # flat + gate inactive -> can only stay flat (no new entries)
     mask, must = CE.compute_action_mask(phase, rows, DEV, is_flat=True)
-    assert _mask_dirs(mask) == {FLAT}   # no new entries; FLAT/exit only
+    assert _mask_dirs(mask) == {FLAT}
     assert must is False
+    # in a trade + gate inactive -> can hold or close, but no new entry flip
+    mask2, must2 = CE.compute_action_mask(phase, rows, DEV, is_flat=False)
+    assert _mask_dirs(mask2) == {FLAT, BUY, SELL} and must2 is False
 
 
 def test_open_gate_allows_all_when_true_hold_only_when_false():

@@ -275,21 +275,33 @@ def compute_action_mask(phase: dict, rows_by_tf: Dict[int, dict], device: torch.
 
         if mtype == "force_in_and_gate":
             if condition:
-                # Strategy ACTIVE: FLAT is NEVER an option (DESIGN_DECISIONS.md #2 +
-                # user rule "when any strategy is active hold is not an option").
-                # The agent must always hold a position while active; it may flip
-                # BUY<->SELL but can never go flat. The code NEVER picks the side.
-                # must_enter is True when currently flat (forced to open now).
-                return _dir_mask({BUY, SELL}, device), bool(is_flat)
-            # gate false: block NEW entries; allow FLAT (manage/close existing).
-            return _dir_mask({FLAT}, device), False
+                # Strategy ACTIVE + agent is FLAT → must open a trade (BUY or SELL).
+                # Strategy ACTIVE + agent has a position → can hold (FLAT = stay in
+                # trade) or flip direction. Agent decides lot size and timing freely.
+                if is_flat:
+                    return _dir_mask({BUY, SELL}, device), True
+                else:
+                    return _dir_mask({FLAT, BUY, SELL}, device), False
+            # Gate INACTIVE → no new entries allowed. If already in a trade the
+            # agent can hold it (FLAT) or close it — that's its decision.
+            # Opening a brand-new position while the gate is off is blocked.
+            if is_flat:
+                return _dir_mask({FLAT}, device), False
+            else:
+                return _dir_mask({FLAT, BUY, SELL}, device), False
 
         if mtype == "open_gate":
             if condition:
-                # Gate ACTIVE -> same rule: FLAT not allowed while the strategy is on.
-                return _dir_mask({BUY, SELL}, device), bool(is_flat)
-            # gate closed: no NEW entries; FLAT only (agent still learns exits).
-            return _dir_mask({FLAT}, device), False
+                # Gate ACTIVE + flat → must open. Already in trade → manage freely.
+                if is_flat:
+                    return _dir_mask({BUY, SELL}, device), True
+                else:
+                    return _dir_mask({FLAT, BUY, SELL}, device), False
+            # Gate INACTIVE → no new entries; hold or close existing position.
+            if is_flat:
+                return _dir_mask({FLAT}, device), False
+            else:
+                return _dir_mask({FLAT, BUY, SELL}, device), False
 
         return allow_all, False
 
