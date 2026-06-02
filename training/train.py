@@ -111,10 +111,22 @@ def train(args) -> int:
                 steps += 1
                 if len(agent.buffer) >= rollout:
                     agent.update()        # PPO update, then buffer clears
-            agent.update()                # flush any remaining rollout at episode end
+            loss = agent.update()          # flush any remaining rollout at episode end
 
             global_ep += 1
             ep_in_phase += 1
+
+            # ── per-episode progress line ─────────────────────────────────────
+            eq_now   = float(env._equity.mean().item())
+            eq_start = float(cfg.get("INITIAL_EQUITY", 100_000))
+            day_ret  = (eq_now - eq_start) / (eq_start + 1e-9) * 100
+            loss_str = f"  loss={loss:.4f}" if loss is not None else ""
+            print(
+                f"[{phase['name']}] ep={global_ep:>4}  steps={steps:>5}"
+                f"  equity={eq_now:>10,.2f}  ret={day_ret:+.3f}%"
+                f"{loss_str}  best_phi={best_phi:.4f}",
+                flush=True,
+            )
 
             if global_ep % cfg["CHECKPOINT_EVERY"] == 0:
                 ckpt_mgr.save(agent, phase["name"], global_ep, phi=best_phi,
@@ -126,6 +138,14 @@ def train(args) -> int:
                     ckpt_mgr.save(agent, phase["name"], global_ep,
                                   phi=best_phi, pass_rate=metrics["pass_rate"],
                                   name="best_eval.pt")
+                print(
+                    f"  ↳ EVAL  pass={metrics['pass_rate']*100:.1f}%"
+                    f"  phi={metrics['phi']:.4f}"
+                    f"  avg_ret={metrics['avg_daily_return']*100:+.3f}%"
+                    f"  avg_dd={metrics['avg_daily_dd']*100:.3f}%"
+                    + (" ★ new best" if metrics["phi"] > best_phi else ""),
+                    flush=True,
+                )
                 if infinite:
                     print(f"[LIVE_IMPROVE] ep={global_ep} phi={metrics['phi']:.4f} "
                           f"best_phi={best_phi:.4f}", flush=True)
