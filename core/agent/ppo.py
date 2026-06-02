@@ -52,8 +52,10 @@ class ActorCritic(nn.Module):
 
     def forward(self, x: torch.Tensor):
         h = self.trunk(x)
-        return (self.dir_head(h), self.exit_head(h),
-                self.lot_mean(h), self.value_head(h).squeeze(-1))
+        # .clone() prevents CUDAGraphs from overwriting these tensors in-place
+        # across rollout steps when torch.compile(mode="reduce-overhead") is active.
+        return (self.dir_head(h).clone(), self.exit_head(h).clone(),
+                self.lot_mean(h).clone(), self.value_head(h).squeeze(-1).clone())
 
 
 class RolloutBuffer:
