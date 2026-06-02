@@ -77,12 +77,22 @@ def _np_cci(h, l, c, period=14) -> np.ndarray:
 
 
 def _np_rsi(c, period=14) -> np.ndarray:
+    # Wilder smoothing (RMA) to match TA-Lib: seed avg with SMA of first `period`
+    # up/down moves (TA-Lib starts from index 1), then EMA with alpha=1/period.
     d = np.diff(c, prepend=c[:1])
     up = np.where(d > 0, d, 0.0)
     dn = np.where(d < 0, -d, 0.0)
-    roll_up = pd.Series(up).rolling(period, min_periods=1).mean().to_numpy()
-    roll_dn = pd.Series(dn).rolling(period, min_periods=1).mean().to_numpy()
-    rs = roll_up / np.where(roll_dn == 0, 1e-10, roll_dn)
+    n = len(c)
+    avg_up = np.full(n, np.nan)
+    avg_dn = np.full(n, np.nan)
+    if n >= period:
+        avg_up[period - 1] = up[1:period].mean()
+        avg_dn[period - 1] = dn[1:period].mean()
+        alpha = 1.0 / period
+        for i in range(period, n):
+            avg_up[i] = alpha * up[i] + (1.0 - alpha) * avg_up[i - 1]
+            avg_dn[i] = alpha * dn[i] + (1.0 - alpha) * avg_dn[i - 1]
+    rs = avg_up / np.where(avg_dn == 0, 1e-10, avg_dn)
     return 100.0 - (100.0 / (1.0 + rs))
 
 

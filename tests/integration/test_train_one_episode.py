@@ -11,7 +11,7 @@ DEV = torch.device("cpu")
 def test_train_one_episode(tmp_path):
     c = auto_tune_batch(dict(CFG), DEV)
     c.update({"FEATURES": make_synthetic_ohlcv_array(n=500),
-              "EPISODE_BARS": 120, "BARS_PER_DAY": 60, "MEMORY_SIZE": 2000,
+              "EPISODE_BARS": 120, "BARS_PER_DAY": 60,
               "ROLLOUT_STEPS": 32, "USE_AMP": False, "USE_TORCH_COMPILE": False})
     env, agent, *_ = build_pipeline(c, DEV,
         phase={"name": "p", "entry_conditions": {"buy": "any", "sell": "any"}})

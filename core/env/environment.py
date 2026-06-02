@@ -328,7 +328,7 @@ class BatchedFTMOEnv:
 
         # ── per-day reward (progressive consistency) at each day boundary ──
         daily_ret = (self._equity - self._day_start_eq) / (self._day_start_eq + 1e-8)
-        reward = (daily_ret - daily_ret) if False else torch.zeros_like(daily_ret)
+        reward = torch.zeros_like(daily_ret)
         # small step signal = change in unrealised/realised equity this bar
         reward = reward + (equity_now - self._equity_prev) / (self.initial_equity + 1e-8)
         self._equity_prev = equity_now.clone()

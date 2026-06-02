@@ -2,8 +2,9 @@
 # Pinned for reproducibility. Tested on Python 3.10+ (Colab A100).
 # Torch is installed by Colab's CUDA image; pinned here for local/dev parity.
 torch==2.7.1
-numpy==2.3.1
-pandas==2.3.1
+# numpy<2.0 required by faiss-cpu; numpy>=1.26 required by pandas 2.x
+numpy>=1.26,<2.0
+pandas>=2.0,<3.0
 PyYAML==6.0.2
 python-dotenv==1.0.1
 requests==2.32.3
