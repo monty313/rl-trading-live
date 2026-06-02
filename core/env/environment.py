@@ -329,6 +329,8 @@ class BatchedFTMOEnv:
 
         self._step_i = self._step_i + 1
         new_day = (self._step_i % self.bars_per_day) == 0
+        # Save trades_today BEFORE resetting — info must report the closing day's count
+        trades_today_closing = self._trades_today.clone()
         # On a new day: roll baseline forward (vectorized)
         self._day_start_eq = torch.where(new_day, equity_now, self._day_start_eq)
         self._day_high_eq = torch.where(new_day, equity_now, self._day_high_eq)
@@ -371,7 +373,8 @@ class BatchedFTMOEnv:
 
         # day-end (new_day) OR newly-halted -> classify PASS/OK/FAIL for the day
         day_closed = new_day | newly_halted
-        traded_today = self._trades_today > 0
+        # Use the pre-reset count so day close reports the correct trade count
+        traded_today = trades_today_closing > 0
         # Gate was meaningfully active today if it fired on >5% of bars
         gate_was_active = self._gate_bars_today > (self.bars_per_day // 20)
         dd_today = (self._day_high_eq - equity_now) / (self._day_high_eq + 1e-8)
@@ -409,7 +412,7 @@ class BatchedFTMOEnv:
             "equity": self._equity.detach(),
             "passed": passed.detach(),
             "dd_breached": self._dd_breached.detach(),
-            "trades_today": self._trades_today.detach(),
+            "trades_today": trades_today_closing.detach(),
             "pass_no_breach": pass_no_breach.detach(),
             "day_closed": day_closed.detach(),
             "day_halted": self._day_halted.detach(),

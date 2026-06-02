@@ -44,7 +44,7 @@ def test_free_allows_all():
 def test_phase0_cci_extreme_both_high():
     r = {"cci10": 150.0, "cci30": 120.0}
     assert CE.phase0_cci_extreme(r, r) is True
-    r2 = {"cci10": 150.0, "cci30": 50.0}        # cci30 not extreme
+    r2 = {"cci10": 150.0, "cci30": 50.0}   # cci30 not above 100
     assert CE.phase0_cci_extreme(r2, r2) is False
 
 
