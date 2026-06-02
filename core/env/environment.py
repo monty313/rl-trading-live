@@ -81,6 +81,11 @@ class BatchedFTMOEnv:
         self._raw_ohlcv = self._extract_raw_ohlcv(features)
         if self._raw_ohlcv is not None:
             self._build_tf_indicators()
+            print(f"[env] TF indicators built for timeframes: {sorted(self._tf_indicators.keys())} "
+                  f"({len(self._raw_ohlcv)} bars raw OHLCV)", flush=True)
+        else:
+            print("[env] WARNING: no raw OHLCV available — phase gate masks DISABLED. "
+                  "Pass raw (N,5) OHLCV, not a prebuilt feature matrix.", flush=True)
 
     # ── helpers ──────────────────────────────────────────────────────────────
     def _ensure_feature_matrix(self, features) -> torch.Tensor:
@@ -142,8 +147,8 @@ class BatchedFTMOEnv:
                 df_tf = resample_ohlcv(self._raw_ohlcv, tf)
                 if len(df_tf) > 0:
                     self._tf_indicators[tf] = compute_indicators(df_tf)
-            except Exception:
-                pass
+            except Exception as e:
+                print(f"[env] WARNING: failed to build TF{tf} indicators: {e}", flush=True)
 
     def _rows_by_tf(self) -> Dict[int, dict]:
         """Return {tf_minutes: feature_row_dict} aligned to the current 1m bar.
