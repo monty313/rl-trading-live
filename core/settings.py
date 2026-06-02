@@ -96,6 +96,17 @@ CFG = {
     "CHECKPOINT_EVERY":       10,
     "EVAL_EVERY":             50,
 
+    # Per-day reward weights
+    "REWARD": {
+        "pass_day_bonus":    2.0,
+        "ok_day_bonus":      0.5,
+        "fail_day_penalty":  -2.0,
+        "no_trade_penalty":  -1.0,   # gate was active all day but agent never traded
+        "streak_scale":      0.1,
+        "low_dd_threshold":  0.005,
+        "low_dd_bonus":      0.3,
+    },
+
     # ── Potential-based reward shaping (Φ) ───────────────────────────────────
     # Φ = (pass_rate × avg_ret_normalised) / (1 + λ × avg_dd_normalised)
     "SHAPE_ALPHA":   0.006,

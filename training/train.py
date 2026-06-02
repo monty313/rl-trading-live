@@ -130,7 +130,12 @@ def train(args) -> int:
                     fail_b   = float(rw.get("fail_day_penalty", -2.0))
                     streak_b = float(rw.get("streak_scale",     0.1)) * streak
 
-                    if trades == 0:
+                    no_trade_pen = bool(info["no_trade_penalty"][0].item())
+                    if no_trade_pen:
+                        ep_days_failed += 1
+                        label  = "⚠️  NO-TRADE"
+                        base_r = float(rw.get("no_trade_penalty", -1.0))
+                    elif trades == 0:
                         label  = "⬜ SKIP"
                         base_r = 0.0
                     elif passed:

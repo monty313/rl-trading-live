@@ -111,6 +111,8 @@ class BatchedFTMOEnv:
         self._day_passed = torch.zeros(B, dtype=torch.bool, device=d)
         self._pass_streak = torch.zeros(B, dtype=torch.long, device=d)
         self._equity_prev = torch.full((B,), self.initial_equity, device=d)
+        # tracks bars where the gate was active this day (condition TRUE)
+        self._gate_bars_today = torch.zeros(B, dtype=torch.long, device=d)
 
     def _abs_idx(self) -> torch.Tensor:
         return (self._start + self._step_i).clamp(0, self.T - 1)
@@ -177,6 +179,7 @@ class BatchedFTMOEnv:
         # NOTE: _pass_streak intentionally persists across episodes within a phase
         # (DESIGN_DECISIONS.md #7 — consecutive pass-days counter is phase-level).
         self._equity_prev.fill_(self.initial_equity)
+        self._gate_bars_today.zero_()
         return self._get_state()
 
     # ── state ──────────────────────────────────────────────────────────────────
@@ -315,6 +318,9 @@ class BatchedFTMOEnv:
                                        self._day_halted)
         self._dd_breached = torch.where(new_day, torch.zeros_like(self._dd_breached),
                                         self._dd_breached)
+        self._gate_bars_today = torch.where(new_day,
+                                            torch.zeros_like(self._gate_bars_today),
+                                            self._gate_bars_today)
 
         self._equity = equity_now
 
@@ -333,26 +339,39 @@ class BatchedFTMOEnv:
         reward = reward + (equity_now - self._equity_prev) / (self.initial_equity + 1e-8)
         self._equity_prev = equity_now.clone()
 
+        # ── count gate-active bars this step (condition was TRUE this bar) ──
+        # current_direction_mask() already computed the mask; re-use must_enter
+        # to know if the gate was active. We check: if FLAT is blocked the gate fired.
+        _cur_mask, _ = self.current_mask_and_force()
+        gate_active_this_bar = (_cur_mask[FLAT] == 0.0)   # scalar bool
+        if gate_active_this_bar:
+            self._gate_bars_today = self._gate_bars_today + 1
+
         # day-end (new_day) OR newly-halted -> classify PASS/OK/FAIL for the day
         day_closed = new_day | newly_halted
-        # A day with zero trades is ignored — no reward, no penalty, streak unchanged.
-        # Floating-point noise on a flat equity must not trigger FAIL.
         traded_today = self._trades_today > 0
+        # Gate was meaningfully active today if it fired on >5% of bars
+        gate_was_active = self._gate_bars_today > (self.bars_per_day // 20)
         dd_today = (self._day_high_eq - equity_now) / (self._day_high_eq + 1e-8)
         passed = traded_today & (daily_ret >= self.target_pct) & (dd_today <= self.max_dd_pct)
         failed = traded_today & ((dd_today > self.max_dd_pct) | (daily_ret < 0))
+        # No-trade penalty: gate was active but agent never opened a position
+        no_trade_penalty = (~traded_today) & gate_was_active
         self._day_passed = torch.where(day_closed & passed,
                                        torch.ones_like(self._day_passed), self._day_passed)
         # progressive day bonus (pass/ok/fail + streak) applied at day close
-        pass_b = float(self.cfg.get("REWARD", {}).get("pass_day_bonus", 2.0))
-        ok_b = float(self.cfg.get("REWARD", {}).get("ok_day_bonus", 0.5))
-        fail_b = float(self.cfg.get("REWARD", {}).get("fail_day_penalty", -2.0))
-        streak_s = float(self.cfg.get("REWARD", {}).get("streak_scale", 0.1))
+        pass_b    = float(self.cfg.get("REWARD", {}).get("pass_day_bonus",    2.0))
+        ok_b      = float(self.cfg.get("REWARD", {}).get("ok_day_bonus",      0.5))
+        fail_b    = float(self.cfg.get("REWARD", {}).get("fail_day_penalty",  -2.0))
+        no_trade_b = float(self.cfg.get("REWARD", {}).get("no_trade_penalty", -1.0))
+        streak_s  = float(self.cfg.get("REWARD", {}).get("streak_scale",      0.1))
         self._pass_streak = torch.where(day_closed & passed, self._pass_streak + 1,
-                                        torch.where(day_closed & (passed | failed),
+                                        torch.where(day_closed & (passed | failed | no_trade_penalty),
                                                     torch.zeros_like(self._pass_streak),
                                                     self._pass_streak))
-        day_reward = (passed.float() * pass_b + failed.float() * fail_b
+        day_reward = (passed.float() * pass_b
+                      + failed.float() * fail_b
+                      + no_trade_penalty.float() * no_trade_b
                       + (traded_today & ~passed & ~failed).float() * ok_b
                       + streak_s * self._pass_streak.float())
         reward = reward + day_closed.float() * day_reward
@@ -373,8 +392,8 @@ class BatchedFTMOEnv:
             "day_closed": day_closed.detach(),
             "day_halted": self._day_halted.detach(),
             "pass_streak": self._pass_streak.detach(),
-            # PPO masking is applied to direction logits BEFORE sampling, so the
-            # sampled direction IS the executed direction (no silent remap).
+            "no_trade_penalty": no_trade_penalty.detach(),
+            "gate_bars_today": self._gate_bars_today.detach(),
             "executed_direction": direction.detach(),
         }
         return self._get_state(), reward, self._done.clone(), info
