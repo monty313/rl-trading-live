@@ -125,58 +125,76 @@ class BatchedFTMOEnv:
     # ── multi-timeframe indicator support ────────────────────────────────────
     def _extract_raw_ohlcv(self, features):
         """Return a 1m OHLCV DataFrame from raw (N,>=5) input, or None if a
-        prebuilt feature matrix was passed (no raw OHLC available)."""
+        prebuilt feature matrix was passed (no raw OHLC available).
+
+        The DataFrame carries a plain RangeIndex (0..N-1). A DatetimeIndex is
+        synthesized ONLY transiently inside _build_tf_indicators for pandas'
+        resample(); TF-to-1m alignment is done by INTEGER row position
+        (1m row i -> TF bar i // tf), never by timestamp searchsorted. This
+        avoids the fake-timestamp drift that produced impossible base_ts values.
+        """
         t = features if isinstance(features, torch.Tensor) else torch.as_tensor(
             np.asarray(features, dtype=np.float32))
         if t.ndim == 2 and t.shape[1] >= 5 and t.shape[1] != NUM_FEATURES:
             arr = t[:, :5].detach().cpu().numpy()
-            idx = pd.date_range("2024-01-01", periods=arr.shape[0], freq="1min")
             return pd.DataFrame(arr, columns=["open", "high", "low", "close",
-                                              "volume"], index=idx)
+                                              "volume"])
         return None
 
     def _build_tf_indicators(self):
         """Build indicator DataFrames for all required timeframes by resampling
         the 1m OHLCV bars. The raw 1m data from the CSV is the single source of
         truth — all higher timeframes (15m, 30m, 60m, etc.) are derived from it.
-        No separate higher-TF CSV is needed."""
+        No separate higher-TF CSV is needed.
+
+        pandas' resample() needs a DatetimeIndex, so we attach a synthetic 1-min
+        DatetimeIndex *transiently* just for the resample step, then drop it: the
+        resulting per-TF indicator frames carry a plain RangeIndex so alignment
+        back to the 1m bar is done purely by integer position (see _rows_by_tf)."""
         tfs = set([1])
         gt = (self.phase or {}).get("gate_timeframes", []) or []
         tfs.update(gt)
         tfs.update([15, 30, 60])   # all phase gate TFs used across the curriculum
+        # Transient DatetimeIndex (resample-only); never used for alignment.
+        dt_raw = self._raw_ohlcv.copy()
+        dt_raw.index = pd.date_range("2020-01-01", periods=len(dt_raw), freq="1min")
         for tf in tfs:
             try:
-                df_tf = resample_ohlcv(self._raw_ohlcv, tf)
+                df_tf = resample_ohlcv(dt_raw, tf)
                 if len(df_tf) > 0:
-                    self._tf_indicators[tf] = compute_indicators(df_tf)
+                    ind = compute_indicators(df_tf).reset_index(drop=True)
+                    self._tf_indicators[tf] = ind
             except Exception as e:
                 print(f"[env] WARNING: failed to build TF{tf} indicators: {e}", flush=True)
 
-    def _rows_by_tf(self) -> Dict[int, dict]:
-        """Return {tf_minutes: feature_row_dict} aligned to the current 1m bar.
-        For higher TFs, picks the most recent completed bar at/under current time."""
-        out = {}
-        abs_i = int(self._abs_idx()[0].item())
-        if not self._tf_indicators:
-            return out
-        raw_i = min(abs_i, len(self._raw_ohlcv) - 1)
-        base_idx = self._raw_ohlcv.index[raw_i]
-        for tf, df_ind in self._tf_indicators.items():
-            pos = df_ind.index.searchsorted(base_idx, side="right") - 1
-            pos = max(0, min(pos, len(df_ind) - 1))
-            out[tf] = df_ind.iloc[pos].to_dict()
+    def _tf_pos(self, raw_i: int, tf: int, tf_len: int) -> int:
+        """Integer-based TF alignment: 1m row `raw_i` belongs to the higher-TF
+        bar covering it, i.e. position `raw_i // tf` (most recent completed bar
+        at/under the current 1m bar). Clamped to the resampled length. No
+        timestamp searchsorted — alignment is purely positional, so it can never
+        drift to an impossible date."""
+        pos = raw_i // max(tf, 1)
+        return max(0, min(pos, tf_len - 1))
 
-        # ── one-time diagnostic on step 1 (remove after confirming gate fires) ──
-        if abs_i == int(self._start[0].item()) + 1:
-            r1 = out.get(1, {})
-            r2 = out.get(15, {})
-            print(
-                f"[gate-diag] bar={abs_i}  base_ts={base_idx}"
-                f"  1m cci10={r1.get('cci10','?'):.1f}  cci30={r1.get('cci30','?'):.1f}"
-                f"  15m cci10={r2.get('cci10','?'):.1f}  cci30={r2.get('cci30','?'):.1f}",
-                flush=True,
-            )
+    def _rows_by_tf_batch(self, abs_idx: torch.Tensor) -> Dict[int, list]:
+        """Return {tf_minutes: [feature_row_dict per episode]} aligned PER EPISODE
+        to each episode's current 1m bar via integer row indexing. Length of each
+        list == B. Empty dict if no raw OHLCV / TF indicators are available."""
+        if not self._tf_indicators:
+            return {}
+        raw_idx = abs_idx.clamp(0, len(self._raw_ohlcv) - 1).detach().cpu().tolist()
+        out: Dict[int, list] = {}
+        for tf, df_ind in self._tf_indicators.items():
+            tf_len = len(df_ind)
+            recs = df_ind.to_dict("records")   # list of row dicts, indexed positionally
+            out[tf] = [recs[self._tf_pos(int(ri), tf, tf_len)] for ri in raw_idx]
         return out
+
+    def _rows_by_tf(self) -> Dict[int, dict]:
+        """Episode-0 view (compat shim for callers/tests that want a single bar's
+        rows). Delegates to the batched path and returns episode 0's dicts."""
+        batch = self._rows_by_tf_batch(self._abs_idx())
+        return {tf: rows[0] for tf, rows in batch.items()}
 
     # ── reset ──────────────────────────────────────────────────────────────────
     def reset(self) -> torch.Tensor:
@@ -227,25 +245,50 @@ class BatchedFTMOEnv:
         return torch.cat([norm, pos_feat], dim=1)
 
     # ── action mask (RULE 12) ──────────────────────────────────────────────────
-    def current_direction_mask(self) -> torch.Tensor:
-        """(B, DIRECTION_DIM) float mask for the PPO direction head this bar."""
-        mask_1d, _ = self.current_mask_and_force()
-        return mask_1d.unsqueeze(0).expand(self.B, -1).contiguous()
+    def current_mask_and_force(self) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        Per-episode gate mask. Returns:
+          dir_mask   : (B, DIRECTION_DIM) float — 1.0 allowed / 0.0 masked, computed
+                       independently for EVERY one of the B episodes (each episode
+                       has its own bar index and own position state).
+          must_enter : (B,) bool — True where a force_in_and_gate/open_gate gate is
+                       ON and the episode is flat (agent must open BUY or SELL).
 
-    def current_mask_and_force(self) -> Tuple[torch.Tensor, bool]:
+        BUG-4 FIX: previously this read only self._position[0] / abs_idx[0] (episode
+        0) and broadcast that single mask to all 64 episodes, so 63/64 episodes got
+        the wrong mask. Now the gate condition + force-entry is evaluated per episode.
         """
-        Returns (dir_mask (DIRECTION_DIM,), must_enter). Uses per-TF indicator rows
-        when available (named phase masks); falls back to the compact feature row
-        for string-condition phases. must_enter=True only for force_in_and_gate
-        when the gate holds and the agent is flat (the agent still picks BUY/SELL).
-        """
-        is_flat = bool((self._position[0] == 0).item())
-        rows = self._rows_by_tf()
-        if not rows:
+        abs_idx = self._abs_idx()
+        is_flat = (self._position == 0)                      # (B,) bool tensor
+        rows_batch = self._rows_by_tf_batch(abs_idx)
+        if not rows_batch:
+            # string-condition / no-raw-OHLCV fallback: build the compact feature
+            # row per episode from the feature matrix.
+            rows_batch = {1: [feature_row_dict(self.features[i])
+                              for i in abs_idx.detach().cpu().tolist()]}
+        return conditions_engine.compute_action_mask_batch(
+            self.phase, rows_batch, self.B, self.device, is_flat=is_flat)
+
+    def current_direction_mask(self) -> torch.Tensor:
+        """(B, DIRECTION_DIM) per-episode float mask for the PPO direction head."""
+        mask, _ = self.current_mask_and_force()
+        return mask
+
+    def _gate_on_batch(self, abs_idx: Optional[torch.Tensor] = None) -> torch.Tensor:
+        """(B,) bool — True where the phase gate condition fires for that episode
+        at bar `abs_idx` (defaults to the current bar), regardless of its position.
+        Computed by masking AS-IF-FLAT: when the gate is ON the FLAT direction is
+        masked, so mask[:,FLAT]==0 is the per-episode gate-on signal."""
+        if abs_idx is None:
             abs_idx = self._abs_idx()
-            rows = {1: feature_row_dict(self.features[abs_idx[0]])}
-        return conditions_engine.compute_action_mask(
-            self.phase, rows, self.device, is_flat=is_flat)
+        rows_batch = self._rows_by_tf_batch(abs_idx)
+        if not rows_batch:
+            rows_batch = {1: [feature_row_dict(self.features[i])
+                              for i in abs_idx.detach().cpu().tolist()]}
+        forced_flat = torch.ones(self.B, dtype=torch.bool, device=self.device)
+        mask, _ = conditions_engine.compute_action_mask_batch(
+            self.phase, rows_batch, self.B, self.device, is_flat=forced_flat)
+        return mask[:, FLAT] == 0.0
 
     # ── step ────────────────────────────────────────────────────────────────────
     def step(self, actions) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, Dict]:
@@ -267,6 +310,9 @@ class BatchedFTMOEnv:
         close = self.features[abs_idx, COL["close"]]
         nxt_idx = (abs_idx + 1).clamp(0, self.T - 1)
         next_close = self.features[nxt_idx, COL["close"]]
+
+        # Per-episode gate state for THIS bar (drives force-entry + gate counting).
+        gate_on = self._gate_on_batch(abs_idx)            # (B,) bool
 
         # Direction sign (+1 buy / -1 sell / 0 flat) and per-trade lot (continuous).
         dirs = torch.zeros(self.B, device=self.device)
@@ -293,7 +339,7 @@ class BatchedFTMOEnv:
         # realize PnL on the closed (100%) and reduced (50%) fractions
         exit_realized = (do_close.float() * pnl_per_unit
                          + do_reduce.float() * pnl_per_unit * 0.5)
-        self._equity = self._equity + exit_realized * 0.0001
+        self._equity = self._equity + exit_realized
         # shrink/close the position per the exit action
         self._position = torch.where(do_close, torch.zeros_like(self._position),
                                      self._position)
@@ -308,16 +354,35 @@ class BatchedFTMOEnv:
         opening = dirs != 0
         self._trades_today = self._trades_today + opening.long()
         self._equity = self._equity + torch.where(opening, realized,
-                                                  torch.zeros_like(realized)) * 0.0001
+                                                  torch.zeros_like(realized))
         self._position = torch.where(opening, dirs * lots, self._position)
+
+        # ── FORCE-ENTRY ENFORCEMENT (gate invariant, DESIGN_DECISIONS.md #2) ──
+        # A trade MUST be active on EVERY bar the gate is ON. The PPO direction
+        # mask enforces this when the episode is flat at the START of the bar, but
+        # the agent can still close an existing position (EXIT_CLOSE) and sample
+        # FLAT in the SAME bar — going flat mid-gate. The rule is "re-enter that
+        # same bar", so here we re-open any episode that is gate-ON, not halted,
+        # and now flat. The code never PICKS the side: we reuse the agent's own
+        # sampled direction, defaulting to BUY only when it sampled FLAT.
+        need_entry = gate_on & (~self._day_halted) & (self._position == 0)
+        if bool(need_entry.any().item()):
+            forced_dir = torch.where(direction == SELL,
+                                     -torch.ones(self.B, device=self.device),
+                                     torch.ones(self.B, device=self.device))
+            forced_lot = 0.01 + lot_raw.clamp(0, 1) * (self.max_lot - 0.01)
+            self._trades_today = self._trades_today + need_entry.long()
+            self._position = torch.where(need_entry, forced_dir * forced_lot,
+                                         self._position)
+            opening = opening | need_entry
         self._entry_px = torch.where(opening, close, self._entry_px)
 
         # mark-to-market with next close
-        # PnL = price_move * lots * contract_size * pip_value
-        # EURUSD: contract_size=100000, pip=0.0001 → factor = 100000 * 0.0001 = 10
+        # PnL = price_move (raw price units) * lots * contract_size (100000).
+        # A 10-pip move (0.0010) on 0.10 lots = 0.0010 * 0.10 * 100000 = $10.00.
         # Leverage 1:100 affects margin requirement only, not PnL per lot.
         mtm = (next_close - self._entry_px) * torch.sign(self._position) * \
-            self._position.abs() * 100_000.0 * 0.0001
+            self._position.abs() * 100_000.0
         equity_now = self._equity + torch.where(self._position != 0, mtm,
                                                 torch.zeros_like(mtm))
         self._day_high_eq = torch.maximum(self._day_high_eq, equity_now)
@@ -363,13 +428,11 @@ class BatchedFTMOEnv:
         reward = reward + (equity_now - self._equity_prev) / (self.initial_equity + 1e-8)
         self._equity_prev = equity_now.clone()
 
-        # ── count gate-active bars this step (condition was TRUE this bar) ──
-        # current_direction_mask() already computed the mask; re-use must_enter
-        # to know if the gate was active. We check: if FLAT is blocked the gate fired.
-        _cur_mask, _ = self.current_mask_and_force()
-        gate_active_this_bar = (_cur_mask[FLAT] == 0.0)   # scalar bool
-        if gate_active_this_bar:
-            self._gate_bars_today = self._gate_bars_today + 1
+        # ── count gate-active bars this step, PER EPISODE ──
+        # Reuse the per-episode gate_on computed for this bar (force-entry above):
+        # it is independent of the live position, so it is the correct gate-active
+        # signal whether or not the episode currently holds a trade.
+        self._gate_bars_today = self._gate_bars_today + gate_on.long()
 
         # day-end (new_day) OR newly-halted -> classify PASS/OK/FAIL for the day
         day_closed = new_day | newly_halted

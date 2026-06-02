@@ -341,3 +341,41 @@ def compute_action_mask(phase: dict, rows_by_tf: Dict[int, dict], device: torch.
     if buy_true and sell_true:
         return _dir_mask({BUY, SELL}, device), False
     return allow_all, False
+
+
+# ════════════════════════════════════════════════════════════════════════════
+# Vectorized per-episode action mask (BUG-4 FIX)
+# ════════════════════════════════════════════════════════════════════════════
+def compute_action_mask_batch(phase: dict, rows_by_tf: Dict[int, list], B: int,
+                              device: torch.device,
+                              is_flat: "torch.Tensor"
+                              ) -> Tuple[torch.Tensor, torch.Tensor]:
+    """
+    Compute the direction mask + force-entry flag INDEPENDENTLY for each of the B
+    episodes. Each episode has its own per-TF feature row (aligned to its own bar)
+    and its own flat/in-trade state.
+
+    Args:
+      phase       : the active phase dict (same schema as compute_action_mask).
+      rows_by_tf  : {tf_minutes: [row_dict per episode]} — each list has length B.
+      B           : number of episodes.
+      is_flat     : (B,) bool tensor — True where that episode holds NO position.
+
+    Returns:
+      dir_mask    : (B, DIRECTION_DIM) float (1.0 allowed / 0.0 masked).
+      must_enter  : (B,) bool — True where the gate is ON and the episode is flat.
+
+    The single-episode compute_action_mask() is reused per episode so the gate
+    semantics stay in exactly one place; only the per-episode dispatch is new.
+    """
+    flat_list = is_flat.detach().cpu().tolist()
+    masks = torch.empty(B, DIRECTION_DIM, dtype=torch.float32, device=device)
+    must = torch.zeros(B, dtype=torch.bool, device=device)
+    # transpose {tf: [rows]} -> per-episode {tf: row}
+    tfs = list(rows_by_tf.keys())
+    for i in range(B):
+        rows_i = {tf: rows_by_tf[tf][i] for tf in tfs}
+        m, me = compute_action_mask(phase, rows_i, device, is_flat=bool(flat_list[i]))
+        masks[i] = m
+        must[i] = bool(me)
+    return masks, must

@@ -75,22 +75,49 @@ class CheckpointManager:
         with open(self.manifest_path, "w") as f:
             json.dump(self.manifest, f, indent=2)
 
+    def _read_ckpt_meta(self, path: Path) -> dict:
+        """Read the embedded metadata (phase/episode/phi/pass_rate/agent) that
+        PPOAgent.save() stores inside each .pt. Falls back to 'unknown' only when
+        the file truly carries no phase tag (genuine legacy/DQN files)."""
+        try:
+            blob = torch.load(path, map_location="cpu", weights_only=False)
+        except Exception:
+            return {"phase": "unknown", "episode": 0, "phi": 0.0,
+                    "pass_rate": 0.0, "corrupt": True}
+        if not isinstance(blob, dict):
+            return {"phase": "unknown", "episode": 0, "phi": 0.0,
+                    "pass_rate": 0.0, "corrupt": False}
+        return {
+            "phase": blob.get("phase", "unknown"),
+            "episode": int(blob.get("episode", 0) or 0),
+            "phi": float(blob.get("phi", 0.0) or 0.0),
+            "pass_rate": float(blob.get("pass_rate", 0.0) or 0.0),
+            "corrupt": False,
+        }
+
     def bootstrap(self):
-        """Build a manifest from existing .pt files; protect the largest."""
+        """Build a manifest from existing .pt files. CRITICAL: recover the real
+        phase/episode/phi from each checkpoint's embedded metadata (PPO saves it
+        via agent.save(extra=...)). Earlier this hard-coded phase='unknown' for
+        every file, which made find_best_resume() skip ALL valid PPO checkpoints
+        and report 'no checkpoint found' on every restart."""
         pts = list(self.checkpoint_dir.glob("*.pt"))
         checkpoints = {}
         largest = max(pts, key=lambda p: p.stat().st_size, default=None)
         for p in pts:
+            meta = self._read_ckpt_meta(p)
             checkpoints[p.name] = {
-                "phase": "unknown", "episode": 0, "phi": 0.0, "pass_rate": 0.0,
+                "phase": meta["phase"], "episode": meta["episode"],
+                "phi": meta["phi"], "pass_rate": meta["pass_rate"],
                 "timestamp": _now_iso(), "size_bytes": p.stat().st_size,
-                "corrupt": False,
+                "corrupt": meta["corrupt"],
                 "protected": (p.name in PROTECTED) or (largest is not None and p.name == largest.name),
             }
         self.manifest = {"checkpoints": checkpoints, "parity_hashes": {}}
         self.save_manifest()
-        print(f"[ckpt] MANIFEST CREATED from {len(pts)} existing checkpoints",
-              flush=True)
+        recovered = sum(1 for m in checkpoints.values() if m["phase"] != "unknown")
+        print(f"[ckpt] MANIFEST CREATED from {len(pts)} existing checkpoints "
+              f"({recovered} with recoverable PPO phase metadata)", flush=True)
 
     # ── parity hashes (HARD RULE 10) ─────────────────────────────────────────
     def set_parity_hashes(self, hashes: dict):
@@ -188,15 +215,24 @@ class CheckpointManager:
 
     # ── resume selection ─────────────────────────────────────────────────────
     def find_best_resume(self, phase=None) -> Optional[Path]:
-        """Return path of the highest-Φ non-corrupt PPO checkpoint (prefer `phase`).
-        Skips checkpoints whose phase is 'unknown' — these are legacy DQN files
-        that cannot be loaded by PPOAgent and would cause a CUDAGraphs crash."""
+        """Return the path of the latest valid PPO checkpoint to resume from
+        (preferring `phase` when given).
+
+        Selection: among non-corrupt PPO checkpoints that still exist on disk,
+        pick the LATEST progress (highest episode), breaking ties by highest Φ.
+        Episode is the reliable "latest" key — Φ is often a stale 0.0 placeholder
+        on the periodic every-10-episodes saves, so ranking by Φ alone would
+        wrongly prefer an old high-Φ file over the most recent weights.
+
+        Only TRUE legacy entries are skipped: phase=='unknown' (pre-PPO/DQN files
+        with no phase tag) cannot be loaded by PPOAgent. Valid PPO checkpoints
+        with a real phase name (including latest.pt / best_eval.pt) are eligible."""
         self.load_manifest()
         cks = self.manifest["checkpoints"]
         candidates = [
             (n, m) for n, m in cks.items()
             if not m.get("corrupt")
-            and m.get("phase", "unknown") != "unknown"   # skip legacy DQN
+            and m.get("phase", "unknown") != "unknown"   # skip legacy DQN/unknown
             and (self.checkpoint_dir / n).exists()
         ]
         if not candidates:
@@ -205,5 +241,7 @@ class CheckpointManager:
             phase_cands = [(n, m) for n, m in candidates if m.get("phase") == phase]
             if phase_cands:
                 candidates = phase_cands
-        best = max(candidates, key=lambda kv: kv[1].get("phi", -1e9))
+        best = max(candidates,
+                   key=lambda kv: (int(kv[1].get("episode", 0) or 0),
+                                   float(kv[1].get("phi", -1e9) or -1e9)))
         return self.checkpoint_dir / best[0]

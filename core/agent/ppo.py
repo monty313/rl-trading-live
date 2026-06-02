@@ -52,8 +52,11 @@ class ActorCritic(nn.Module):
 
     def forward(self, x: torch.Tensor):
         h = self.trunk(x)
-        # .clone() prevents CUDAGraphs from overwriting these tensors in-place
-        # across rollout steps when torch.compile(mode="reduce-overhead") is active.
+        # .clone() returns fresh storage for each head output so nothing the
+        # rollout buffer keeps a reference to can be overwritten in-place by a
+        # later compiled forward pass. Combined with torch.compile(mode="default")
+        # (NOT reduce-overhead / CUDA Graphs) this fixes the rollout-buffer
+        # corruption that crashed torch.stack() in update().
         return (self.dir_head(h).clone(), self.exit_head(h).clone(),
                 self.lot_mean(h).clone(), self.value_head(h).squeeze(-1).clone())
 
