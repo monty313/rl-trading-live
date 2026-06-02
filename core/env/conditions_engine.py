@@ -274,30 +274,52 @@ def compute_action_mask(phase: dict, rows_by_tf: Dict[int, dict], device: torch.
         condition = fn(r1, r2)
 
         if mtype == "force_in_and_gate":
+            # ── GATE ON ──────────────────────────────────────────────────────
+            # Rule: a trade MUST be active at all times while the gate is ON.
+            # This is enforced bar-by-bar — the mask is evaluated every single
+            # bar, so the agent can never be flat for even one bar while the
+            # gate is firing.
+            #
+            #   Gate ON + no trades open
+            #       → strategy just triggered, agent MUST get in immediately.
+            #         BUY or SELL only (agent picks direction + lot size).
+            #
+            #   Gate ON + already in a trade
+            #       → strategy still active, agent has COMPLETE FREEDOM:
+            #         add positions, hold, flip direction, partial close,
+            #         full close — anything. Lot size and exit timing are
+            #         always the agent's decision, never forced.
+            #
+            #   Gate ON + agent just closed everything (went flat mid-gate)
+            #       → must immediately re-enter THIS SAME BAR.
+            #         mask returns {BUY, SELL} with must_enter=True so the
+            #         agent is forced to open again before the step completes.
             if condition:
-                # Strategy ACTIVE + agent is FLAT → must open a trade (BUY or SELL).
-                # Strategy ACTIVE + agent has a position → can hold (FLAT = stay in
-                # trade) or flip direction. Agent decides lot size and timing freely.
                 if is_flat:
                     return _dir_mask({BUY, SELL}, device), True
                 else:
                     return _dir_mask({FLAT, BUY, SELL}, device), False
-            # Gate INACTIVE → no new entries allowed. If already in a trade the
-            # agent can hold it (FLAT) or close it — that's its decision.
-            # Opening a brand-new position while the gate is off is blocked.
+            # ── GATE OFF ─────────────────────────────────────────────────────
+            #   Gate OFF + no trades open
+            #       → no valid setup right now, stay out.
+            #         No new entries allowed from flat.
+            #
+            #   Gate OFF + already in a trade
+            #       → strategy ended but position is still open.
+            #         Agent manages it however it wants — hold, add, or exit.
+            #         The agent decides when to close, not the gate.
             if is_flat:
                 return _dir_mask({FLAT}, device), False
             else:
                 return _dir_mask({FLAT, BUY, SELL}, device), False
 
         if mtype == "open_gate":
+            # Same rules as force_in_and_gate (see above).
             if condition:
-                # Gate ACTIVE + flat → must open. Already in trade → manage freely.
                 if is_flat:
                     return _dir_mask({BUY, SELL}, device), True
                 else:
                     return _dir_mask({FLAT, BUY, SELL}, device), False
-            # Gate INACTIVE → no new entries; hold or close existing position.
             if is_flat:
                 return _dir_mask({FLAT}, device), False
             else:

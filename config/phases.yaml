@@ -5,12 +5,30 @@
 # (MASK_REGISTRY) plus a mask_type and the timeframes the gate evaluates on.
 #
 # mask_type semantics (HARD RULE 12 + REPO1 _eval_mask):
-#   force_in_and_gate : when the condition is TRUE the agent MUST be in a trade
-#                       (forced entry if flat; agent chooses direction + lot).
-#                       When FALSE, opening new trades is blocked.
-#   open_gate         : the condition GATES opening new trades only (never forces).
-#                       Existing positions may stay open; agent learns when to exit.
-#   free              : no masking — agent trades freely (Phase 7 / live_improve).
+#
+#   force_in_and_gate / open_gate — AUTHORITATIVE GATE RULES:
+#
+#     Gate ON + no trades open
+#         → strategy just triggered. Agent MUST get in immediately (BUY or SELL).
+#           Agent picks direction and lot size — never forced by the code.
+#
+#     Gate ON + already in a trade
+#         → strategy still active. Agent has COMPLETE FREEDOM:
+#           add positions, hold, flip direction, partial close, full close.
+#           A trade must be active at all times while the gate is ON.
+#
+#     Gate ON + agent just closed everything (went flat mid-gate)
+#         → must immediately re-enter THAT SAME BAR. The mask is evaluated
+#           every bar — agent cannot be flat for even one bar while gate fires.
+#
+#     Gate OFF + no trades open
+#         → no valid setup. Stay flat. No new entries allowed.
+#
+#     Gate OFF + already in a trade
+#         → strategy ended but position is still open. Agent manages freely —
+#           hold, add, or exit whenever it wants. Agent decides exit timing.
+#
+#   free : no masking — agent trades freely (Phase 7 / live_improve).
 #
 # HOW TO ADD A STRATEGY (no code for string conditions): add a phase that uses
 #   entry_conditions: {buy: "...", sell: "..."}  (validated against VARIABLE_REGISTRY)
