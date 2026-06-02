@@ -1,0 +1,48 @@
+# rl-trading-live/config/phases.yaml
+# ────────────────────────────────────────────────────────────────────────────
+# HOW TO ADD A NEW STRATEGY (NO PYTHON CODE REQUIRED):
+#   1. Add a new block to the "phases" list below.
+#   2. Set order: to any integer (phases run in ascending order).
+#   3. Set entry_conditions using variables from the VARIABLE_REGISTRY
+#      (defined in core/env/conditions_engine.py). Run:
+#         python scripts/validate_phases_yaml.py
+#      to verify your conditions before training.
+#   4. Set instruments to one or more of: [EURUSD, GBPUSD, XAUUSD, US30].
+#   5. Restart training (Colab CELL 6) — it resumes from your last checkpoint
+#      and begins the new phase automatically.
+#
+#   If you reference a variable the system does not recognize, the validator
+#   prints EXACT instructions (IRAC format) on what to add and where.
+#   Standard strategies need ZERO code changes.
+# ────────────────────────────────────────────────────────────────────────────
+
+phases:
+
+  - name: ftmo_baseline
+    order: 1
+    instruments: [EURUSD]
+    entry_conditions:
+      buy:  "cci_14 < -100 and close > sma_20"
+      sell: "cci_14 > 100 and close < sma_20"
+    max_episodes: 500
+    advance_criteria:
+      consecutive_pass_days: 5
+
+  - name: breakout_momentum
+    order: 2
+    instruments: [EURUSD, GBPUSD]
+    entry_conditions:
+      buy:  "close > rolling_high_20 and atr_14 > atr_14_ma"
+      sell: "close < rolling_low_20 and atr_14 > atr_14_ma"
+    max_episodes: 500
+    advance_criteria:
+      consecutive_pass_days: 5
+
+  - name: live_improve
+    order: 999
+    instruments: [EURUSD, GBPUSD, XAUUSD, US30]
+    entry_conditions:
+      buy:  "any"
+      sell: "any"
+    max_episodes: -1          # -1 = infinite; runs forever until manually stopped
+    advance_criteria: null    # never advances

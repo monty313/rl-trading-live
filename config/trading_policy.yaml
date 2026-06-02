@@ -1,0 +1,57 @@
+# rl-trading-live/config/trading_policy.yaml
+# ────────────────────────────────────────────────────────────────────────────
+# Runtime trading policy. Edit these values — NO code changes required.
+# Changes take effect on the next Colab session restart (or dashboard save).
+#
+# SECURITY: account login/password/server placeholders below are NEVER the real
+# values. Real MT5 credentials are read from the .env file via os.getenv()
+# (MT5_LOGIN, MT5_PASSWORD, MT5_SERVER). The placeholders here just document the
+# account shape; broker/account_manager.py overrides them from .env.
+# ────────────────────────────────────────────────────────────────────────────
+
+mode: ftmo             # ftmo | beast
+
+ftmo_settings:
+  daily_target_pct: 2.5      # PASS target: end balance >= start * 1.025
+  daily_max_dd_pct: 1.0      # trailing DD halt threshold (% below prior-day close)
+  max_trades_per_day: 800    # FTMO trade-count cap
+
+beast_settings:
+  trailing_dd_from_peak_pct: 5.0   # halt if equity drops this % from peak
+  profit_target_pct: 10.0          # optional; null = no target
+  max_trades_per_day: null         # null = unlimited
+
+accounts:
+  - id: ftmo_primary
+    login: YOUR_MT5_LOGIN_HERE         # REPLACE via .env MT5_LOGIN (not here)
+    password: YOUR_MT5_PASSWORD_HERE   # REPLACE via .env MT5_PASSWORD (not here)
+    server: YOUR_MT5_SERVER_HERE       # REPLACE via .env MT5_SERVER (not here)
+    max_lot: 2.0
+    mode: ftmo
+    instruments: [EURUSD]
+    symbol_aliases:
+      # adapter tries each alias until mt5.symbol_info() succeeds
+      # Bug 14: try multiple broker suffixes (no suffix, .sim, .r, m, .pro, .ecn)
+      EURUSD: [EURUSD, "EURUSD.sim", "EURUSD.r", EURUSDm, "EURUSD.pro", "EURUSD.ecn", "EURUSD+"]
+
+instrument_settings:
+  EURUSD:
+    pip_value: 0.0001
+    spread_pips: 1.0
+    slippage_pips: 0.5
+    sl_buffer_pips: 2.0
+  GBPUSD:
+    pip_value: 0.0001
+    spread_pips: 1.5
+    slippage_pips: 0.5
+    sl_buffer_pips: 2.0
+  XAUUSD:
+    pip_value: 0.01
+    spread_pips: 3.0
+    slippage_pips: 1.0
+    sl_buffer_pips: 5.0
+  US30:
+    pip_value: 1.0
+    spread_pips: 2.0
+    slippage_pips: 1.0
+    sl_buffer_pips: 10.0

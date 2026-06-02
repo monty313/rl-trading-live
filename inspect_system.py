@@ -1,0 +1,217 @@
+"""
+inspect_system.py — THE ONE COMMAND
+────────────────────────────────────────────────────────────────────────────
+Runs every system check and prints a table: CHECK | STATUS (✅/❌). On any
+failure, prints the full IRAC block. Exit 0 if all green, 1 otherwise. Colab
+CELL 5 runs this and aborts if exit code is 1.
+
+GPU/Drive checks are reported as ⚠️ SKIP (not failures) when not in Colab, so
+the build can be validated on CPU/CI without faking a GPU.
+
+    python inspect_system.py
+"""
+from __future__ import annotations
+
+import importlib
+import os
+import subprocess
+import sys
+
+ROOT = os.path.dirname(os.path.abspath(__file__))
+sys.path.insert(0, ROOT)
+
+results = []   # (name, status, irac_or_none)  status in {"PASS","FAIL","SKIP"}
+
+
+def record(name, status, irac=None):
+    results.append((name, status, irac))
+
+
+def irac(issue, rule, application, conclusion):
+    return (f"  **ISSUE**: {issue}\n  **RULE**: {rule}\n"
+            f"  **APPLICATION**: {application}\n  **CONCLUSION**: {conclusion}")
+
+
+def check_python_version():
+    ok = sys.version_info >= (3, 10)
+    record("Python >= 3.10", "PASS" if ok else "FAIL",
+           None if ok else irac(f"Python {sys.version_info}", "Need >=3.10",
+                                "Use a 3.10+ runtime", "Re-run inspect_system.py"))
+
+
+def check_cuda():
+    try:
+        import torch
+        if torch.cuda.is_available():
+            record("torch.cuda available (A100 in Colab)", "PASS")
+        else:
+            record("torch.cuda available (A100 in Colab)", "SKIP")  # CPU/CI
+    except Exception as e:
+        record("torch import", "FAIL", irac(str(e), "torch must import",
+               "pip install torch", "Re-run"))
+
+
+def check_phases_yaml():
+    rc = subprocess.run([sys.executable, os.path.join(ROOT, "scripts",
+                        "validate_phases_yaml.py")], capture_output=True, text=True)
+    ok = rc.returncode == 0
+    record("phases.yaml schema + VARIABLE_REGISTRY", "PASS" if ok else "FAIL",
+           None if ok else rc.stdout)
+
+
+def check_trading_policy():
+    import yaml
+    try:
+        with open(os.path.join(ROOT, "config", "trading_policy.yaml")) as f:
+            p = yaml.safe_load(f)
+        ok = all(k in p for k in ("mode", "accounts", "instrument_settings"))
+        record("trading_policy.yaml required keys", "PASS" if ok else "FAIL",
+               None if ok else irac("missing keys", "need mode/accounts/instrument_settings",
+                                    "add keys", "re-run"))
+    except Exception as e:
+        record("trading_policy.yaml loads", "FAIL", irac(str(e), "must load",
+               "fix YAML", "re-run"))
+
+
+def check_all_imports():
+    """Walk the repo and import every module (orphan/import check)."""
+    failed = []
+    skip_dirs = (".git", "__pycache__", "audit", "tests/fixtures", "dashboard")
+    for dirpath, _dirs, files in os.walk(ROOT):
+        if any(s in dirpath for s in skip_dirs):
+            continue
+        for fn in files:
+            if not fn.endswith(".py") or fn == "__init__.py":
+                continue
+            rel = os.path.relpath(os.path.join(dirpath, fn), ROOT)
+            mod = rel[:-3].replace(os.sep, ".")
+            if mod in ("inspect_system", "training.train", "broker.live_runner"):
+                continue   # scripts with side-effect __main__ / windows-only deps
+            try:
+                importlib.import_module(mod)
+            except Exception as e:
+                failed.append((mod, str(e)))
+    if failed:
+        record("All modules import", "FAIL",
+               "\n".join(irac(f"{m}: {e}", "every module must import",
+                              f"fix {m}", "re-run") for m, e in failed))
+    else:
+        record("All modules import", "PASS")
+
+
+def check_pytest():
+    rc = subprocess.run([sys.executable, "-m", "pytest", "tests/unit",
+                        "tests/integration", "-q"], capture_output=True, text=True,
+                        cwd=ROOT)
+    ok = rc.returncode == 0
+    record("pytest tests/ (unit + integration)", "PASS" if ok else "FAIL",
+           None if ok else rc.stdout[-2000:])
+
+
+def check_smoke(name, script):
+    rc = subprocess.run([sys.executable, os.path.join("scripts", script)],
+                        capture_output=True, text=True, cwd=ROOT)
+    ok = rc.returncode == 0
+    record(name, "PASS" if ok else "FAIL", None if ok else rc.stdout[-1500:])
+
+
+def check_action_roundtrip():
+    from core.agent import action_space as A
+    ok = all(A.encode(*A.decode(x)) == x for x in range(A.NUM_ACTIONS))
+    record("action_space 756 roundtrip", "PASS" if ok else "FAIL",
+           None if ok else irac("roundtrip broke", "encode(decode(x))==x",
+                                "fix action_space", "re-run"))
+
+
+def check_trade_gate():
+    from core.risk.trade_gate import TradeGate
+    from core.risk.daily_guard import DailyGuard
+    from core.settings import CFG
+    g = DailyGuard("ftmo", 100000, dict(CFG)); g.force_halt()
+    gate = TradeGate(g, log_path=os.path.join(ROOT, "logs", "inspect_trade_log.csv"))
+    blocked = gate.approve({"symbol": "EURUSD"}) is False
+    record("trade_gate blocks when halted", "PASS" if blocked else "FAIL",
+           None if blocked else irac("gate approved while halted", "must block",
+                                     "fix trade_gate", "re-run"))
+
+
+def check_jordan_irac():
+    from jordan.irac_engine import generate_irac
+    md = generate_irac("test_failure", {"test": "x"})
+    ok = all(s in md for s in ("**ISSUE**", "**RULE**", "**APPLICATION**", "**CONCLUSION**"))
+    record("Jordan IRAC generates markdown", "PASS" if ok else "FAIL")
+
+
+def check_persona_fallback():
+    os.environ.pop("GROK_API_KEY", None)
+    from jordan.persona import get_response
+    ok = bool(get_response({}, "status?"))
+    record("Jordan persona fallback (no API key)", "PASS" if ok else "FAIL")
+
+
+def check_dashboard_imports():
+    try:
+        importlib.import_module("dashboard.app")
+        record("dashboard.app imports", "PASS")
+    except Exception as e:
+        record("dashboard.app imports", "FAIL", irac(str(e), "must import",
+               "fix dashboard", "re-run"))
+
+
+def check_no_hardcoded_credentials():
+    import re
+    pat = re.compile(r"(password|api_key|secret|token)\s*=\s*['\"][^'\"]{6,}['\"]",
+                     re.IGNORECASE)
+    allow = ("YOUR_", "os.getenv", ".env", "placeholder", "_HERE")
+    hits = []
+    for dp, _d, files in os.walk(ROOT):
+        if any(s in dp for s in (".git", "__pycache__", "audit")):
+            continue
+        for fn in files:
+            if fn.endswith(".py"):
+                p = os.path.join(dp, fn)
+                for i, line in enumerate(open(p, encoding="utf-8", errors="ignore"), 1):
+                    if pat.search(line) and not any(a in line for a in allow):
+                        hits.append(f"{os.path.relpath(p, ROOT)}:{i}")
+    record("No hardcoded credentials", "PASS" if not hits else "FAIL",
+           None if not hits else irac(f"found: {hits}", "secrets via os.getenv only",
+                                      "move to .env", "grep returns zero"))
+
+
+def main() -> int:
+    check_python_version()
+    check_cuda()
+    check_phases_yaml()
+    check_trading_policy()
+    check_all_imports()
+    check_action_roundtrip()
+    check_trade_gate()
+    check_jordan_irac()
+    check_persona_fallback()
+    check_dashboard_imports()
+    check_no_hardcoded_credentials()
+    check_smoke("smoke_train.py (1 episode)", "smoke_train.py")
+    check_smoke("smoke_backtest.py (1 day)", "smoke_backtest.py")
+    check_smoke("smoke_infer.py (1 action)", "smoke_infer.py")
+    check_pytest()
+
+    print("\n" + "=" * 64)
+    print(f"  {'CHECK':<46}STATUS")
+    print("=" * 64)
+    icon = {"PASS": "✅", "FAIL": "❌", "SKIP": "⚠️ "}
+    failed = 0
+    for name, status, ir in results:
+        print(f"  {name:<46}{icon[status]} {status}")
+        if status == "FAIL":
+            failed += 1
+            if ir:
+                print(ir)
+    skipped = sum(1 for _n, s, _i in results if s == "SKIP")
+    print("=" * 64)
+    print(f"  {len(results)} checks — {failed} failed, {skipped} skipped "
+          f"(SKIP = needs Colab GPU/Drive)")
+    return 0 if failed == 0 else 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())

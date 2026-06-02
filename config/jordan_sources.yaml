@@ -1,0 +1,18 @@
+# rl-trading-live/config/jordan_sources.yaml
+# ────────────────────────────────────────────────────────────────────────────
+# Approved URLs that Jordan's vitals_daemon may read (read-only HTTP GET only).
+# Jordan NEVER posts, NEVER writes to these — it only fetches market context.
+# Add or remove URLs here; no code change required.
+# ────────────────────────────────────────────────────────────────────────────
+
+approved_sources:
+  - name: forexfactory_calendar
+    url: "https://www.forexfactory.com/calendar"
+    type: economic_calendar
+    enabled: true
+  # Add more approved read-only sources below as needed.
+
+fetch_settings:
+  timeout_seconds: 10
+  max_snippets: 3        # Daily Market Roar shows up to this many snippets
+  user_agent: "rl-trading-live-jordan/1.0 (read-only market context)"

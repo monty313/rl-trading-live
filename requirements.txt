@@ -1,0 +1,26 @@
+# ── rl-trading-live requirements.txt ────────────────────────────────────────
+# Pinned for reproducibility. Tested on Python 3.10+ (Colab A100).
+# Torch is installed by Colab's CUDA image; pinned here for local/dev parity.
+torch==2.7.1
+numpy==2.3.1
+pandas==2.3.1
+PyYAML==6.0.2
+python-dotenv==1.0.1
+requests==2.32.3
+
+# Dashboard
+streamlit==1.39.0
+streamlit-autorefresh==1.0.1
+plotly==5.24.1
+
+# Jordan repo indexing (FAISS) — optional at runtime; guarded imports
+faiss-cpu==1.8.0.post1
+
+# Broker (Windows live only; import-guarded so Colab/Linux still works)
+# MetaTrader5==5.0.5120   # uncomment on Windows; not installable on Linux/Colab
+
+# Test + lint
+pytest==8.3.3
+pytest-cov==5.0.0
+black==24.10.0
+ruff==0.7.1

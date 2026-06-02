@@ -1,0 +1,26 @@
+# ── rl-trading-live .gitignore ──────────────────────────────────────────────
+# Secrets — NEVER commit real credentials
+.env
+*.env
+!.env.example
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.ruff_cache/
+.ipynb_checkpoints/
+
+# Checkpoints live on Google Drive, NOT in git
+*.pt
+*.pth
+
+# Runtime logs (created at runtime; not source)
+logs/
+!logs/jordan_reports/.gitkeep
+
+# OS / editor
+.DS_Store
+.vscode/
+.idea/
