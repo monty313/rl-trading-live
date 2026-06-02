@@ -101,12 +101,16 @@ def train(args) -> int:
             day_num = 0
             ep_days_passed = ep_days_failed = ep_days_ok = 0
             ep_total_reward = 0.0
+            ep_gate_bars = 0   # bars where gate fired this episode
             max_steps = env.ep_bars
             rollout = int(cfg.get("ROLLOUT_STEPS", 2048))
             initial_equity = float(cfg.get("INITIAL_EQUITY", 100_000))
             # ── PPO on-policy rollout: collect transitions, update periodically ──
             while not done.all() and steps < max_steps:
                 mask = env.current_direction_mask()
+                # gate fired this bar if FLAT is masked (index 0 = FLAT)
+                if mask[0, 0].item() == 0.0:
+                    ep_gate_bars += 1
                 out = agent.select_actions(state, mask=mask)
                 next_state, reward, done, info = env.step(out)
                 agent.store(state, out, reward, done, mask)
@@ -174,12 +178,14 @@ def train(args) -> int:
             eq_now   = float(env._equity.mean().item())
             ep_ret   = (eq_now - initial_equity) / (initial_equity + 1e-9) * 100
             loss_str = f"  loss {loss:.4f}" if loss is not None else ""
+            gate_pct = ep_gate_bars / max(steps, 1) * 100
             print(
                 f"  {'─'*70}\n"
                 f"  Episode {global_ep:>4}  [{phase['name']}]"
                 f"  │  {ep_days_passed}✅ {ep_days_ok}🟡 {ep_days_failed}❌"
                 f"  │  equity {eq_now:>10,.2f}  ({ep_ret:+.3f}%)"
                 f"  │  reward {ep_total_reward:+.2f}"
+                f"  │  gate {ep_gate_bars}bars ({gate_pct:.1f}%)"
                 f"{loss_str}  │  best_phi {best_phi:.4f}",
                 flush=True,
             )
