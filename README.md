@@ -83,7 +83,7 @@ sma_20, ema_20, cci_14, atr_14, atr_14_ma, rolling_high_20, rolling_low_20`.
 ## Live Trading (Windows MT5 machine)
 
 ```bash
-git clone https://github.com/mmayes313/rl-trading-live
+git clone https://github.com/monty313/rl-trading-live
 pip install -r requirements.txt
 pip install MetaTrader5            # Windows only
 copy .env.example .env             # then fill in MT5 + GROK + Telegram values
