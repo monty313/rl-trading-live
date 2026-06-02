@@ -189,19 +189,20 @@ def compute_indicators(df: pd.DataFrame) -> pd.DataFrame:
     out["rsi7"] = pd.Series(_rsi(c, 7), index=idx)
     out["rsi5"] = pd.Series(_rsi(c, 5), index=idx)
 
-    # ── CCI (14, 30, 100, 140) — NO 300/900 ──
+    # ── CCI (10, 14, 30, 140) — NO 300/900 ──
+    # cci10 and cci30 are the primary phase gate indicators (changed from 30/100)
+    out["cci10"] = pd.Series(_cci(h, l, c, 10), index=idx)
     out["cci14"] = pd.Series(_cci(h, l, c, 14), index=idx)
     out["cci30"] = pd.Series(_cci(h, l, c, 30), index=idx)
-    out["cci100"] = pd.Series(_cci(h, l, c, 100), index=idx)
     out["cci140"] = pd.Series(_cci(h, l, c, 140), index=idx)
-    # shifted SMA(1,+8) on CCI30/100 (Phase 1 gate) + compat MAs
+    # shifted SMA(1,+8) on CCI10/30 (Phase 1 gate) + compat MAs
+    out["cci10_sma1_sh8"] = _sma_series(out["cci10"], 1, shift=8)
     out["cci30_sma1_sh8"] = _sma_series(out["cci30"], 1, shift=8)
-    out["cci100_sma1_sh8"] = _sma_series(out["cci100"], 1, shift=8)
     out["cci14_sma20"] = _sma_series(out["cci14"], 20)
-    out["cci100_sma20"] = _sma_series(out["cci100"], 20)
+    out["cci30_sma20"] = _sma_series(out["cci30"], 20)
     out["cci140_sma1_sh4"] = _sma_series(out["cci140"], 1, shift=4)
-    # CCI BB bands (STRAT-008) on cci30/cci100 only (cci300 removed)
-    for col in ["cci30", "cci100"]:
+    # CCI BB bands on cci10/cci30
+    for col in ["cci10", "cci30"]:
         u, m, lo = _bbands(out[col].to_numpy(np.float64), 14, 1.0)
         out[f"{col}_bb14_upper"], out[f"{col}_bb14_mid"], out[f"{col}_bb14_lower"] = u, m, lo
 
@@ -258,7 +259,7 @@ FEATURE_COLUMNS = [
     "sma_20", "ema_20", "cci_14", "atr_14", "atr_14_ma",
     "rolling_high_20", "rolling_low_20",
     # authoritative gate variables exposed to VARIABLE_REGISTRY:
-    "cci30", "cci100", "cci30_sma1_sh8", "cci100_sma1_sh8",
+    "cci10", "cci30", "cci10_sma1_sh8", "cci30_sma1_sh8",
     "bb20_upper", "bb20_mid", "bb200_upper", "bb200_mid",
     "high_sma4_sh8", "low_sma4_sh8",
     "atr14", "atr14_sma1_sh8", "atr45", "atr45_sma1_sh8",

@@ -172,8 +172,8 @@ class BatchedFTMOEnv:
             r2 = out.get(15, {})
             print(
                 f"[gate-diag] bar={abs_i}  base_ts={base_idx}"
-                f"  1m cci30={r1.get('cci30','?'):.1f}  cci100={r1.get('cci100','?'):.1f}"
-                f"  15m cci30={r2.get('cci30','?'):.1f}  cci100={r2.get('cci100','?'):.1f}",
+                f"  1m cci10={r1.get('cci10','?'):.1f}  cci30={r1.get('cci30','?'):.1f}"
+                f"  15m cci10={r2.get('cci10','?'):.1f}  cci30={r2.get('cci30','?'):.1f}",
                 flush=True,
             )
         return out

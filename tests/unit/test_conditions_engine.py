@@ -17,8 +17,8 @@ def test_any_always_true():
 
 
 def test_evaluate_uses_features():
-    feats = {"cci30": -150.0, "close": 1.2, "sma_20": 1.1}
-    assert CE.evaluate("cci30 < -100 and close > sma_20", feats) is True
+    feats = {"cci10": -150.0, "close": 1.2, "sma_20": 1.1}
+    assert CE.evaluate("cci10 < -100 and close > sma_20", feats) is True
 
 
 def test_unknown_variable_raises_irac():
@@ -28,8 +28,8 @@ def test_unknown_variable_raises_irac():
 
 
 def test_string_buy_condition_masks_to_buy():
-    phase = {"entry_conditions": {"buy": "cci30 < -100", "sell": "cci30 > 100"}}
-    rows = {1: {"cci30": -150.0}}
+    phase = {"entry_conditions": {"buy": "cci10 < -100", "sell": "cci10 > 100"}}
+    rows = {1: {"cci10": -150.0}}
     mask, must = CE.compute_action_mask(phase, rows, DEV)
     assert _mask_dirs(mask) == {BUY} and must is False
 
@@ -42,21 +42,21 @@ def test_free_allows_all():
 
 # ── named phase mask truth tables ──
 def test_phase0_cci_extreme_both_high():
-    r = {"cci30": 150.0, "cci100": 120.0}
+    r = {"cci10": 150.0, "cci30": 120.0}
     assert CE.phase0_cci_extreme(r, r) is True
-    r2 = {"cci30": 150.0, "cci100": 50.0}        # cci100 not extreme
+    r2 = {"cci10": 150.0, "cci30": 50.0}        # cci30 not extreme
     assert CE.phase0_cci_extreme(r2, r2) is False
 
 
 def test_phase0_opposite_direction_false():
-    up = {"cci30": 150.0, "cci100": 120.0}
-    dn = {"cci30": -150.0, "cci100": -120.0}
+    up = {"cci10": 150.0, "cci30": 120.0}
+    dn = {"cci10": -150.0, "cci30": -120.0}
     assert CE.phase0_cci_extreme(up, dn) is False   # TFs disagree
 
 
 def test_phase1_cci_align():
-    r = {"cci30": 10.0, "cci30_sma1_sh8": 5.0,
-         "cci100": 8.0, "cci100_sma1_sh8": 3.0}     # both above their SMA
+    r = {"cci10": 10.0, "cci10_sma1_sh8": 5.0,
+         "cci30": 8.0, "cci30_sma1_sh8": 3.0}     # both above their SMA
     assert CE.phase1_cci_align(r, r) is True
 
 
@@ -70,7 +70,7 @@ def test_phase6_atr_expansion():
 def test_force_in_and_gate_active_masks_flat_always():
     phase = {"mask": "phase0_cci_extreme", "mask_type": "force_in_and_gate",
              "gate_timeframes": [1, 15]}
-    extreme = {"cci30": 150.0, "cci100": 120.0}
+    extreme = {"cci10": 150.0, "cci30": 120.0}
     rows = {1: extreme, 15: extreme}
     # flat + gate active -> must open (BUY or SELL only, no FLAT)
     mask, must = CE.compute_action_mask(phase, rows, DEV, is_flat=True)
@@ -83,7 +83,7 @@ def test_force_in_and_gate_active_masks_flat_always():
 def test_force_in_and_gate_blocks_entries_when_condition_false():
     phase = {"mask": "phase0_cci_extreme", "mask_type": "force_in_and_gate",
              "gate_timeframes": [1, 15]}
-    calm = {"cci30": 0.0, "cci100": 0.0}
+    calm = {"cci10": 0.0, "cci30": 0.0}
     rows = {1: calm, 15: calm}
     # flat + gate inactive -> can only stay flat (no new entries)
     mask, must = CE.compute_action_mask(phase, rows, DEV, is_flat=True)
@@ -97,13 +97,13 @@ def test_force_in_and_gate_blocks_entries_when_condition_false():
 def test_open_gate_allows_all_when_true_hold_only_when_false():
     phase = {"mask": "phase1_cci_align", "mask_type": "open_gate",
              "gate_timeframes": [1, 15]}
-    aligned = {"cci30": 10.0, "cci30_sma1_sh8": 5.0,
-               "cci100": 8.0, "cci100_sma1_sh8": 3.0}
+    aligned = {"cci10": 10.0, "cci10_sma1_sh8": 5.0,
+               "cci30": 8.0, "cci30_sma1_sh8": 3.0}
     rows = {1: aligned, 15: aligned}
     mask, must = CE.compute_action_mask(phase, rows, DEV, is_flat=True)
     assert _mask_dirs(mask) == {BUY, SELL}   # active gate -> no FLAT, in any phase
-    misaligned = {"cci30": 10.0, "cci30_sma1_sh8": 5.0,
-                  "cci100": -8.0, "cci100_sma1_sh8": -3.0}   # disagree
+    misaligned = {"cci10": 10.0, "cci10_sma1_sh8": 5.0,
+                  "cci30": -8.0, "cci30_sma1_sh8": -3.0}   # disagree
     rows2 = {1: misaligned, 15: misaligned}
     mask2, _ = CE.compute_action_mask(phase, rows2, DEV)
     assert _mask_dirs(mask2) == {FLAT}   # gate closed -> no new entries

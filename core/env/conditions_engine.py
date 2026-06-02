@@ -59,14 +59,14 @@ def _aligned(val, ref) -> int:
 
 
 def phase0_cci_extreme(r1, r2) -> bool:
-    """CCI30 AND CCI100 both > +100 OR both < -100 on both TFs, same direction."""
+    """CCI10 AND CCI30 both > +100 OR both < -100 on both TFs, same direction."""
     def _ex(r):
-        c30, c100 = _g(r, "cci30"), _g(r, "cci100")
-        if c30 is None or c100 is None:
+        c10, c30 = _g(r, "cci10"), _g(r, "cci30")
+        if c10 is None or c30 is None:
             return (False, 0)
-        if c30 > 100 and c100 > 100:
+        if c10 > 100 and c30 > 100:
             return (True, 1)
-        if c30 < -100 and c100 < -100:
+        if c10 < -100 and c30 < -100:
             return (True, -1)
         return (False, 0)
     a1, d1 = _ex(r1)
@@ -75,11 +75,11 @@ def phase0_cci_extreme(r1, r2) -> bool:
 
 
 def phase1_cci_align(r1, r2) -> bool:
-    """CCI30 & CCI100 each above/below their SMA(1,+8) on both TFs, all agree."""
+    """CCI10 & CCI30 each above/below their SMA(1,+8) on both TFs, all agree."""
     def _dir(r):
+        d10 = _aligned(_g(r, "cci10"), _g(r, "cci10_sma1_sh8"))
         d30 = _aligned(_g(r, "cci30"), _g(r, "cci30_sma1_sh8"))
-        d100 = _aligned(_g(r, "cci100"), _g(r, "cci100_sma1_sh8"))
-        return d30 if (d30 != 0 and d30 == d100) else 0
+        return d10 if (d10 != 0 and d10 == d30) else 0
     d1, d2 = _dir(r1), _dir(r2)
     return d1 != 0 and d1 == d2
 

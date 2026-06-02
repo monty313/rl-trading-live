@@ -12,7 +12,7 @@ def test_compute_indicators_has_authoritative_columns():
         ["open", "high", "low", "close", "tick_volume"]].rename(
         columns={"tick_volume": "volume"})
     ind = compute_indicators(df)
-    for col in ["cci30", "cci100", "cci30_sma1_sh8", "cci100_sma1_sh8",
+    for col in ["cci10", "cci30", "cci10_sma1_sh8", "cci30_sma1_sh8",
                 "atr14", "atr14_sma1_sh8", "atr45", "atr45_sma1_sh8",
                 "bb20_upper", "bb20_mid", "bb200_upper", "bb200_mid",
                 "high_sma4_sh8", "low_sma4_sh8", "sma2_sh0", "sma2_sh4",
@@ -46,4 +46,4 @@ def test_feature_matrix_shape_and_columns():
                                torch.device("cpu"))
     assert mat.shape == (300, len(FEATURE_COLUMNS))
     assert torch.isfinite(mat).all()
-    assert "cci30" in COL and "bb200_mid" in COL
+    assert "cci10" in COL and "cci30" in COL and "bb200_mid" in COL
