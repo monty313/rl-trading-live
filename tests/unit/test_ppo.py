@@ -57,3 +57,37 @@ def test_select_action_single_obs():
                                                        deterministic=True)
     assert direction in (FLAT, BUY, SELL)
     assert 0.0 <= lot_raw <= 1.0
+
+
+def test_forward_outputs_are_cloned():
+    """Regression: CUDAGraphs overwrote buffer tensors when ActorCritic.forward()
+    did not .clone() its outputs. On GPU, torch.compile(mode='reduce-overhead')
+    reuses the same memory on every forward pass — stored references all pointed
+    to the same address, so torch.stack() in update() read identical garbage.
+
+    Verifies structurally: each forward call returns independent copies
+    (data_ptr differs between calls), which is what .clone() guarantees."""
+    from core.agent.ppo import ActorCritic
+    net = ActorCritic(state_dim=16, hidden=64)
+    x1, x2 = torch.randn(4, 16), torch.randn(4, 16)
+    dir1, exit1, lot1, val1 = net(x1)
+    dir2, exit2, lot2, val2 = net(x2)
+    assert dir1.data_ptr() != dir2.data_ptr(), \
+        "dir_head outputs share memory — .clone() missing in ActorCritic.forward()"
+    assert val1.data_ptr() != val2.data_ptr(), \
+        "value_head outputs share memory — .clone() missing in ActorCritic.forward()"
+
+
+def test_rollout_buffer_stack_succeeds():
+    """Regression: torch.stack(buffer.values) crashed with CUDAGraphs overwrite.
+    Verifies that after a full rollout, update() can stack all buffer tensors
+    and complete a PPO gradient step without error."""
+    agent = PPOAgent(state_dim=16, cfg=_cfg(), device=DEV)
+    B = 4
+    for _ in range(20):
+        s = torch.randn(B, 16)
+        out = agent.select_actions(s)
+        agent.store(s, out, torch.randn(B), torch.zeros(B).bool(), None)
+    loss = agent.update()
+    assert loss is not None
+    assert len(agent.buffer) == 0
