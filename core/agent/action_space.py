@@ -1,121 +1,82 @@
 """
 core/agent/action_space.py
 ────────────────────────────────────────────────────────────────────────────
-The 756-action discrete action space for the DQN agent.
+PPO action space (single source of truth). See DESIGN_DECISIONS.md #1.
 
-An action encodes a full trade decision in one integer:
+The PPO agent emits a STRUCTURED action with three components:
 
-    DIRECTION  : [0=HOLD, 1=BUY, 2=SELL]                       -> 3 choices
-    LOT_BUCKET : [0.01, 0.02, 0.05, 0.10, 0.20, 0.50, max_lot] -> 7 choices
-    SL_PIPS    : [5, 10, 15, 20, 30, 50]                       -> 6 choices
-    TP_PIPS    : [5, 10, 15, 20, 30, 50]                       -> 6 choices
+  DIRECTION (categorical, 3) : FLAT=0, BUY=1, SELL=2
+  LOT       (continuous, 1)  : raw scalar in [0,1] -> mapped to [min_lot, max_lot]
+  EXIT      (categorical, 3) : HOLD=0, REDUCE=1, CLOSE=2   (manage open positions)
 
-    TOTAL = 3 * 7 * 6 * 6 = 756 actions  (ids 0..755)
+WHY THIS SHAPE:
+  - The model learns direction on its own (the code NEVER picks buy vs sell —
+    DESIGN_DECISIONS.md #2). Under a force_in_and_gate phase, only the FLAT
+    option of DIRECTION is masked when flat, so the agent MUST choose BUY or
+    SELL — but which one is entirely the policy's choice.
+  - Lot size is the agent's continuous decision (PPO sizing head).
+  - Exit lets the agent manage/scale/close positions it already holds.
 
-WHY ONE INTEGER: the DQN outputs Q-values over a flat discrete space. Packing
-(direction, lot, sl, tp) into a single index lets a standard argmax pick a
-complete order in one shot, while encode()/decode() keep the mapping reversible
-and unit-testable (roundtrip is asserted for all 756 ids).
-
-The mixed-radix layout (direction is the most significant "digit", tp the
-least) is:
-    action = ((direction * 7 + lot_idx) * 6 + sl_idx) * 6 + tp_idx
-
-Other modules MUST import NUM_ACTIONS from here — never hardcode 756.
+There is no DQN flat-index space anymore. `DIRECTION_DIM` / `EXIT_DIM` are the
+categorical sizes PPO's policy heads use; lot is a single squashed continuous
+output. Other modules import these constants — never hardcode the integers.
 """
 from __future__ import annotations
 
 from typing import Tuple
 
-# ── Dimension sizes (mixed-radix digits, most-significant first) ─────────────
-N_DIRECTION = 3   # HOLD / BUY / SELL
-N_LOT       = 7   # lot buckets
-N_SL        = 6   # stop-loss pip buckets
-N_TP        = 6   # take-profit pip buckets
-
-NUM_ACTIONS = N_DIRECTION * N_LOT * N_SL * N_TP   # = 756
-
-# ── Direction constants ─────────────────────────────────────────────────────
-HOLD = 0
-BUY  = 1
+# ── Direction head ───────────────────────────────────────────────────────────
+FLAT = 0
+BUY = 1
 SELL = 2
-DIRECTION_NAMES = {HOLD: "HOLD", BUY: "BUY", SELL: "SELL"}
+DIRECTION_DIM = 3
+DIRECTION_NAMES = {FLAT: "FLAT", BUY: "BUY", SELL: "SELL"}
 
-# ── Bucket value tables ─────────────────────────────────────────────────────
-# Lot buckets: index 6 is special — it resolves to the account's max_lot at
-# runtime (see get_lot). The fixed buckets cover common discretionary sizes.
-LOT_BUCKETS = [0.01, 0.02, 0.05, 0.10, 0.20, 0.50, None]  # None -> max_lot
-SL_PIPS_TABLE = [5, 10, 15, 20, 30, 50]
-TP_PIPS_TABLE = [5, 10, 15, 20, 30, 50]
+# Back-compat alias: some risk/fill code refers to HOLD meaning "no new position".
+HOLD = FLAT
+
+# ── Exit head ────────────────────────────────────────────────────────────────
+EXIT_HOLD = 0
+EXIT_REDUCE = 1
+EXIT_CLOSE = 2
+EXIT_DIM = 3
+EXIT_NAMES = {EXIT_HOLD: "HOLD", EXIT_REDUCE: "REDUCE", EXIT_CLOSE: "CLOSE"}
+
+# ── Lot head (continuous) ────────────────────────────────────────────────────
+LOT_DIM = 1          # one squashed continuous scalar in [0,1]
+MIN_LOT = 0.01       # MT5 minimum
 
 
-def encode(direction: int, lot_idx: int, sl_idx: int, tp_idx: int) -> int:
+def map_lot(raw: float, max_lot: float, min_lot: float = MIN_LOT) -> float:
     """
-    Pack (direction, lot_idx, sl_idx, tp_idx) into a single action id in 0..755.
-
-    Raises ValueError if any component is out of range, so bad calls fail loudly
-    instead of silently wrapping.
+    Map a raw policy scalar in [0,1] to an actual lot in [min_lot, max_lot].
+    Clamped both ends; rounded to 0.01. The Policy/PositionSizer apply the same
+    mapping so training and live agree.
     """
-    if not (0 <= direction < N_DIRECTION):
-        raise ValueError(f"direction {direction} out of range [0,{N_DIRECTION})")
-    if not (0 <= lot_idx < N_LOT):
-        raise ValueError(f"lot_idx {lot_idx} out of range [0,{N_LOT})")
-    if not (0 <= sl_idx < N_SL):
-        raise ValueError(f"sl_idx {sl_idx} out of range [0,{N_SL})")
-    if not (0 <= tp_idx < N_TP):
-        raise ValueError(f"tp_idx {tp_idx} out of range [0,{N_TP})")
-    return ((direction * N_LOT + lot_idx) * N_SL + sl_idx) * N_TP + tp_idx
-
-
-def decode(action_int: int) -> Tuple[int, int, int, int]:
-    """
-    Inverse of encode(). Returns (direction, lot_idx, sl_idx, tp_idx).
-
-    Raises ValueError if action_int is outside 0..755.
-    """
-    if not (0 <= action_int < NUM_ACTIONS):
-        raise ValueError(f"action_int {action_int} out of range [0,{NUM_ACTIONS})")
-    tp_idx = action_int % N_TP
-    action_int //= N_TP
-    sl_idx = action_int % N_SL
-    action_int //= N_SL
-    lot_idx = action_int % N_LOT
-    action_int //= N_LOT
-    direction = action_int  # already < N_DIRECTION by range check above
-    return direction, lot_idx, sl_idx, tp_idx
-
-
-def get_lot(lot_idx: int, max_lot: float) -> float:
-    """
-    Resolve a lot bucket index to an actual lot size.
-
-    The final bucket (index 6) maps to the account's max_lot. Every result is
-    floored at the MT5 minimum (0.01) and capped at max_lot. position_sizer.py
-    applies the same clamp — this is the single source of bucket->lot truth.
-    """
-    raw = LOT_BUCKETS[lot_idx]
-    lot = float(max_lot) if raw is None else float(raw)
-    lot = max(0.01, min(lot, float(max_lot)))
+    raw = max(0.0, min(1.0, float(raw)))
+    lot = min_lot + raw * (max_lot - min_lot)
+    lot = max(min_lot, min(lot, float(max_lot)))
     return round(lot, 2)
 
 
-def get_sl_pips(sl_idx: int) -> int:
-    """Return stop-loss pip count for a bucket index."""
-    return SL_PIPS_TABLE[sl_idx]
-
-
-def get_tp_pips(tp_idx: int) -> int:
-    """Return take-profit pip count for a bucket index."""
-    return TP_PIPS_TABLE[tp_idx]
-
-
-def describe(action_int: int, max_lot: float = 2.0) -> dict:
-    """Human-readable expansion of an action id (used by Jordan / dashboard)."""
-    direction, lot_idx, sl_idx, tp_idx = decode(action_int)
+def describe(direction: int, lot_raw: float, exit_act: int, max_lot: float = 2.0
+             ) -> dict:
+    """Human-readable expansion of a structured PPO action (dashboard/Jordan)."""
     return {
-        "action_int": action_int,
-        "direction": DIRECTION_NAMES[direction],
-        "lot": get_lot(lot_idx, max_lot),
-        "sl_pips": get_sl_pips(sl_idx),
-        "tp_pips": get_tp_pips(tp_idx),
+        "direction": DIRECTION_NAMES.get(int(direction), "FLAT"),
+        "lot": map_lot(lot_raw, max_lot),
+        "exit": EXIT_NAMES.get(int(exit_act), "HOLD"),
+    }
+
+
+def decode(action: Tuple[int, float, int], max_lot: float = 2.0) -> dict:
+    """
+    Decode a structured action tuple (direction, lot_raw, exit_act) into concrete
+    trade fields. Kept as the single decode point used by env / live_runner.
+    """
+    direction, lot_raw, exit_act = action
+    return {
+        "direction": int(direction),
+        "lot": map_lot(lot_raw, max_lot),
+        "exit": int(exit_act),
     }

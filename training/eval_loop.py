@@ -14,7 +14,6 @@ from __future__ import annotations
 import numpy as np
 import torch
 
-from core.reward.shaper import EpisodeRewardShaper
 
 
 def run_eval(env, agent, cfg: dict, n_days: int = 10) -> dict:
@@ -24,34 +23,28 @@ def run_eval(env, agent, cfg: dict, n_days: int = 10) -> dict:
     """
     device = env.device
     bars_per_day = int(cfg.get("BARS_PER_DAY", 1440))
-    saved_eps = agent.epsilon
-    agent.epsilon = 0.0   # deterministic evaluation
-
     env.reset()
     daily_returns, daily_dds, daily_pass = [], [], []
     day_start_eq = float(env._equity[0].item())
     day_high = day_start_eq
     steps = n_days * bars_per_day
 
-    try:
-        for step in range(steps):
-            mask = env.current_action_mask()
-            state = env._get_state()
-            actions = agent.select_actions(state, mask=mask)
-            _s, _r, done, info = env.step(actions)
-            eq = float(info["equity"][0].item())
-            day_high = max(day_high, eq)
-            if (step + 1) % bars_per_day == 0:
-                ret = (eq - day_start_eq) / (day_start_eq + 1e-9)
-                dd = (day_high - eq) / (day_high + 1e-9)
-                daily_returns.append(ret)
-                daily_dds.append(dd)
-                daily_pass.append(1.0 if eq >= day_start_eq * (1 + env.target_pct) else 0.0)
-                day_start_eq, day_high = eq, eq
-            if done.all():
-                break
-    finally:
-        agent.epsilon = saved_eps
+    for step in range(steps):
+        mask = env.current_direction_mask()
+        state = env._get_state()
+        out = agent.select_actions(state, mask=mask)
+        _s, _r, done, info = env.step(out)
+        eq = float(info["equity"][0].item())
+        day_high = max(day_high, eq)
+        if (step + 1) % bars_per_day == 0:
+            ret = (eq - day_start_eq) / (day_start_eq + 1e-9)
+            dd = (day_high - eq) / (day_high + 1e-9)
+            daily_returns.append(ret)
+            daily_dds.append(dd)
+            daily_pass.append(1.0 if eq >= day_start_eq * (1 + env.target_pct) else 0.0)
+            day_start_eq, day_high = eq, eq
+        if done.all():
+            break
 
     if not daily_returns:   # episode ended before a full day; record one partial day
         eq = float(env._equity[0].item())
@@ -59,6 +52,7 @@ def run_eval(env, agent, cfg: dict, n_days: int = 10) -> dict:
         daily_dds = [(day_high - eq) / (day_high + 1e-9)]
         daily_pass = [1.0 if eq >= day_start_eq * (1 + env.target_pct) else 0.0]
 
+    from core.reward.shaper import EpisodeRewardShaper
     pass_rate = float(np.mean(daily_pass))
     avg_ret = float(np.mean(daily_returns))
     avg_dd = float(np.mean(daily_dds))

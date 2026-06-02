@@ -22,8 +22,7 @@ import torch
 
 from core.settings import auto_tune_batch
 from core.env.environment import BatchedFTMOEnv
-from core.agent.dqn import DQNAgent
-from core.agent.action_space import NUM_ACTIONS
+from core.agent.ppo import PPOAgent
 from core.risk.position_sizer import PositionSizer
 from core.risk.daily_guard import DailyGuard
 from core.risk.trade_gate import TradeGate
@@ -71,7 +70,7 @@ def _resolve_features(cfg: dict) -> np.ndarray:
 
 def build_pipeline(cfg: dict, device: torch.device,
                    phase: Optional[dict] = None, policy: Optional[dict] = None
-                   ) -> Tuple[BatchedFTMOEnv, DQNAgent, PositionSizer,
+                   ) -> Tuple[BatchedFTMOEnv, PPOAgent, PositionSizer,
                               DailyGuard, TradeGate]:
     """Construct and wire the full stack. Returns 5 objects."""
     cfg = auto_tune_batch(dict(cfg), device)
@@ -83,7 +82,7 @@ def build_pipeline(cfg: dict, device: torch.device,
                          phase=phase, policy=policy)
 
     cfg["STATE_DIM"] = env.state_dim
-    agent = DQNAgent(env.state_dim, NUM_ACTIONS, cfg, device)
+    agent = PPOAgent(env.state_dim, cfg, device)   # PURE PPO (DQN deprecated)
 
     sizer = PositionSizer(cfg)
     mode = (policy or {}).get("mode", "ftmo") if policy else cfg.get("MODE", "ftmo")

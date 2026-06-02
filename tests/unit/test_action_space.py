@@ -1,44 +1,29 @@
-"""Unit tests for the 756-action space: roundtrip, bounds, bucket resolution."""
+"""Unit tests for the PPO structured action space."""
 from core.agent import action_space as A
 
 
-def test_num_actions_is_756():
-    assert A.NUM_ACTIONS == 756
+def test_direction_and_exit_dims():
+    assert A.DIRECTION_DIM == 3 and A.EXIT_DIM == 3
+    assert (A.FLAT, A.BUY, A.SELL) == (0, 1, 2)
+    assert A.HOLD == A.FLAT   # back-compat alias
 
 
-def test_encode_decode_roundtrip_all_756():
-    seen = set()
-    for d in range(A.N_DIRECTION):
-        for lot in range(A.N_LOT):
-            for sl in range(A.N_SL):
-                for tp in range(A.N_TP):
-                    a = A.encode(d, lot, sl, tp)
-                    assert A.decode(a) == (d, lot, sl, tp)
-                    seen.add(a)
-    assert seen == set(range(756))
-    assert min(seen) == 0 and max(seen) == 755
+def test_map_lot_range_and_clamp():
+    assert A.map_lot(0.0, max_lot=2.0) == 0.01      # min floor
+    assert A.map_lot(1.0, max_lot=2.0) == 2.0       # max
+    mid = A.map_lot(0.5, max_lot=2.0)
+    assert 0.01 < mid < 2.0
+    assert A.map_lot(5.0, max_lot=0.10) == 0.10     # clamped above
+    assert A.map_lot(-1.0, max_lot=2.0) == 0.01     # clamped below
 
 
-def test_decode_encode_roundtrip_all_ids():
-    for x in range(A.NUM_ACTIONS):
-        assert A.encode(*A.decode(x)) == x
+def test_decode_structured_action():
+    out = A.decode((A.BUY, 0.5, A.EXIT_CLOSE), max_lot=2.0)
+    assert out["direction"] == A.BUY
+    assert out["exit"] == A.EXIT_CLOSE
+    assert 0.01 <= out["lot"] <= 2.0
 
 
-def test_lot_resolution_and_clamp():
-    assert A.get_lot(0, max_lot=2.0) == 0.01
-    assert A.get_lot(6, max_lot=2.0) == 2.0      # special bucket -> max_lot
-    assert A.get_lot(5, max_lot=0.10) == 0.10    # clamped to max_lot
-    assert A.get_lot(0, max_lot=0.005) == 0.01   # floored at MT5 min
-
-
-def test_sl_tp_tables():
-    assert A.get_sl_pips(0) == 5 and A.get_sl_pips(5) == 50
-    assert A.get_tp_pips(0) == 5 and A.get_tp_pips(5) == 50
-
-
-def test_out_of_range_raises():
-    import pytest
-    with pytest.raises(ValueError):
-        A.decode(756)
-    with pytest.raises(ValueError):
-        A.encode(3, 0, 0, 0)
+def test_describe():
+    d = A.describe(A.SELL, 1.0, A.EXIT_HOLD, max_lot=1.5)
+    assert d["direction"] == "SELL" and d["lot"] == 1.5 and d["exit"] == "HOLD"

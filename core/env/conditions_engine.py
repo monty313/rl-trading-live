@@ -17,10 +17,12 @@ Phase gating + action masking. Two mechanisms, both supported:
   2. STRING conditions (custom strategies, no code): entry_conditions {buy,sell}
      evaluated against the VARIABLE_REGISTRY (RULE 12 boolean masking).
 
-compute_action_mask(phase, rows_by_tf|features, device, ...) returns
-    (mask: (NUM_ACTIONS,) float, must_enter: bool)
-where mask is 1.0 allowed / 0.0 masked. The env adds -1e9 to masked Q-values
-and, if must_enter and the agent is flat, forces a non-HOLD action.
+compute_action_mask(phase, rows_by_tf, device, ...) returns
+    (dir_mask: (DIRECTION_DIM,) float, must_enter: bool)
+where dir_mask is 1.0 allowed / 0.0 masked over {FLAT, BUY, SELL}. The PPO
+agent zeroes masked directions before sampling. CRITICAL (DESIGN_DECISIONS #2):
+when a strategy gate is active we mask ONLY FLAT so the agent MUST open a trade,
+but BUY and SELL both stay available — the code NEVER chooses the direction.
 """
 from __future__ import annotations
 
@@ -29,7 +31,7 @@ from typing import Callable, Dict, Optional, Tuple
 import pandas as pd
 import torch
 
-from core.agent.action_space import NUM_ACTIONS, HOLD, BUY, SELL, decode
+from core.agent.action_space import DIRECTION_DIM, FLAT, BUY, SELL
 from core.env.indicators import FEATURE_COLUMNS
 
 VARIABLE_REGISTRY = set(FEATURE_COLUMNS)
@@ -227,23 +229,18 @@ def evaluate(condition_str: str, bar_features: Dict[str, float]) -> bool:
 # ════════════════════════════════════════════════════════════════════════════
 # Action mask construction
 # ════════════════════════════════════════════════════════════════════════════
-def _dir_of(a: int) -> int:
-    return decode(a)[0]
-
-
-def _mask_for_allowed_dirs(allowed: set, device) -> torch.Tensor:
-    m = torch.zeros(NUM_ACTIONS, dtype=torch.float32, device=device)
-    for a in range(NUM_ACTIONS):
-        if _dir_of(a) in allowed:
-            m[a] = 1.0
+def _dir_mask(allowed: set, device) -> torch.Tensor:
+    """(DIRECTION_DIM,) mask: 1.0 for allowed directions in {FLAT,BUY,SELL}."""
+    m = torch.zeros(DIRECTION_DIM, dtype=torch.float32, device=device)
+    for d in allowed:
+        m[d] = 1.0
     return m
 
 
 def compute_action_mask(phase: dict, rows_by_tf: Dict[int, dict], device: torch.device,
-                        num_actions: int = NUM_ACTIONS, is_flat: bool = True
-                        ) -> Tuple[torch.Tensor, bool]:
+                        is_flat: bool = True) -> Tuple[torch.Tensor, bool]:
     """
-    Returns (mask (num_actions,), must_enter bool).
+    Returns (dir_mask (DIRECTION_DIM,), must_enter bool) for the PPO direction head.
 
     phase may specify either:
       - a named mask:   {"mask": "phase0_cci_extreme", "mask_type": "...",
@@ -252,18 +249,19 @@ def compute_action_mask(phase: dict, rows_by_tf: Dict[int, dict], device: torch.
       - free:           mask None / mask_type "free"
 
     rows_by_tf: {timeframe_minutes: feature_row_dict} for the current bar.
-    is_flat: whether the agent currently holds NO position (affects must_enter
-             and whether HOLD/exit stays allowed under open_gate / force modes).
+    is_flat: whether the agent holds NO position.
+
+    DESIGN_DECISIONS.md #2: when a gate is ACTIVE we mask ONLY FLAT so the agent
+    must open a trade; BUY and SELL stay open — the code never picks the side.
     """
+    allow_all = _dir_mask({FLAT, BUY, SELL}, device)
     mask_name = phase.get("mask")
     has_string_conditions = "entry_conditions" in phase
-    # Default mask_type is 'free' ONLY when there is no named mask and no string
-    # conditions; otherwise honor the declared mask_type / fall through to strings.
     mask_type = phase.get("mask_type", "free" if not has_string_conditions else None)
 
     # ── free ──
     if mask_type == "free" and mask_name is None and not has_string_conditions:
-        return torch.ones(num_actions, dtype=torch.float32, device=device), False
+        return allow_all, False
 
     # ── named mask path ──
     if mask_name and mask_name in MASK_REGISTRY:
@@ -272,25 +270,28 @@ def compute_action_mask(phase: dict, rows_by_tf: Dict[int, dict], device: torch.
         r1 = rows_by_tf.get(tfs[0]) if len(tfs) > 0 else None
         r2 = rows_by_tf.get(tfs[1]) if len(tfs) > 1 else None
         if r1 is None or r2 is None:
-            return torch.ones(num_actions, dtype=torch.float32, device=device), False
+            return allow_all, False
         condition = fn(r1, r2)
 
         if mtype == "force_in_and_gate":
             if condition:
-                # must be in a trade: allow BUY/SELL; mask HOLD (force entry if flat)
-                mask = _mask_for_allowed_dirs({BUY, SELL}, device)
-                return mask, bool(is_flat)
-            # condition false: block opening new trades. Allow HOLD (and exits) so
-            # existing positions can be managed; if flat, only HOLD remains.
-            return _mask_for_allowed_dirs({HOLD}, device), False
+                # Strategy ACTIVE: FLAT is NEVER an option (DESIGN_DECISIONS.md #2 +
+                # user rule "when any strategy is active hold is not an option").
+                # The agent must always hold a position while active; it may flip
+                # BUY<->SELL but can never go flat. The code NEVER picks the side.
+                # must_enter is True when currently flat (forced to open now).
+                return _dir_mask({BUY, SELL}, device), bool(is_flat)
+            # gate false: block NEW entries; allow FLAT (manage/close existing).
+            return _dir_mask({FLAT}, device), False
 
         if mtype == "open_gate":
             if condition:
-                return torch.ones(num_actions, dtype=torch.float32, device=device), False
-            # gate closed: no NEW entries; HOLD/exits allowed (learn when to close)
-            return _mask_for_allowed_dirs({HOLD}, device), False
+                # Gate ACTIVE -> same rule: FLAT not allowed while the strategy is on.
+                return _dir_mask({BUY, SELL}, device), bool(is_flat)
+            # gate closed: no NEW entries; FLAT only (agent still learns exits).
+            return _dir_mask({FLAT}, device), False
 
-        return torch.ones(num_actions, dtype=torch.float32, device=device), False
+        return allow_all, False
 
     # ── string-condition path ──
     ec = phase.get("entry_conditions", {}) or {}
@@ -300,9 +301,9 @@ def compute_action_mask(phase: dict, rows_by_tf: Dict[int, dict], device: torch.
     buy_true = buy_c != "any" and evaluate(buy_c, feats)
     sell_true = sell_c != "any" and evaluate(sell_c, feats)
     if buy_true and not sell_true:
-        return _mask_for_allowed_dirs({BUY}, device), False
+        return _dir_mask({BUY}, device), False
     if sell_true and not buy_true:
-        return _mask_for_allowed_dirs({SELL}, device), False
+        return _dir_mask({SELL}, device), False
     if buy_true and sell_true:
-        return _mask_for_allowed_dirs({BUY, SELL}, device), False
-    return torch.ones(num_actions, dtype=torch.float32, device=device), False
+        return _dir_mask({BUY, SELL}, device), False
+    return allow_all, False

@@ -19,6 +19,8 @@ import sys
 
 ROOT = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, ROOT)
+# CI/dev has no talib; allow the numpy indicator fallback (TEST ONLY).
+os.environ.setdefault("RL_ALLOW_NUMPY_INDICATORS", "1")
 
 results = []   # (name, status, irac_or_none)  status in {"PASS","FAIL","SKIP"}
 
@@ -76,7 +78,7 @@ def check_trading_policy():
 def check_all_imports():
     """Walk the repo and import every module (orphan/import check)."""
     failed = []
-    skip_dirs = (".git", "__pycache__", "audit", "tests/fixtures", "dashboard")
+    skip_dirs = (".git", "__pycache__", "audit", "tests/fixtures", "dashboard", "legacy")
     for dirpath, _dirs, files in os.walk(ROOT):
         if any(s in dirpath for s in skip_dirs):
             continue
@@ -115,11 +117,12 @@ def check_smoke(name, script):
     record(name, "PASS" if ok else "FAIL", None if ok else rc.stdout[-1500:])
 
 
-def check_action_roundtrip():
+def check_action_space():
     from core.agent import action_space as A
-    ok = all(A.encode(*A.decode(x)) == x for x in range(A.NUM_ACTIONS))
-    record("action_space 756 roundtrip", "PASS" if ok else "FAIL",
-           None if ok else irac("roundtrip broke", "encode(decode(x))==x",
+    ok = (A.DIRECTION_DIM == 3 and A.EXIT_DIM == 3
+          and A.map_lot(1.0, 2.0) == 2.0 and A.map_lot(0.0, 2.0) == 0.01)
+    record("PPO action space (dir/exit/lot)", "PASS" if ok else "FAIL",
+           None if ok else irac("action space broke", "dir=3,exit=3,lot maps [0,1]->[min,max]",
                                 "fix action_space", "re-run"))
 
 
@@ -184,7 +187,7 @@ def main() -> int:
     check_phases_yaml()
     check_trading_policy()
     check_all_imports()
-    check_action_roundtrip()
+    check_action_space()
     check_trade_gate()
     check_jordan_irac()
     check_persona_fallback()

@@ -19,6 +19,10 @@ faiss-cpu==1.8.0.post1
 # Broker (Windows live only; import-guarded so Colab/Linux still works)
 # MetaTrader5==5.0.5120   # uncomment on Windows; not installable on Linux/Colab
 
+# Indicators — REQUIRED single source of truth (DESIGN_DECISIONS.md #3)
+# On Colab: apt-get install -y ta-lib first. On Windows: install the TA-Lib wheel.
+TA-Lib==0.4.32
+
 # Test + lint
 pytest==8.3.3
 pytest-cov==5.0.0

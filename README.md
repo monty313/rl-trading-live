@@ -1,7 +1,7 @@
 # rl-trading-live
 
 GPU-optimized (NVIDIA A100) reinforcement-learning forex trading system with a
-756-action DQN, YAML-driven strategy phases, FTMO + Beast risk modes, an MT5 live
+pure-PPO agent (direction + lot size + exits), YAML-driven strategy phases, FTMO + Beast risk modes, an MT5 live
 runner, and **Jordan** — a read-only, permission-gated Wolf-of-Wall-Street coach
 with a Streamlit dashboard.
 
@@ -138,7 +138,7 @@ results (`tests/run_all_tests.py` → `jordan_summary()`) to report build health
 
 ```
 config/        phases.yaml (strategies) · trading_policy.yaml · jordan_sources.yaml
-core/          env (indicators, fills, environment, conditions) · agent (dqn, action_space)
+core/          env (indicators, fills, environment, conditions) · agent (ppo, action_space)
                reward (shaper) · risk (sizer, daily_guard, trade_gate) · pipeline · settings
 training/      train.py · checkpoint_manager.py · eval_loop.py
 backtest/      engine.py (md5 parity assertion)
@@ -166,9 +166,13 @@ These are real, expected behaviors — not bugs:
 - **MT5 symbol suffixes:** brokers vary (`EURUSD`, `EURUSD.sim`, `EURUSDm`, `.r`,
   `.pro`, `.ecn`). `mt5_adapter` auto-resolves via the alias list in
   `trading_policy.yaml` — extend it if your broker uses another suffix.
-- **Transfer learning (7→756 actions):** on first resume from an old checkpoint,
-  the output layer is re-initialized and epsilon is raised (`TRANSFER_EPSILON`)
-  for `TRANSFER_EPISODES`. Verify the `[transfer]` log line prints on first run.
+- **Agent = pure PPO** (DESIGN_DECISIONS.md): one actor-critic outputs direction
+  (FLAT/BUY/SELL), continuous lot size, and exit (hold/reduce/close). DQN is
+  deprecated to `legacy/`. When a strategy gate is active, FLAT is masked so the
+  agent must hold a position — but the code never picks the side.
+- **TA-Lib required:** indicators come from TA-Lib (single source of truth).
+  Colab: `!apt-get install -y ta-lib && pip install TA-Lib`. For tests without
+  talib, set `RL_ALLOW_NUMPY_INDICATORS=1` (numpy fallback, test-only).
 - **MQL5 EA (separate from this Python repo):** if you also run the MetaTrader EA,
   prior builds hit per-symbol bar tracking, margin-aware lot sizing, `FILE_COMMON`
   path mismatch, Windows-path `\U` unicode escapes, and `.sim` suffix issues — all

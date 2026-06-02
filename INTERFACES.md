@@ -9,10 +9,9 @@ serves future LLMs maintaining the code.)
 - Device is auto-detected. All code must run on CPU (dev/CI) and CUDA (Colab) identically.
 - `cfg["device"]` is set by `build_pipeline` before constructing objects.
 
-## core/agent/action_space.py  (DONE)
-- `NUM_ACTIONS=756`, `HOLD=0,BUY=1,SELL=2`.
-- `encode(direction,lot_idx,sl_idx,tp_idx)->int`, `decode(int)->(d,lot,sl,tp)`.
-- `get_lot(lot_idx,max_lot)->float`, `get_sl_pips(idx)->int`, `get_tp_pips(idx)->int`.
+## core/agent/action_space.py  (PPO)
+- `DIRECTION_DIM=3` (FLAT/BUY/SELL), `EXIT_DIM=3` (HOLD/REDUCE/CLOSE), `LOT_DIM=1`.
+- `map_lot(raw,max_lot)->float` (raw in [0,1] -> [MIN_LOT,max_lot]). `decode((dir,lot_raw,exit))->dict`.
 
 ## core/env/indicators.py
 - `build_feature_matrix(open,high,low,close,volume,device)->torch.Tensor (N,F)`.
@@ -26,7 +25,7 @@ serves future LLMs maintaining the code.)
 - `VARIABLE_REGISTRY: set[str]` = the named columns above.
 - `evaluate(condition_str, bar_features_dict)->bool`. `"any"`->True. Safe eval (no builtins).
 - Unknown variable -> `raise ConfigError("... not in VARIABLE_REGISTRY ...")`.
-- `compute_action_mask(phase, bar_features_dict, num_actions=756, device)->torch.Tensor (num_actions,)`
+- `compute_action_mask(phase, rows_by_tf, device, is_flat=True)->(dir_mask (DIRECTION_DIM,), must_enter)`
   returns 1.0 allowed / 0.0 masked per RULE 12: if buy True -> mask all HOLD+SELL; if sell True ->
   mask HOLD+BUY; both False -> all allowed; `"any"` -> all allowed.
 - `class ConfigError(Exception)`.
@@ -42,12 +41,12 @@ serves future LLMs maintaining the code.)
   Applies action mask each step; PASS/FAIL per RULE 7; preloads features to device.
 - Multi-symbol: `build_multi_symbol_env(instruments:list, cfg, device)` aligns by datetime.
 
-## core/agent/dqn.py
-- `class DQNAgent(state_dim, num_actions, cfg, device)`: `select_actions(state, mask=None)->(B,)`,
-  `select_action(obs, deterministic=False, mask=None)->int`, `store(...)`, `train_step()->float|None`,
-  `decay_epsilon(ep)`, `save(path,extra)`, `load(path,partial=False)->dict`.
-- `NUM_ACTIONS` imported from action_space. torch.compile + AMP applied when device.type=="cuda".
-- `load_partial` re-inits output layer when checkpoint output dim != 756 (transfer learning).
+## core/agent/ppo.py  (the single live agent; DQN deprecated -> legacy/)
+- `class PPOAgent(state_dim, cfg, device)`: `select_actions(state, mask=None)->dict`
+  (direction,exit,lot_raw,logp,value); `select_action(obs,deterministic,mask)->(dir,lot_raw,exit)`;
+  `store(state,out,reward,done,dir_mask)`; `update(last_value=None)->float|None`;
+  `save(path,extra)`; `load(path,partial=False)->dict`.
+- mask is (B,DIRECTION_DIM): masked directions get -1e9 before sampling. AMP/compile on CUDA.
 
 ## core/reward/shaper.py
 - `class EpisodeRewardShaper(cfg)`: `compute_bonus(daily_log:list[dict])->float`,

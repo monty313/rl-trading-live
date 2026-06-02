@@ -81,15 +81,10 @@ def run_backtest(csv: Optional[str], cfg: dict = None, device: torch.device = No
     elif csv:
         cfg["DATA_CSV_EURUSD"] = csv
 
-    # BUG 6 FIX: inference needs no replay buffer; a full-size buffer wastes
-    # ~GBs of RAM/VRAM. Shrink it to 1 before building the agent.
-    cfg["MEMORY_SIZE"] = 1
-
     assert_parity(manifest_path)   # HARD RULE 10 — before any trading
 
     env, agent, sizer, guard, gate = build_pipeline(
         cfg, device, phase={"entry_conditions": {"buy": "any", "sell": "any"}})
-    agent.epsilon = 0.0
 
     bars_per_day = int(cfg.get("BARS_PER_DAY", 1440))
     env.reset()
@@ -100,9 +95,9 @@ def run_backtest(csv: Optional[str], cfg: dict = None, device: torch.device = No
     steps = n_days * bars_per_day
 
     for step in range(steps):
-        mask = env.current_action_mask()
-        actions = agent.select_actions(env._get_state(), mask=mask)
-        _s, _r, done, info = env.step(actions)
+        mask = env.current_direction_mask()
+        out = agent.select_actions(env._get_state(), mask=mask)
+        _s, _r, done, info = env.step(out)
         eq = float(info["equity"][0].item())
         peak = max(peak, eq)
         max_dd = max(max_dd, (peak - eq) / (peak + 1e-9))

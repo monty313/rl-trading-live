@@ -86,3 +86,14 @@ standardizes on **DQN with a 756-action discrete space** (3 direction × 7 lot �
    (`pass`, `ret`, `dd`). Ported; PASS/FAIL rule updated to the spec's 2.5% rule + weekly bonus.
 5. **REPO1 `live/`** has `live_agent.py` (per-bar inference) + an `.mq5` EA. The Python runner concept
    is ported into `broker/live_runner.py`; the `.mq5` is out of scope.
+
+---
+
+## ADDENDUM (PPO migration — supersedes the DQN decision above)
+
+After review against the user's locked design, the live agent is now **pure PPO**
+(direction + lot size + exits), not the 756-action DQN described earlier in this
+file. DQN is deprecated to `legacy/`. The 8-phase curriculum
+(`config/training_config.yaml`) and talib-required multi-timeframe indicators are
+authoritative. See **DESIGN_DECISIONS.md** and **SPEC_STRATEGY.md** for the
+governing spec. The DQN notes above are retained only for traceability.

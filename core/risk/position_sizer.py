@@ -5,15 +5,14 @@ Maps a lot-bucket index (0..6) to an actual lot size, clamped to the account's
 max_lot from trading_policy.yaml. Enforces the MT5 minimum (0.01) and emits a
 risk warning when the resulting notional risk exceeds ~5% of balance.
 
-This is the single source of bucket->lot truth alongside action_space.get_lot
+This maps the PPO continuous lot scalar via action_space.map_lot (single source).
 (they use the same table). Training uses a coarse internal sizing; live trading
 uses this sizer for exact lots before send_order.
 """
 from __future__ import annotations
 
-from core.agent.action_space import get_lot
+from core.agent.action_space import map_lot, MIN_LOT
 
-MIN_LOT = 0.01
 RISK_WARN_FRACTION = 0.05   # warn if lot notional risk > 5% of balance
 
 
@@ -21,28 +20,18 @@ class PositionSizer:
     def __init__(self, cfg: dict = None):
         self.cfg = cfg or {}
 
-    def size(self, lot_idx: int, max_lot: float, balance: float = None,
+    def size(self, lot_raw: float, max_lot: float, balance: float = None,
              sl_pips: int = None, pip_value: float = 0.0001) -> float:
         """
-        Resolve a lot-bucket index to a clamped lot size.
-
-        Args:
-            lot_idx  : 0..6 (6 -> max_lot)
-            max_lot  : account ceiling from trading_policy.yaml
-            balance  : optional account balance for the 5% risk warning
-            sl_pips  : optional stop distance for the risk estimate
-            pip_value: instrument pip value (default FX 0.0001)
-        Returns the final lot (>= 0.01, <= max_lot).
+        Map a continuous PPO lot scalar in [0,1] to an actual lot in
+        [MIN_LOT, max_lot] (same mapping as action_space.map_lot). Optional
+        non-fatal 5%-of-balance risk warning.
         """
-        lot = get_lot(lot_idx, max_lot)             # already clamped + floored
-        lot = max(MIN_LOT, min(lot, float(max_lot)))
-
-        # Optional risk check (non-fatal warning only — never blocks here).
+        lot = map_lot(lot_raw, max_lot)
         if balance and sl_pips:
-            # notional risk ≈ lot * 100_000 * sl_pips * pip_value (FX-style)
             risk = lot * 100_000.0 * sl_pips * pip_value
             if risk > RISK_WARN_FRACTION * float(balance):
-                print(f"[sizer] WARNING: lot {lot} risks "
-                      f"{risk / balance:.1%} of balance (> "
-                      f"{RISK_WARN_FRACTION:.0%}) at {sl_pips} pip SL", flush=True)
-        return round(lot, 2)
+                print(f"[sizer] WARNING: lot {lot} risks {risk / balance:.1%} of "
+                      f"balance (> {RISK_WARN_FRACTION:.0%}) at {sl_pips} pip SL",
+                      flush=True)
+        return lot

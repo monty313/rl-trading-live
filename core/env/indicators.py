@@ -29,12 +29,26 @@ import numpy as np
 import pandas as pd
 import torch
 
-try:  # talib is optional — numpy fallback below produces the same columns
+# talib is the REQUIRED single source of truth for indicators
+# (DESIGN_DECISIONS.md #3). The numpy implementations below are a TEST-ONLY
+# fallback and must never be mixed with talib in a parity run. Set the env var
+# RL_ALLOW_NUMPY_INDICATORS=1 to permit the fallback (tests/CI without talib);
+# otherwise a missing talib raises ImportError at import time (fail-fast).
+import os as _os
+
+try:
     import talib  # type: ignore
     _HAS_TALIB = True
 except Exception:  # pragma: no cover
     talib = None
     _HAS_TALIB = False
+    if _os.getenv("RL_ALLOW_NUMPY_INDICATORS") != "1":
+        raise ImportError(
+            "TA-Lib is required (DESIGN_DECISIONS.md #3) and is not installed. "
+            "On Colab: `!apt-get install -y ta-lib && pip install TA-Lib`. "
+            "On Windows: install the TA-Lib wheel. For tests/CI WITHOUT talib, "
+            "set RL_ALLOW_NUMPY_INDICATORS=1 to use the numpy fallback (TEST ONLY "
+            "— never mix with talib in a parity run).")
 
 
 # ════════════════════════════════════════════════════════════════════════════

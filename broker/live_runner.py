@@ -7,7 +7,7 @@ On each new M1 bar close:
   1. fetch latest candle (MT5 or mock)
   2. build observation via core/env/indicators (PARITY REQUIRED)
   3. agent.select_action(obs, deterministic=True)
-  4. action_space.decode -> (direction, lot_idx, sl_idx, tp_idx)
+  4. agent.select_action -> (direction, lot_raw, exit)
   5. intrabar_fills.compute_fill -> entry/sl/tp
   6. trade_gate.approve(order) -> if False, log BLOCKED, skip
   7. mt5_adapter.send_order(order) -> log result
@@ -26,7 +26,7 @@ from collections import deque
 
 import torch
 
-from core.agent.action_space import decode, get_lot, get_sl_pips, get_tp_pips, HOLD
+from core.agent.action_space import map_lot, FLAT
 from core.env.intrabar_fills import compute_fill
 
 
@@ -47,17 +47,21 @@ class LiveRunner:
         self._last_hb = 0.0
 
     def step_bar(self, obs: torch.Tensor, bar: dict, max_lot: float = 2.0,
-                 atr_14: float = None) -> dict:
+                 atr_14: float = None, mask=None) -> dict:
         """Process one closed M1 bar. Returns the order result dict."""
-        action = self.agent.select_action(obs, deterministic=True)
-        direction, lot_idx, sl_idx, tp_idx = decode(action)
-        if direction == HOLD:
+        direction, lot_raw, exit_act = self.agent.select_action(
+            obs, deterministic=True, mask=mask)
+        if direction == FLAT:
             self._heartbeat()
-            return {"status": "HOLD", "action": action}
+            return {"status": "FLAT", "direction": direction, "exit": exit_act}
 
-        lot = get_lot(lot_idx, max_lot)
-        fill = compute_fill(bar, direction, get_sl_pips(sl_idx),
-                            get_tp_pips(tp_idx), self.instrument, self.policy, atr_14)
+        lot = map_lot(lot_raw, max_lot)
+        # SL/TP handled deterministically by the risk module (DESIGN_DECISIONS #1);
+        # use policy default pip buffers for the protective levels.
+        sl_pips = int(self.cfg.get("DEFAULT_SL_PIPS", 20))
+        tp_pips = int(self.cfg.get("DEFAULT_TP_PIPS", 30))
+        fill = compute_fill(bar, direction, sl_pips, tp_pips,
+                            self.instrument, self.policy, atr_14)
         order = {"symbol": self.instrument, "direction": direction, "lot": lot,
                  "entry": fill["entry"], "sl": fill["sl"], "tp": fill["tp"]}
 

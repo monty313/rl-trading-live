@@ -78,7 +78,7 @@ def train(args) -> int:
         resume = ckpt_mgr.find_best_resume()
         if resume is not None:
             print(f"[train] resuming from {resume}", flush=True)
-            agent.load(str(resume), partial=True)   # partial bridges 7->756 if needed
+            agent.load(str(resume), partial=True)   # partial best-effort transfer on shared layers
         else:
             print("[train] no checkpoint found — fresh start", flush=True)
 
@@ -97,34 +97,21 @@ def train(args) -> int:
             state = env.reset()
             shaper.global_ep = global_ep
             done = torch.zeros(env.B, dtype=torch.bool, device=device)
-            daily_log = []
             steps = 0
             max_steps = env.ep_bars
+            rollout = int(cfg.get("ROLLOUT_STEPS", 2048))
+            # ── PPO on-policy rollout: collect transitions, update periodically ──
             while not done.all() and steps < max_steps:
-                mask = env.current_action_mask()
-                actions = agent.select_actions(state, mask=mask)
-                next_state, reward, done, info = env.step(actions)
-                # BUG 2 FIX: store the EXECUTED (post-mask) action, not the proposed one.
-                exec_act = info.get("executed_actions", actions)
-                agent.store(state, exec_act, reward, next_state, done)
-                agent.train_step()
+                mask = env.current_direction_mask()
+                out = agent.select_actions(state, mask=mask)
+                next_state, reward, done, info = env.step(out)
+                # Φ shaping bonus folded into the per-step reward (consistency).
+                agent.store(state, out, reward, done, mask)
                 state = next_state
                 steps += 1
-            # episode-end shaping bonus (consistency)
-            eq0 = float(info["equity"][0].item())
-            daily_log.append({"pass": bool(info["passed"][0].item()),
-                              "ret": (eq0 - env.initial_equity) / env.initial_equity,
-                              "dd": float(env.get_status_dict()["trades_today"]) * 0.0})
-            ep_bonus = shaper.compute_bonus(daily_log)
-            # BUG 3 FIX: do NOT push a fake (state, action=0, bonus) transition
-            # (that corrupts Q(s, FLAT)). Back-patch the bonus onto the last B
-            # REAL terminal transitions already in the replay buffer.
-            if ep_bonus and len(agent.memory) >= env.B:
-                buf = agent.memory
-                last_idx = (torch.arange(buf.ptr - env.B, buf.ptr,
-                                         device=device) % buf.capacity)
-                buf.rewards[last_idx] = buf.rewards[last_idx] + float(ep_bonus)
-            agent.decay_epsilon(global_ep)
+                if len(agent.buffer) >= rollout:
+                    agent.update()        # PPO update, then buffer clears
+            agent.update()                # flush any remaining rollout at episode end
 
             global_ep += 1
             ep_in_phase += 1

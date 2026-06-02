@@ -2,16 +2,15 @@
 import json
 import torch
 from training.checkpoint_manager import CheckpointManager, PROTECTED
-from core.agent.dqn import DQNAgent
-from core.agent.action_space import NUM_ACTIONS
+from core.agent.ppo import PPOAgent
 from core.settings import CFG
 
 DEV = torch.device("cpu")
 
 
 def _agent():
-    c = dict(CFG); c.update({"USE_AMP": False, "USE_TORCH_COMPILE": False, "MEMORY_SIZE": 100})
-    return DQNAgent(16, NUM_ACTIONS, c, DEV)
+    c = dict(CFG); c.update({"USE_AMP": False, "USE_TORCH_COMPILE": False})
+    return PPOAgent(16, c, DEV)
 
 
 def test_rolling_deletion_keeps_five_lowest_phi_removed(tmp_path, monkeypatch):

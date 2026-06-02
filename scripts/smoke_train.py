@@ -29,7 +29,7 @@ def main() -> int:
         "FEATURES": make_synthetic_ohlcv_array(n=500),
         "EPISODE_BARS": 120, "BARS_PER_DAY": 60,
         "USE_AMP": False, "USE_TORCH_COMPILE": False,
-        "MEMORY_SIZE": 2000, "BATCH_SIZE_RL": 32,
+        "ROLLOUT_STEPS": 32,
     })
     phase = {"name": "smoke", "entry_conditions": {"buy": "any", "sell": "any"}}
     env, agent, sizer, guard, gate = build_pipeline(cfg, device, phase=phase)
@@ -39,13 +39,15 @@ def main() -> int:
     done = torch.zeros(env.B, dtype=torch.bool, device=device)
     steps = 0
     while not done.all() and steps < env.ep_bars:
-        mask = env.current_action_mask()
-        actions = agent.select_actions(state, mask=mask)
-        next_state, reward, done, info = env.step(actions)
-        agent.store(state, actions, reward, next_state, done)
-        agent.train_step()
+        mask = env.current_direction_mask()
+        out = agent.select_actions(state, mask=mask)
+        next_state, reward, done, info = env.step(out)
+        agent.store(state, out, reward, done, mask)
+        if len(agent.buffer) >= 32:
+            agent.update()
         state = next_state
         steps += 1
+    agent.update()
     print(f"[smoke_train] episode complete in {steps} steps", flush=True)
 
     with tempfile.TemporaryDirectory() as tmp:

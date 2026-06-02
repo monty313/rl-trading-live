@@ -2,13 +2,13 @@
 import torch
 import pytest
 from core.env import conditions_engine as CE
-from core.agent.action_space import NUM_ACTIONS, BUY, SELL, HOLD, decode
+from core.agent.action_space import DIRECTION_DIM, BUY, SELL, FLAT
 
 DEV = torch.device("cpu")
 
 
 def _mask_dirs(mask):
-    return {decode(a)[0] for a in range(NUM_ACTIONS) if float(mask[a]) > 0.5}
+    return {d for d in range(DIRECTION_DIM) if float(mask[d]) > 0.5}
 
 
 # ── string-condition path ──
@@ -37,7 +37,7 @@ def test_string_buy_condition_masks_to_buy():
 def test_free_allows_all():
     phase = {"mask": None, "mask_type": "free"}
     mask, must = CE.compute_action_mask(phase, {1: {}}, DEV)
-    assert _mask_dirs(mask) == {HOLD, BUY, SELL}
+    assert _mask_dirs(mask) == {FLAT, BUY, SELL}
 
 
 # ── named phase mask truth tables ──
@@ -67,14 +67,17 @@ def test_phase6_atr_expansion():
 
 
 # ── mask_type semantics ──
-def test_force_in_and_gate_forces_entry_when_flat():
+def test_force_in_and_gate_active_masks_flat_always():
     phase = {"mask": "phase0_cci_extreme", "mask_type": "force_in_and_gate",
              "gate_timeframes": [1, 15]}
     extreme = {"cci30": 150.0, "cci100": 120.0}
     rows = {1: extreme, 15: extreme}
+    # flat -> must_enter True, FLAT masked
     mask, must = CE.compute_action_mask(phase, rows, DEV, is_flat=True)
-    assert _mask_dirs(mask) == {BUY, SELL}   # HOLD masked -> must trade
-    assert must is True                       # forced entry when flat
+    assert _mask_dirs(mask) == {BUY, SELL} and must is True
+    # already in a position -> FLAT still masked (no hold while active), no force
+    mask2, must2 = CE.compute_action_mask(phase, rows, DEV, is_flat=False)
+    assert _mask_dirs(mask2) == {BUY, SELL} and must2 is False
 
 
 def test_force_in_and_gate_blocks_entries_when_condition_false():
@@ -83,7 +86,7 @@ def test_force_in_and_gate_blocks_entries_when_condition_false():
     calm = {"cci30": 0.0, "cci100": 0.0}
     rows = {1: calm, 15: calm}
     mask, must = CE.compute_action_mask(phase, rows, DEV, is_flat=True)
-    assert _mask_dirs(mask) == {HOLD}   # no new entries; HOLD/exit only
+    assert _mask_dirs(mask) == {FLAT}   # no new entries; FLAT/exit only
     assert must is False
 
 
@@ -93,10 +96,10 @@ def test_open_gate_allows_all_when_true_hold_only_when_false():
     aligned = {"cci30": 10.0, "cci30_sma1_sh8": 5.0,
                "cci100": 8.0, "cci100_sma1_sh8": 3.0}
     rows = {1: aligned, 15: aligned}
-    mask, must = CE.compute_action_mask(phase, rows, DEV)
-    assert _mask_dirs(mask) == {HOLD, BUY, SELL} and must is False
+    mask, must = CE.compute_action_mask(phase, rows, DEV, is_flat=True)
+    assert _mask_dirs(mask) == {BUY, SELL}   # active gate -> no FLAT, in any phase
     misaligned = {"cci30": 10.0, "cci30_sma1_sh8": 5.0,
                   "cci100": -8.0, "cci100_sma1_sh8": -3.0}   # disagree
     rows2 = {1: misaligned, 15: misaligned}
     mask2, _ = CE.compute_action_mask(phase, rows2, DEV)
-    assert _mask_dirs(mask2) == {HOLD}   # gate closed -> no new entries
+    assert _mask_dirs(mask2) == {FLAT}   # gate closed -> no new entries

@@ -5,7 +5,7 @@ BatchedFTMOEnv — B parallel trading episodes stepped in lockstep on GPU tensor
 Ported from gpu_rl_trading/env/environment.py (REPO1) with these changes:
 
   (a) Wires core/env/intrabar_fills.compute_fill for entry/SL/TP on each trade.
-  (b) Adds a (B, 756) action mask: Q-values get -1e9 on masked actions before
+  (b) Adds a (B, DIRECTION_DIM) direction mask applied to PPO logits before
       argmax. The mask is produced by conditions_engine from the active phase.
   (c) Multi-symbol: load EURUSD / GBPUSD / XAUUSD / US30 (or aligned baskets).
   (d) PASS/FAIL rule (HARD RULE 7):
@@ -29,7 +29,8 @@ import torch
 
 import pandas as pd
 
-from core.agent.action_space import NUM_ACTIONS, BUY, SELL, HOLD, decode
+from core.agent.action_space import (DIRECTION_DIM, FLAT, BUY, SELL, HOLD,
+                                     map_lot)
 from core.env.indicators import (build_feature_matrix, NUM_FEATURES, COL,
                                  feature_row_dict, compute_indicators,
                                  resample_ohlcv)
@@ -56,7 +57,8 @@ class BatchedFTMOEnv:
         self.max_dd_pct = float(cfg.get("DAILY_MAX_DD_PCT", 0.010))
         self.initial_equity = float(cfg.get("INITIAL_EQUITY", 100_000.0))
         self.bars_per_day = int(cfg.get("BARS_PER_DAY", 1440))
-        self.num_actions = NUM_ACTIONS
+        self.max_lot = float(cfg.get("MAX_LOT", 2.0))
+        self.direction_dim = DIRECTION_DIM
 
         # ── Preload the feature matrix to device (built if raw OHLCV passed) ──
         feat = self._ensure_feature_matrix(features)
@@ -104,6 +106,11 @@ class BatchedFTMOEnv:
         self._dd_breached = torch.zeros(B, dtype=torch.bool, device=d)
         self._trades_today = torch.zeros(B, dtype=torch.long, device=d)
         self._done = torch.zeros(B, dtype=torch.bool, device=d)
+        # PPO/day-reward state
+        self._day_halted = torch.zeros(B, dtype=torch.bool, device=d)  # DD-ended day
+        self._day_passed = torch.zeros(B, dtype=torch.bool, device=d)
+        self._pass_streak = torch.zeros(B, dtype=torch.long, device=d)
+        self._equity_prev = torch.full((B,), self.initial_equity, device=d)
 
     def _abs_idx(self) -> torch.Tensor:
         return (self._start + self._step_i).clamp(0, self.T - 1)
@@ -165,6 +172,11 @@ class BatchedFTMOEnv:
         self._dd_breached.zero_()
         self._trades_today.zero_()
         self._done.zero_()
+        self._day_halted.zero_()
+        self._day_passed.zero_()
+        # NOTE: _pass_streak intentionally persists across episodes within a phase
+        # (DESIGN_DECISIONS.md #7 — consecutive pass-days counter is phase-level).
+        self._equity_prev.fill_(self.initial_equity)
         return self._get_state()
 
     # ── state ──────────────────────────────────────────────────────────────────
@@ -193,56 +205,59 @@ class BatchedFTMOEnv:
         return torch.cat([norm, pos_feat], dim=1)
 
     # ── action mask (RULE 12) ──────────────────────────────────────────────────
-    def current_action_mask(self) -> torch.Tensor:
-        """(B, NUM_ACTIONS) float mask for the current bar (see current_mask_and_force)."""
+    def current_direction_mask(self) -> torch.Tensor:
+        """(B, DIRECTION_DIM) float mask for the PPO direction head this bar."""
         mask_1d, _ = self.current_mask_and_force()
         return mask_1d.unsqueeze(0).expand(self.B, -1).contiguous()
 
     def current_mask_and_force(self) -> Tuple[torch.Tensor, bool]:
         """
-        Returns (mask (NUM_ACTIONS,), must_enter). Uses per-TF indicator rows when
-        available (named phase masks); falls back to the compact feature row for
-        string-condition phases. must_enter=True (force entry) only for
-        force_in_and_gate when the gate holds and the agent is flat.
+        Returns (dir_mask (DIRECTION_DIM,), must_enter). Uses per-TF indicator rows
+        when available (named phase masks); falls back to the compact feature row
+        for string-condition phases. must_enter=True only for force_in_and_gate
+        when the gate holds and the agent is flat (the agent still picks BUY/SELL).
         """
         is_flat = bool((self._position[0] == 0).item())
         rows = self._rows_by_tf()
         if not rows:
-            # fallback: single compact row at TF=1 for string-condition phases
             abs_idx = self._abs_idx()
             rows = {1: feature_row_dict(self.features[abs_idx[0]])}
         return conditions_engine.compute_action_mask(
-            self.phase, rows, self.device, self.num_actions, is_flat=is_flat)
-
-    def apply_mask_to_q(self, q_values: torch.Tensor) -> torch.Tensor:
-        """Add -1e9 to masked Q-values so argmax never selects them."""
-        mask = self.current_action_mask()
-        return q_values + (1.0 - mask) * _NEG_INF
+            self.phase, rows, self.device, is_flat=is_flat)
 
     # ── step ────────────────────────────────────────────────────────────────────
-    def step(self, actions: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor,
-                                                    torch.Tensor, Dict]:
+    def step(self, actions) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, Dict]:
         """
-        Advance one bar for all B episodes. actions: (B,) long tensor of ids 0..755.
+        Advance one bar for all B episodes with a PPO structured action.
+
+        actions: a dict from PPOAgent.select_actions with keys:
+          direction (B,) long {FLAT,BUY,SELL}, lot_raw (B,) float in [0,1],
+          exit (B,) long {HOLD,REDUCE,CLOSE}.
         Returns (next_state, reward (B,), done (B,) bool, info dict).
         """
-        actions = actions.to(self.device).long()
+        direction = actions["direction"].to(self.device).long()
+        lot_raw = actions["lot_raw"].to(self.device).float()
+        exit_a = actions.get("exit")
+        exit_a = (exit_a.to(self.device).long() if exit_a is not None
+                  else torch.zeros(self.B, dtype=torch.long, device=self.device))
+
         abs_idx = self._abs_idx()
         close = self.features[abs_idx, COL["close"]]
         nxt_idx = (abs_idx + 1).clamp(0, self.T - 1)
         next_close = self.features[nxt_idx, COL["close"]]
 
-        # Decode action components vectorized (direction, lot bucket bps).
+        # Direction sign (+1 buy / -1 sell / 0 flat) and per-trade lot (continuous).
         dirs = torch.zeros(self.B, device=self.device)
-        lots = torch.zeros(self.B, device=self.device)
-        # lookup tables on device
-        for b in range(self.B):  # B is tiny (<=64); not a CPU-sync hot path
-            d, lot_idx, _sl, _tp = decode(int(actions[b].item()))
-            sign = 0.0 if d == HOLD else (1.0 if d == BUY else -1.0)
-            dirs[b] = sign
-            # simple lot model: bucket fraction of a base 0.1 lot (sizer refines live)
-            lots[b] = 0.0 if d == HOLD else float([0.01, 0.02, 0.05, 0.10, 0.20,
-                                                   0.50, 1.0][lot_idx])
+        dirs = torch.where(direction == BUY, torch.ones_like(dirs), dirs)
+        dirs = torch.where(direction == SELL, -torch.ones_like(dirs), dirs)
+        # map raw [0,1] -> [MIN_LOT, max_lot] (same mapping as action_space.map_lot)
+        lots = 0.01 + lot_raw.clamp(0, 1) * (self.max_lot - 0.01)
+        lots = torch.where(dirs != 0, lots, torch.zeros_like(lots))
+
+        # Once the day is halted (DD hit), no new positions open this day.
+        halted = self._day_halted
+        dirs = torch.where(halted, torch.zeros_like(dirs), dirs)
+        lots = torch.where(halted, torch.zeros_like(lots), lots)
 
         # Realize PnL on existing position when direction flips or HOLD->close.
         had_pos = self._position != 0
@@ -277,12 +292,49 @@ class BatchedFTMOEnv:
         self._trades_today = torch.where(new_day,
                                          torch.zeros_like(self._trades_today),
                                          self._trades_today)
+        # new day clears the intraday DD halt (fresh trading day, FTMO CEST)
+        self._day_halted = torch.where(new_day, torch.zeros_like(self._day_halted),
+                                       self._day_halted)
+        self._dd_breached = torch.where(new_day, torch.zeros_like(self._dd_breached),
+                                        self._dd_breached)
 
         self._equity = equity_now
 
-        # ── reward: shaped daily return, with PASS/FAIL terminal logic ──
+        # ── INTRADAY 1% DD ENDS THE TRADING DAY (DESIGN_DECISIONS.md #5) ──
+        # When today's trailing DD first hits the limit, halt trading for the
+        # rest of the day (positions flattened, no new entries until next day).
+        newly_halted = breach_now & (~self._day_halted)
+        self._day_halted = self._day_halted | breach_now
+        self._position = torch.where(self._day_halted, torch.zeros_like(self._position),
+                                     self._position)
+
+        # ── per-day reward (progressive consistency) at each day boundary ──
         daily_ret = (self._equity - self._day_start_eq) / (self._day_start_eq + 1e-8)
-        reward = daily_ret.clone()
+        reward = (daily_ret - daily_ret) if False else torch.zeros_like(daily_ret)
+        # small step signal = change in unrealised/realised equity this bar
+        reward = reward + (equity_now - self._equity_prev) / (self.initial_equity + 1e-8)
+        self._equity_prev = equity_now.clone()
+
+        # day-end (new_day) OR newly-halted -> classify PASS/OK/FAIL for the day
+        day_closed = new_day | newly_halted
+        dd_today = (self._day_high_eq - equity_now) / (self._day_high_eq + 1e-8)
+        passed = (daily_ret >= self.target_pct) & (dd_today <= self.max_dd_pct)
+        failed = (dd_today > self.max_dd_pct) | (daily_ret < 0)
+        self._day_passed = torch.where(day_closed & passed,
+                                       torch.ones_like(self._day_passed), self._day_passed)
+        # progressive day bonus (pass/ok/fail + streak) applied at day close
+        pass_b = float(self.cfg.get("REWARD", {}).get("pass_day_bonus", 2.0))
+        ok_b = float(self.cfg.get("REWARD", {}).get("ok_day_bonus", 0.5))
+        fail_b = float(self.cfg.get("REWARD", {}).get("fail_day_penalty", -2.0))
+        streak_s = float(self.cfg.get("REWARD", {}).get("streak_scale", 0.1))
+        self._pass_streak = torch.where(day_closed & passed, self._pass_streak + 1,
+                                        torch.where(day_closed,
+                                                    torch.zeros_like(self._pass_streak),
+                                                    self._pass_streak))
+        day_reward = (passed.float() * pass_b + failed.float() * fail_b
+                      + ((~passed) & (~failed)).float() * ok_b
+                      + streak_s * self._pass_streak.float())
+        reward = reward + day_closed.float() * day_reward
 
         # episode termination: reached ep_bars or trade cap
         max_trades = int(self.cfg.get("MAX_TRADES_PER_DAY", 800))
@@ -290,30 +342,19 @@ class BatchedFTMOEnv:
         ep_end = (self._step_i >= self.ep_bars) | cap_hit
         self._done = self._done | ep_end
 
-        # PASS/FAIL on episode end (RULE 7)
-        target_balance = self.initial_equity * (1.0 + self.target_pct)
-        passed = self._equity >= target_balance
         pass_no_breach = passed & (~self._dd_breached)
-        reward = reward + ep_end.float() * (
-            passed.float() * 0.025                       # PASS reward
-            - ((~passed) & self._dd_breached).float() * 0.010   # FAIL penalty
-            + pass_no_breach.float() * float(self.cfg.get("PASS_NO_BREACH_BONUS", 0.01))
-        )
-
         info = {
             "equity": self._equity.detach(),
             "passed": passed.detach(),
             "dd_breached": self._dd_breached.detach(),
             "trades_today": self._trades_today.detach(),
             "pass_no_breach": pass_no_breach.detach(),
-            # BUG 2 FIX: the agent must learn from the action that was ACTUALLY
-            # executed after masking, not the one it proposed. Here the env does
-            # not silently remap actions (masking is applied to Q-values BEFORE
-            # selection via apply_mask_to_q / select_actions(mask=...)), so the
-            # selected action IS the executed action. We still surface it in
-            # info["executed_actions"] so train.py always stores the executed
-            # action explicitly and the contract is unambiguous.
-            "executed_actions": actions.detach(),
+            "day_closed": day_closed.detach(),
+            "day_halted": self._day_halted.detach(),
+            "pass_streak": self._pass_streak.detach(),
+            # PPO masking is applied to direction logits BEFORE sampling, so the
+            # sampled direction IS the executed direction (no silent remap).
+            "executed_direction": direction.detach(),
         }
         return self._get_state(), reward, self._done.clone(), info
 

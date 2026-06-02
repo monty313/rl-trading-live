@@ -1,4 +1,9 @@
 """
+DEPRECATED — moved to legacy/ (see DESIGN_DECISIONS.md #1).
+The live agent is PURE PPO (core/agent/ppo.py). This DQN implementation is kept
+for reference and checkpoint archaeology only; nothing in the live system imports it.
+"""
+"""
 core/agent/dqn.py
 ────────────────────────────────────────────────────────────────────────────
 GPU DQN agent. Ported from gpu_rl_trading/agent/dqn.py + replay.py (REPO1) with:

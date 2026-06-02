@@ -2,6 +2,7 @@
 import torch
 from core.settings import CFG, auto_tune_batch
 from core.env.environment import BatchedFTMOEnv, build_multi_symbol_env
+from core.agent.action_space import DIRECTION_DIM, FLAT
 from tests.fixtures.sample_candles import make_synthetic_ohlcv_array
 
 DEV = torch.device("cpu")
@@ -28,27 +29,32 @@ def test_state_shape():
 def test_step_contract():
     env = _env()
     env.reset()
-    actions = torch.zeros(env.B, dtype=torch.long)
-    s, r, d, info = env.step(actions)
+    out = {"direction": torch.zeros(env.B, dtype=torch.long),
+           "lot_raw": torch.zeros(env.B),
+           "exit": torch.zeros(env.B, dtype=torch.long)}
+    s, r, d, info = env.step(out)
     assert s.shape == (env.B, env.state_dim)
     assert r.shape == (env.B,)
     assert d.dtype == torch.bool and d.shape == (env.B,)
-    assert "equity" in info and "passed" in info
+    assert "equity" in info and "passed" in info and "executed_direction" in info
 
 
-def test_action_mask_shape():
+def test_direction_mask_shape():
     env = _env()
     env.reset()
-    mask = env.current_action_mask()
-    assert mask.shape == (env.B, env.num_actions)
+    mask = env.current_direction_mask()
+    assert mask.shape == (env.B, DIRECTION_DIM)
 
 
 def test_episode_terminates():
     env = _env()
     env.reset()
     done_any = False
+    flat = {"direction": torch.zeros(env.B, dtype=torch.long),
+            "lot_raw": torch.zeros(env.B),
+            "exit": torch.zeros(env.B, dtype=torch.long)}
     for _ in range(200):
-        s, r, d, info = env.step(torch.zeros(env.B, dtype=torch.long))
+        s, r, d, info = env.step(flat)
         if d.any():
             done_any = True
             break
