@@ -335,9 +335,12 @@ class BatchedFTMOEnv:
 
         # day-end (new_day) OR newly-halted -> classify PASS/OK/FAIL for the day
         day_closed = new_day | newly_halted
+        # A day with zero trades is ignored — no reward, no penalty, streak unchanged.
+        # Floating-point noise on a flat equity must not trigger FAIL.
+        traded_today = self._trades_today > 0
         dd_today = (self._day_high_eq - equity_now) / (self._day_high_eq + 1e-8)
-        passed = (daily_ret >= self.target_pct) & (dd_today <= self.max_dd_pct)
-        failed = (dd_today > self.max_dd_pct) | (daily_ret < 0)
+        passed = traded_today & (daily_ret >= self.target_pct) & (dd_today <= self.max_dd_pct)
+        failed = traded_today & ((dd_today > self.max_dd_pct) | (daily_ret < 0))
         self._day_passed = torch.where(day_closed & passed,
                                        torch.ones_like(self._day_passed), self._day_passed)
         # progressive day bonus (pass/ok/fail + streak) applied at day close
@@ -346,11 +349,11 @@ class BatchedFTMOEnv:
         fail_b = float(self.cfg.get("REWARD", {}).get("fail_day_penalty", -2.0))
         streak_s = float(self.cfg.get("REWARD", {}).get("streak_scale", 0.1))
         self._pass_streak = torch.where(day_closed & passed, self._pass_streak + 1,
-                                        torch.where(day_closed,
+                                        torch.where(day_closed & (passed | failed),
                                                     torch.zeros_like(self._pass_streak),
                                                     self._pass_streak))
         day_reward = (passed.float() * pass_b + failed.float() * fail_b
-                      + ((~passed) & (~failed)).float() * ok_b
+                      + (traded_today & ~passed & ~failed).float() * ok_b
                       + streak_s * self._pass_streak.float())
         reward = reward + day_closed.float() * day_reward
 
