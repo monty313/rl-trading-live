@@ -78,7 +78,9 @@ def check_trading_policy():
 def check_all_imports():
     """Walk the repo and import every module (orphan/import check)."""
     failed = []
-    skip_dirs = (".git", "__pycache__", "audit", "tests/fixtures", "dashboard", "legacy")
+    # Skip tests/ (pytest imports + runs those; some use importorskip at module
+    # level), plus dirs that aren't plain importable modules.
+    skip_dirs = (".git", "__pycache__", "audit", "tests", "dashboard", "legacy")
     for dirpath, _dirs, files in os.walk(ROOT):
         if any(s in dirpath for s in skip_dirs):
             continue

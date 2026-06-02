@@ -30,7 +30,7 @@ import torch
 import pandas as pd
 
 from core.agent.action_space import (DIRECTION_DIM, FLAT, BUY, SELL, HOLD,
-                                     map_lot)
+                                     EXIT_REDUCE, EXIT_CLOSE, map_lot)
 from core.env.indicators import (build_feature_matrix, NUM_FEATURES, COL,
                                  feature_row_dict, compute_indicators,
                                  resample_ohlcv)
@@ -259,7 +259,25 @@ class BatchedFTMOEnv:
         dirs = torch.where(halted, torch.zeros_like(dirs), dirs)
         lots = torch.where(halted, torch.zeros_like(lots), lots)
 
-        # Realize PnL on existing position when direction flips or HOLD->close.
+        # ── EXIT head wired into position management (action_space EXIT_*) ──
+        # EXIT_CLOSE flattens the open position; EXIT_REDUCE halves it; EXIT_HOLD
+        # leaves it. Applied to the EXISTING position before any new entry. PnL on
+        # the closed/reduced fraction is realized at the current close.
+        had_pos0 = self._position != 0
+        price_move0 = (close - self._entry_px) * torch.sign(self._position)
+        pnl_per_unit = price_move0 * self._position.abs() * 100000.0
+        do_close = had_pos0 & (exit_a == EXIT_CLOSE)
+        do_reduce = had_pos0 & (exit_a == EXIT_REDUCE)
+        # realize PnL on the closed (100%) and reduced (50%) fractions
+        exit_realized = (do_close.float() * pnl_per_unit
+                         + do_reduce.float() * pnl_per_unit * 0.5)
+        self._equity = self._equity + exit_realized * 0.0001
+        # shrink/close the position per the exit action
+        self._position = torch.where(do_close, torch.zeros_like(self._position),
+                                     self._position)
+        self._position = torch.where(do_reduce, self._position * 0.5, self._position)
+
+        # Realize PnL on existing position when direction flips (new entry).
         had_pos = self._position != 0
         price_move = (close - self._entry_px) * torch.sign(self._position)
         realized = torch.where(had_pos, price_move * self._position.abs() * 100000.0,
@@ -267,9 +285,9 @@ class BatchedFTMOEnv:
         # open new position where a non-hold action is taken
         opening = dirs != 0
         self._trades_today = self._trades_today + opening.long()
-        self._equity = self._equity + torch.where(opening | had_pos, realized,
+        self._equity = self._equity + torch.where(opening, realized,
                                                   torch.zeros_like(realized)) * 0.0001
-        self._position = torch.where(opening, dirs * lots, torch.zeros_like(dirs))
+        self._position = torch.where(opening, dirs * lots, self._position)
         self._entry_px = torch.where(opening, close, self._entry_px)
 
         # mark-to-market with next close
