@@ -98,17 +98,63 @@ def train(args) -> int:
             shaper.global_ep = global_ep
             done = torch.zeros(env.B, dtype=torch.bool, device=device)
             steps = 0
+            day_num = 0
+            ep_days_passed = ep_days_failed = ep_days_ok = 0
+            ep_total_reward = 0.0
             max_steps = env.ep_bars
             rollout = int(cfg.get("ROLLOUT_STEPS", 2048))
+            initial_equity = float(cfg.get("INITIAL_EQUITY", 100_000))
             # ── PPO on-policy rollout: collect transitions, update periodically ──
             while not done.all() and steps < max_steps:
                 mask = env.current_direction_mask()
                 out = agent.select_actions(state, mask=mask)
                 next_state, reward, done, info = env.step(out)
-                # Φ shaping bonus folded into the per-step reward (consistency).
                 agent.store(state, out, reward, done, mask)
                 state = next_state
                 steps += 1
+                ep_total_reward += float(reward[0].item())
+
+                # ── print a line for each day that closes (env batch item 0) ──
+                if info["day_closed"][0].item():
+                    day_num += 1
+                    eq       = float(info["equity"][0].item())
+                    passed   = bool(info["passed"][0].item())
+                    halted   = bool(info["day_halted"][0].item())
+                    streak   = int(info["pass_streak"][0].item())
+                    trades   = int(info["trades_today"][0].item())
+                    day_ret  = (eq - initial_equity) / (initial_equity + 1e-9) * 100
+
+                    rw       = cfg.get("REWARD", {}) or {}
+                    pass_b   = float(rw.get("pass_day_bonus",   2.0))
+                    ok_b     = float(rw.get("ok_day_bonus",     0.5))
+                    fail_b   = float(rw.get("fail_day_penalty", -2.0))
+                    streak_b = float(rw.get("streak_scale",     0.1)) * streak
+
+                    if passed:
+                        ep_days_passed += 1
+                        label  = "✅ PASS"
+                        base_r = pass_b
+                    elif halted or day_ret < 0:
+                        ep_days_failed += 1
+                        label  = "❌ FAIL"
+                        base_r = fail_b
+                    else:
+                        ep_days_ok += 1
+                        label  = "🟡 OK  "
+                        base_r = ok_b
+
+                    halt_tag = "  ⛔ DD-HALT" if halted else ""
+                    print(
+                        f"    Day {day_num:>2}  {label}"
+                        f"  │  equity {eq:>10,.2f}  ({day_ret:+.3f}%)"
+                        f"  │  trades {trades:>3}"
+                        f"  │  streak {streak}"
+                        f"  │  reward {base_r+streak_b:+.2f}"
+                        f"  (base {base_r:+.1f}  streak {streak_b:+.2f})"
+                        f"{halt_tag}",
+                        flush=True,
+                    )
+
                 if len(agent.buffer) >= rollout:
                     agent.update()        # PPO update, then buffer clears
             loss = agent.update()          # flush any remaining rollout at episode end
@@ -116,15 +162,17 @@ def train(args) -> int:
             global_ep += 1
             ep_in_phase += 1
 
-            # ── per-episode progress line ─────────────────────────────────────
+            # ── episode summary ───────────────────────────────────────────────
             eq_now   = float(env._equity.mean().item())
-            eq_start = float(cfg.get("INITIAL_EQUITY", 100_000))
-            day_ret  = (eq_now - eq_start) / (eq_start + 1e-9) * 100
-            loss_str = f"  loss={loss:.4f}" if loss is not None else ""
+            ep_ret   = (eq_now - initial_equity) / (initial_equity + 1e-9) * 100
+            loss_str = f"  loss {loss:.4f}" if loss is not None else ""
             print(
-                f"[{phase['name']}] ep={global_ep:>4}  steps={steps:>5}"
-                f"  equity={eq_now:>10,.2f}  ret={day_ret:+.3f}%"
-                f"{loss_str}  best_phi={best_phi:.4f}",
+                f"  {'─'*70}\n"
+                f"  Episode {global_ep:>4}  [{phase['name']}]"
+                f"  │  {ep_days_passed}✅ {ep_days_ok}🟡 {ep_days_failed}❌"
+                f"  │  equity {eq_now:>10,.2f}  ({ep_ret:+.3f}%)"
+                f"  │  reward {ep_total_reward:+.2f}"
+                f"{loss_str}  │  best_phi {best_phi:.4f}",
                 flush=True,
             )
 
@@ -138,12 +186,14 @@ def train(args) -> int:
                     ckpt_mgr.save(agent, phase["name"], global_ep,
                                   phi=best_phi, pass_rate=metrics["pass_rate"],
                                   name="best_eval.pt")
+                new_best = metrics["phi"] > best_phi
                 print(
-                    f"  ↳ EVAL  pass={metrics['pass_rate']*100:.1f}%"
-                    f"  phi={metrics['phi']:.4f}"
-                    f"  avg_ret={metrics['avg_daily_return']*100:+.3f}%"
-                    f"  avg_dd={metrics['avg_daily_dd']*100:.3f}%"
-                    + (" ★ new best" if metrics["phi"] > best_phi else ""),
+                    f"  {'═'*70}\n"
+                    f"  🔍 EVAL  pass {metrics['pass_rate']*100:.1f}%"
+                    f"  │  phi {metrics['phi']:.4f}"
+                    f"  │  avg_ret {metrics['avg_daily_return']*100:+.3f}%"
+                    f"  │  avg_dd {metrics['avg_daily_dd']*100:.3f}%"
+                    + ("  ⭐ NEW BEST" if new_best else ""),
                     flush=True,
                 )
                 if infinite:
