@@ -188,16 +188,22 @@ class CheckpointManager:
 
     # ── resume selection ─────────────────────────────────────────────────────
     def find_best_resume(self, phase=None) -> Optional[Path]:
-        """Return path of the highest-Φ non-corrupt checkpoint (prefer `phase`)."""
+        """Return path of the highest-Φ non-corrupt PPO checkpoint (prefer `phase`).
+        Skips checkpoints whose phase is 'unknown' — these are legacy DQN files
+        that cannot be loaded by PPOAgent and would cause a CUDAGraphs crash."""
         self.load_manifest()
         cks = self.manifest["checkpoints"]
-        candidates = [(n, m) for n, m in cks.items()
-                      if not m.get("corrupt") and (self.checkpoint_dir / n).exists()]
+        candidates = [
+            (n, m) for n, m in cks.items()
+            if not m.get("corrupt")
+            and m.get("phase", "unknown") != "unknown"   # skip legacy DQN
+            and (self.checkpoint_dir / n).exists()
+        ]
         if not candidates:
             return None
         if phase is not None:
             phase_cands = [(n, m) for n, m in candidates if m.get("phase") == phase]
             if phase_cands:
                 candidates = phase_cands
-        best = max(candidates, key=lambda kv: kv[1].get("phi", 0.0))
+        best = max(candidates, key=lambda kv: kv[1].get("phi", -1e9))
         return self.checkpoint_dir / best[0]
