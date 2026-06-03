@@ -12,7 +12,8 @@ def test_compute_indicators_has_authoritative_columns():
         ["open", "high", "low", "close", "tick_volume"]].rename(
         columns={"tick_volume": "volume"})
     ind = compute_indicators(df)
-    for col in ["cci10", "cci30", "cci10_sma1_sh8", "cci30_sma1_sh8",
+    for col in ["cci10", "cci30", "cci100",
+                "cci30_sma1_sh8", "cci100_sma1_sh8",
                 "atr14", "atr14_sma1_sh8", "atr45", "atr45_sma1_sh8",
                 "bb20_upper", "bb20_mid", "bb200_upper", "bb200_mid",
                 "high_sma4_sh8", "low_sma4_sh8", "sma2_sh0", "sma2_sh4",

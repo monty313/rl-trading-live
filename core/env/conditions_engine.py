@@ -75,11 +75,17 @@ def phase0_cci_extreme(r1, r2) -> bool:
 
 
 def phase1_cci_align(r1, r2) -> bool:
-    """CCI10 & CCI30 each above/below their SMA(1,+8) on both TFs, all agree."""
+    """All FOUR of CCI(30) & CCI(100) above their SMA(1,+8) — OR all four below —
+    at the SAME bar on BOTH timeframes (1m AND 15m), direction agreeing.
+
+    Per-TF direction: +1 only if BOTH CCI(30)>its SMA(1,+8) AND CCI(100)>its
+    SMA(1,+8); -1 only if BOTH are below; 0 otherwise. The gate fires when both
+    TFs are non-zero and agree (all bullish, or all bearish). SMA(1,+8) is the
+    CCI value forward-shifted 8 bars (period-1 SMA == the value itself)."""
     def _dir(r):
-        d10 = _aligned(_g(r, "cci10"), _g(r, "cci10_sma1_sh8"))
         d30 = _aligned(_g(r, "cci30"), _g(r, "cci30_sma1_sh8"))
-        return d10 if (d10 != 0 and d10 == d30) else 0
+        d100 = _aligned(_g(r, "cci100"), _g(r, "cci100_sma1_sh8"))
+        return d30 if (d30 != 0 and d30 == d100) else 0
     d1, d2 = _dir(r1), _dir(r2)
     return d1 != 0 and d1 == d2
 
@@ -169,7 +175,7 @@ def phase6_atr_expansion(r1, r2) -> bool:
 # name -> (function, mask_type, [tf_a, tf_b])
 MASK_REGISTRY: Dict[str, Tuple[Callable, str, list]] = {
     "phase0_cci_extreme":  (phase0_cci_extreme,  "force_in_and_gate", [1, 15]),
-    "phase1_cci_align":    (phase1_cci_align,     "open_gate",         [1, 15]),
+    "phase1_cci_align":    (phase1_cci_align,     "force_in_and_gate", [1, 15]),
     "phase2_hilo_trend":   (phase2_hilo_trend,    "force_in_and_gate", [1, 30]),
     "phase3_hilo_counter": (phase3_hilo_counter,  "force_in_and_gate", [1, 15]),
     "phase4_bb_position":  (phase4_bb_position,   "force_in_and_gate", [1, 15]),

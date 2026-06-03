@@ -41,17 +41,19 @@ max_episodes_per_phase: 500
 
 phases:
 
-  - name: phase0_cci_extreme
+  # Phase 1 trains FIRST (order 0): CCI(30) & CCI(100) vs their SMA(1,+8),
+  # all four above OR all four below, on both 1m and 15m. force_in_and_gate.
+  - name: phase1_cci_align
     order: 0
-    mask: phase0_cci_extreme
+    mask: phase1_cci_align
     mask_type: force_in_and_gate
     gate_timeframes: [1, 15]
     instruments: [EURUSD]
 
-  - name: phase1_cci_align
+  - name: phase0_cci_extreme
     order: 1
-    mask: phase1_cci_align
-    mask_type: open_gate           # gate entries only; agent learns exits
+    mask: phase0_cci_extreme
+    mask_type: force_in_and_gate
     gate_timeframes: [1, 15]
     instruments: [EURUSD]
 

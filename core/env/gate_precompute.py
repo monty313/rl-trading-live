@@ -122,12 +122,12 @@ def _aligned_sign(val: np.ndarray, ref: np.ndarray) -> np.ndarray:
 
 
 def _v_phase1(a, b) -> np.ndarray:
-    """CCI10 & CCI30 each vs their sma1_sh8 on both TFs, all agree.
-    Mirrors phase1_cci_align."""
+    """CCI(30) & CCI(100) each vs their SMA(1,+8) on both TFs, all four agree
+    (all above, or all below). Mirrors phase1_cci_align EXACTLY."""
     def _dir(d):
-        d10 = _aligned_sign(d["cci10"], d["cci10_sma1_sh8"])
         d30 = _aligned_sign(d["cci30"], d["cci30_sma1_sh8"])
-        return np.where((d10 != 0) & (d10 == d30), d10, 0)
+        d100 = _aligned_sign(d["cci100"], d["cci100_sma1_sh8"])
+        return np.where((d30 != 0) & (d30 == d100), d30, 0)
     d1, d2 = _dir(a), _dir(b)
     return (d1 != 0) & (d1 == d2)
 
@@ -202,8 +202,8 @@ def _v_phase6(a, b) -> np.ndarray:
 # each row), so we list them once and reuse for both timeframes.
 _VEC_REGISTRY = {
     "phase0_cci_extreme":   (_v_phase0, ["cci10", "cci30"]),
-    "phase1_cci_align":     (_v_phase1, ["cci10", "cci30", "cci10_sma1_sh8",
-                                         "cci30_sma1_sh8"]),
+    "phase1_cci_align":     (_v_phase1, ["cci30", "cci100", "cci30_sma1_sh8",
+                                         "cci100_sma1_sh8"]),
     "phase2_hilo_trend":    (_v_phase2, ["close", "high_sma4_sh8", "low_sma4_sh8"]),
     "phase3_hilo_counter":  (_v_phase3, ["close", "high_sma4_sh8", "low_sma4_sh8"]),
     "phase4_bb_position":   (_v_phase4, ["close", "bb200_mid", "bb20_upper",

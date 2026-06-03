@@ -189,15 +189,24 @@ def compute_indicators(df: pd.DataFrame) -> pd.DataFrame:
     out["rsi7"] = pd.Series(_rsi(c, 7), index=idx)
     out["rsi5"] = pd.Series(_rsi(c, 5), index=idx)
 
-    # ── CCI (10, 14, 30, 140) — NO 300/900 ──
-    # cci10 and cci30 are the primary phase gate indicators (changed from 30/100)
+    # ── CCI (10, 14, 30, 100, 140) — NO 300/900 ──
+    # cci30 and cci100 are the Phase 1 gate indicators (reverted from the
+    # short-lived cci10/cci30 experiment back to the authoritative 30/100).
+    # cci10 is still computed because Phase 0 (phase0_cci_extreme) gates on it.
     out["cci10"] = pd.Series(_cci(h, l, c, 10), index=idx)
     out["cci14"] = pd.Series(_cci(h, l, c, 14), index=idx)
     out["cci30"] = pd.Series(_cci(h, l, c, 30), index=idx)
+    out["cci100"] = pd.Series(_cci(h, l, c, 100), index=idx)
     out["cci140"] = pd.Series(_cci(h, l, c, 140), index=idx)
-    # shifted SMA(1,+8) on CCI10/30 (Phase 1 gate) + compat MAs
-    out["cci10_sma1_sh8"] = _sma_series(out["cci10"], 1, shift=8)
+    # Phase 1 gate refs: SMA(1) of each CCI shifted FORWARD 8 bars. A period-1
+    # SMA equals the series itself, so SMA(1,+8) is just the CCI value shifted
+    # forward 8 bars — i.e. each bar is compared against the CCI value from 8
+    # bars earlier. Implemented as a +8 forward shift; intent is "CCI vs its own
+    # value 8 bars ago".
     out["cci30_sma1_sh8"] = _sma_series(out["cci30"], 1, shift=8)
+    out["cci100_sma1_sh8"] = _sma_series(out["cci100"], 1, shift=8)
+    # cci10 SMA(1,+8) kept for compatibility (Phase 0 helpers / older configs).
+    out["cci10_sma1_sh8"] = _sma_series(out["cci10"], 1, shift=8)
     out["cci14_sma20"] = _sma_series(out["cci14"], 20)
     out["cci30_sma20"] = _sma_series(out["cci30"], 20)
     out["cci140_sma1_sh4"] = _sma_series(out["cci140"], 1, shift=4)
@@ -259,7 +268,8 @@ FEATURE_COLUMNS = [
     "sma_20", "ema_20", "cci_14", "atr_14", "atr_14_ma",
     "rolling_high_20", "rolling_low_20",
     # authoritative gate variables exposed to VARIABLE_REGISTRY:
-    "cci10", "cci30", "cci10_sma1_sh8", "cci30_sma1_sh8",
+    "cci10", "cci30", "cci100",
+    "cci10_sma1_sh8", "cci30_sma1_sh8", "cci100_sma1_sh8",
     "bb20_upper", "bb20_mid", "bb200_upper", "bb200_mid",
     "high_sma4_sh8", "low_sma4_sh8",
     "atr14", "atr14_sma1_sh8", "atr45", "atr45_sma1_sh8",

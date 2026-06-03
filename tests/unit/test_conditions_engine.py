@@ -55,9 +55,27 @@ def test_phase0_opposite_direction_false():
 
 
 def test_phase1_cci_align():
-    r = {"cci10": 10.0, "cci10_sma1_sh8": 5.0,
-         "cci30": 8.0, "cci30_sma1_sh8": 3.0}     # both above their SMA
-    assert CE.phase1_cci_align(r, r) is True
+    # CCI(30) & CCI(100) both above their SMA(1,+8) on both TFs -> bullish gate
+    up = {"cci30": 10.0, "cci30_sma1_sh8": 5.0,
+          "cci100": 8.0, "cci100_sma1_sh8": 3.0}
+    assert CE.phase1_cci_align(up, up) is True
+    # both below their SMA(1,+8) -> bearish gate (also fires)
+    dn = {"cci30": -10.0, "cci30_sma1_sh8": -5.0,
+          "cci100": -8.0, "cci100_sma1_sh8": -3.0}
+    assert CE.phase1_cci_align(dn, dn) is True
+
+
+def test_phase1_cci_align_mixed_is_off():
+    # cci30 above its SMA but cci100 below its SMA -> direction disagrees -> OFF
+    mixed = {"cci30": 10.0, "cci30_sma1_sh8": 5.0,
+             "cci100": -8.0, "cci100_sma1_sh8": -3.0}
+    assert CE.phase1_cci_align(mixed, mixed) is False
+    # both above on 1m but both below on 15m -> TFs disagree -> OFF
+    up = {"cci30": 10.0, "cci30_sma1_sh8": 5.0,
+          "cci100": 8.0, "cci100_sma1_sh8": 3.0}
+    dn = {"cci30": -10.0, "cci30_sma1_sh8": -5.0,
+          "cci100": -8.0, "cci100_sma1_sh8": -3.0}
+    assert CE.phase1_cci_align(up, dn) is False
 
 
 def test_phase6_atr_expansion():
@@ -97,13 +115,13 @@ def test_force_in_and_gate_blocks_entries_when_condition_false():
 def test_open_gate_allows_all_when_true_hold_only_when_false():
     phase = {"mask": "phase1_cci_align", "mask_type": "open_gate",
              "gate_timeframes": [1, 15]}
-    aligned = {"cci10": 10.0, "cci10_sma1_sh8": 5.0,
-               "cci30": 8.0, "cci30_sma1_sh8": 3.0}
+    aligned = {"cci30": 10.0, "cci30_sma1_sh8": 5.0,
+               "cci100": 8.0, "cci100_sma1_sh8": 3.0}
     rows = {1: aligned, 15: aligned}
     mask, must = CE.compute_action_mask(phase, rows, DEV, is_flat=True)
     assert _mask_dirs(mask) == {BUY, SELL}   # active gate -> no FLAT, in any phase
-    misaligned = {"cci10": 10.0, "cci10_sma1_sh8": 5.0,
-                  "cci30": -8.0, "cci30_sma1_sh8": -3.0}   # disagree
+    misaligned = {"cci30": 10.0, "cci30_sma1_sh8": 5.0,
+                  "cci100": -8.0, "cci100_sma1_sh8": -3.0}   # cci disagree
     rows2 = {1: misaligned, 15: misaligned}
     mask2, _ = CE.compute_action_mask(phase, rows2, DEV)
     assert _mask_dirs(mask2) == {FLAT}   # gate closed -> no new entries
