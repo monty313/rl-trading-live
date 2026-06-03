@@ -28,6 +28,10 @@ def run_eval(env, agent, cfg: dict, n_days: int = 10) -> dict:
     day_start_eq = float(env._equity[0].item())
     day_high = day_start_eq
     steps = n_days * bars_per_day
+    # PASS uses the FIXED daily increment off INITIAL equity (ftmo_rules_fix.md
+    # RULE 1): daily_target = day_start_eq + daily_increment, NOT a percentage of
+    # the day's opening balance.
+    daily_increment = float(env.daily_increment)
 
     for step in range(steps):
         mask = env.current_direction_mask()
@@ -41,7 +45,7 @@ def run_eval(env, agent, cfg: dict, n_days: int = 10) -> dict:
             dd = (day_high - eq) / (day_high + 1e-9)
             daily_returns.append(ret)
             daily_dds.append(dd)
-            daily_pass.append(1.0 if eq >= day_start_eq * (1 + env.target_pct) else 0.0)
+            daily_pass.append(1.0 if eq >= day_start_eq + daily_increment else 0.0)
             day_start_eq, day_high = eq, eq
         if done.all():
             break
@@ -50,7 +54,7 @@ def run_eval(env, agent, cfg: dict, n_days: int = 10) -> dict:
         eq = float(env._equity[0].item())
         daily_returns = [(eq - day_start_eq) / (day_start_eq + 1e-9)]
         daily_dds = [(day_high - eq) / (day_high + 1e-9)]
-        daily_pass = [1.0 if eq >= day_start_eq * (1 + env.target_pct) else 0.0]
+        daily_pass = [1.0 if eq >= day_start_eq + daily_increment else 0.0]
 
     from core.reward.shaper import EpisodeRewardShaper
     pass_rate = float(np.mean(daily_pass))

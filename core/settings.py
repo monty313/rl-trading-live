@@ -137,11 +137,11 @@ CFG = {
     # the gradient points toward "pass FTMO" long before the first pass happens.
     # See core/env/environment.py step() REWARD block (learning_loop_fix.md FIX 1).
     "REWARD": {
-        # terminal per-day bonus (applied once at day close)
-        "pass_day_bonus":    2.0,    # day hit +2.5% with no DD breach
-        "ok_day_bonus":      0.5,    # traded, green, didn't reach target
-        "fail_day_penalty":  -2.0,   # DD breach OR negative day
-        "no_trade_penalty":  -1.0,   # gate active all day but agent never traded
+        # terminal per-day bonus (applied once at day close) — BINARY PASS/FAIL
+        # (ftmo_rules_fix.md RULE 2): no OK tier, no separate no-trade tier. A
+        # zero-trade day is simply a FAIL and takes fail_day_penalty.
+        "pass_day_bonus":    2.0,    # day reached day_start + fixed daily increment
+        "fail_day_penalty":  -2.0,   # everything else (incl. zero-trade / DD breach)
         "streak_scale":      0.1,    # + per consecutive passing day
         "low_dd_threshold":  0.005,
         "low_dd_bonus":      0.3,

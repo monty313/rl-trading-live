@@ -174,24 +174,27 @@ def test_default_daily_results_and_heartbeat_emit_to_stdout():
 
 
 def test_aggregate_day_counts_consistent():
-    """_aggregate_day must partition the full batch into PASS/FAIL/OK/SKIP with
-    counts summing to the number of episodes (no double-count / gap) and aggregate
-    the WHOLE batch (Bug A — no 1/64 leakage)."""
+    """_aggregate_day must partition the full batch into STRICTLY BINARY PASS/FAIL
+    (ftmo_rules_fix.md RULE 2 — no OK/SKIP) with counts summing to the number of
+    episodes, and aggregate the WHOLE batch (Bug A — no 1/64 leakage)."""
     import training.train as T
     B = 6
+    passed = torch.tensor([1, 0, 0, 1, 0, 0], dtype=torch.bool)
     info = {
-        "passed":           torch.tensor([1, 0, 0, 0, 0, 0], dtype=torch.bool),
-        "failed":           torch.tensor([0, 1, 0, 0, 0, 0], dtype=torch.bool),
-        "day_halted":       torch.tensor([0, 1, 0, 0, 0, 0], dtype=torch.bool),
-        "no_trade_penalty": torch.tensor([0, 0, 1, 0, 0, 0], dtype=torch.bool),
-        "trades_today":     torch.tensor([3, 2, 0, 5, 0, 1], dtype=torch.long),
-        "equity":           torch.full((B,), 10_000.0),
-        "day_start_eq":     torch.full((B,), 10_000.0),
+        "passed":       passed,
+        "failed":       ~passed,                # binary complement (env contract)
+        "day_halted":   torch.tensor([0, 1, 0, 0, 0, 0], dtype=torch.bool),
+        # a zero-trade day (episodes 2 and 4) is a FAIL, never a SKIP
+        "trades_today": torch.tensor([3, 2, 0, 5, 0, 1], dtype=torch.long),
+        "equity":       torch.full((B,), 10_000.0),
+        "day_start_eq": torch.full((B,), 10_000.0),
     }
     closed = torch.ones(B, dtype=torch.bool)
     cls = T._aggregate_day(info, closed)
     assert cls["n"] == B
-    assert cls["pass"] + cls["fail"] + cls["ok"] + cls["skip"] == B
+    assert "ok" not in cls and "skip" not in cls       # OK/SKIP removed entirely
+    assert cls["pass"] + cls["fail"] == B              # binary partition
+    assert cls["pass"] == 2 and cls["fail"] == 4
 
 
 # ════════════════════════════════════════════════════════════════════════════

@@ -93,6 +93,10 @@ def run_backtest(csv: Optional[str], cfg: dict = None, device: torch.device = No
     max_dd = 0.0
     day_start = float(env._equity[0].item())
     steps = n_days * bars_per_day
+    # PASS uses the FIXED daily increment off INITIAL equity (ftmo_rules_fix.md
+    # RULE 1): daily_target = day_start + daily_increment, NOT a percent of the
+    # day's opening balance. Binary PASS/FAIL only.
+    daily_increment = float(env.daily_increment)
 
     for step in range(steps):
         mask = env.current_direction_mask()
@@ -104,7 +108,7 @@ def run_backtest(csv: Optional[str], cfg: dict = None, device: torch.device = No
         if (step + 1) % bars_per_day == 0:
             ret = (eq - day_start) / (day_start + 1e-9)
             daily_returns.append(ret)
-            passed = eq >= day_start * (1 + env.target_pct)
+            passed = eq >= day_start + daily_increment
             pass_fail.append("PASS" if passed else "FAIL")
             day_start = eq
         if done.all():
@@ -113,7 +117,7 @@ def run_backtest(csv: Optional[str], cfg: dict = None, device: torch.device = No
     if not daily_returns:
         eq = float(env._equity[0].item())
         daily_returns = [(eq - day_start) / (day_start + 1e-9)]
-        pass_fail = ["PASS" if eq >= day_start * (1 + env.target_pct) else "FAIL"]
+        pass_fail = ["PASS" if eq >= day_start + daily_increment else "FAIL"]
 
     total_pass = pass_fail.count("PASS")
     total_fail = pass_fail.count("FAIL")

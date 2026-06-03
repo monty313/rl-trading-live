@@ -68,45 +68,39 @@ def _aggregate_day(info: dict, closed: "torch.Tensor") -> dict:
     the calendar new-day mask — true for EVERY episode at once — so this line
     always covers the whole batch (never a 1/64 line).
 
-    Returns mean/median day PnL ($), mean equity, mean trades, the PASS/FAIL/OK/
-    SKIP counts, and the dominant headline status used for the colored bubble.
+    Returns mean/median day PnL ($), mean equity, mean trades, and the BINARY
+    PASS / FAIL counts across the batch (ftmo_rules_fix.md RULE 2).
 
-    Per-episode classes (mirror BatchedFTMOEnv.step):
-      PASS : traded AND hit +2.5% target with no DD breach (info["passed"]).
-      FAIL : env `failed` (DD breach OR negative day), OR the no-trade penalty.
-      OK   : traded, green, didn't reach target.
-      SKIP : no trades and the gate wasn't meaningfully active.
+    Per-episode class (mirrors BatchedFTMOEnv.step — STRICTLY BINARY):
+      PASS : final_or_halt_equity >= day_start + daily_increment (info["passed"]).
+      FAIL : everything else, including a zero-trade day and a DD-breach day that
+             ended under target. There is NO "OK" and NO "SKIP" anymore.
     """
     idx = closed.nonzero(as_tuple=True)[0]
     passed = info["passed"][idx].bool()
-    failed = info.get("failed", info["passed"])[idx].bool() if "failed" in info \
-        else info["day_halted"][idx].bool()
-    no_trade = info["no_trade_penalty"][idx].bool()
+    # Binary: a day is PASS or FAIL — fail is simply the complement of pass. We
+    # read info["failed"] (the env's binary complement) but fall back to ~passed
+    # so the invariant holds even if a caller omits it.
+    failed = info["failed"][idx].bool() if "failed" in info else (~passed)
     trades = info["trades_today"][idx].long()
-    traded = trades > 0
-
-    is_pass = passed & traded
-    is_fail = (~is_pass) & (failed | no_trade)
-    is_skip = (~traded) & (~no_trade)
-    is_ok = traded & (~is_pass) & (~is_fail)
 
     n = int(idx.numel())
-    n_pass, n_fail = int(is_pass.sum().item()), int(is_fail.sum().item())
-    n_ok, n_skip = int(is_ok.sum().item()), int(is_skip.sum().item())
+    n_pass = int(passed.sum().item())
+    n_fail = int(failed.sum().item())
 
     eq = info["equity"][idx].float()
     day_start = info.get("day_start_eq", info["equity"])[idx].float() \
         if "day_start_eq" in info else info["equity"][idx].float()
     day_pnl = eq - day_start
     return {
-        "n": n, "pass": n_pass, "fail": n_fail, "ok": n_ok, "skip": n_skip,
+        "n": n, "pass": n_pass, "fail": n_fail,
         "mean_pnl": float(day_pnl.mean().item()) if n else 0.0,
         "median_pnl": float(day_pnl.median().item()) if n else 0.0,
         "mean_eq": float(eq.mean().item()) if n else 0.0,
         "mean_tr": float(trades.float().mean().item()) if n else 0.0,
-        # Headline bubble: 🟢 if the day PASSED for the batch (more passes than
-        # fails AND at least one pass), else 🔴. This is the glanceable left-edge
-        # progression the user wants.
+        # Headline bubble: 🟢 only when the batch PASSED on balance (more passes
+        # than fails AND at least one pass), else 🔴 — a glanceable left-edge
+        # pass progression. (Per-episode is already strictly binary.)
         "day_passed": (n_pass > n_fail) and (n_pass > 0),
     }
 
@@ -119,8 +113,10 @@ def _print_daily_results(phase: dict, day_num: int, agg: dict, streak: int):
         DAY <n>  <🟢/🔴>  PnL $<..>  equity <..>  streak <..>  trades <..>  phase <name>
 
     The colored bubble sits RIGHT AFTER the day number so the left edge scans as
-    a green/red pass progression. No `ep N`, no `closed X/64`, no verbose class
-    block — those moved off the headline. Flushed for live Colab output.
+    a green/red pass progression. The class block is now COMPACT BINARY pass/fail
+    counts across the 64 episodes (e.g. "P:12 F:52") — no 🟡 (OK) / ⬜ (SKIP)
+    indicators anymore (ftmo_rules_fix.md RULE 2). Phase stays LAST on the far
+    right. Flushed for live Colab output.
     """
     bubble = "🟢" if agg["day_passed"] else "🔴"
     print(
@@ -129,7 +125,7 @@ def _print_daily_results(phase: dict, day_num: int, agg: dict, streak: int):
         f"   equity {agg['mean_eq']:>12,.2f}"
         f"   streak {streak:>3}"
         f"   trades {agg['mean_tr']:>5.1f}"
-        f"   ({agg['pass']}✅/{agg['fail']}❌/{agg['ok']}🟡/{agg['skip']}⬜)"
+        f"   (P:{agg['pass']:>2} F:{agg['fail']:>2})"
         f"   phase {phase['name']}",
         flush=True,
     )
@@ -167,7 +163,18 @@ def train(args) -> int:
     if getattr(args, "account_size", None):
         cfg["ACCOUNT_SIZE"] = float(args.account_size)
         cfg["INITIAL_EQUITY"] = float(args.account_size)
-    print(f"[train] account size = ${float(cfg.get('ACCOUNT_SIZE', cfg['INITIAL_EQUITY'])):,.0f}",
+    # ── FTMO RULE INPUTS (ftmo_rules_fix.md RULE 5): CLI flags override CFG so the
+    # user can dial target / DD per live account. NOTHING downstream hardcodes
+    # 0.025 / 0.01 / 250 / 100 — env, reward, eval, and guard all read these.
+    if getattr(args, "target_pct", None) is not None:
+        cfg["DAILY_TARGET_PCT"] = float(args.target_pct)
+    if getattr(args, "max_dd_pct", None) is not None:
+        cfg["DAILY_MAX_DD_PCT"] = float(args.max_dd_pct)
+    _acct = float(cfg.get("ACCOUNT_SIZE", cfg["INITIAL_EQUITY"]))
+    print(f"[train] account size = ${_acct:,.0f}"
+          f"  target {cfg['DAILY_TARGET_PCT']*100:.2f}%"
+          f" (= ${_acct * cfg['DAILY_TARGET_PCT']:,.2f}/day fixed)"
+          f"  max_dd {cfg['DAILY_MAX_DD_PCT']*100:.2f}%",
           flush=True)
 
     phases = _load_phases(repo_root)
@@ -464,6 +471,14 @@ def main() -> int:
     ap.add_argument("--account-size", type=float, default=None,
                     help="Starting equity (10000/25000/50000/100000). "
                          "Default 10000. Rules stay percent-based.")
+    # ── FTMO RULE INPUTS (ftmo_rules_fix.md RULE 5) — never hardcoded ──
+    ap.add_argument("--target-pct", type=float, default=None,
+                    help="Daily profit target as a fraction of INITIAL equity "
+                         "(default 0.025 = 2.5%%). The fixed daily increment is "
+                         "initial_equity * target_pct (e.g. $250 on a $10k acct).")
+    ap.add_argument("--max-dd-pct", type=float, default=None,
+                    help="Max trailing intraday drawdown as a fraction "
+                         "(default 0.010 = 1%%). Breach halts trading for the day.")
     try:
         return train(ap.parse_args())
     except Exception as exc:

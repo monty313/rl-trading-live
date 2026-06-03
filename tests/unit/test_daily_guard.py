@@ -21,8 +21,15 @@ def test_ftmo_no_halt_within_limit():
 
 def test_pass_recorded_when_target_hit():
     g = DailyGuard("ftmo", 100000, _cfg())
-    g.update(equity=100000 * 1.026)         # +2.6% > 2.5% target
-    assert g.pass_fail() in ("PASS", "PASS_NO_BREACH")
+    g.update(equity=100000 * 1.026)         # +2.6% > +2.5% ($2,500) fixed target
+    assert g.pass_fail() == "PASS"          # binary now: PASS or FAIL only
+
+
+def test_pass_fail_is_binary_below_target():
+    # A small green day that does NOT reach the fixed increment is a FAIL (no OK).
+    g = DailyGuard("ftmo", 10000, _cfg())   # increment = $250
+    g.update(equity=10000 + 20.86)          # the +$20.86 regression case
+    assert g.pass_fail() == "FAIL"
 
 
 def test_force_halt():

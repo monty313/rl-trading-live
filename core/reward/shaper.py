@@ -40,7 +40,7 @@ class EpisodeRewardShaper:
         # streaks of passing days, and days with DD well under the limit all add up.
         rw = cfg.get("REWARD", {}) or {}
         self.pass_day_bonus = float(rw.get("pass_day_bonus", cfg.get("PASS_DAY_BONUS", 2.0)))
-        self.ok_day_bonus = float(rw.get("ok_day_bonus", cfg.get("OK_DAY_BONUS", 0.5)))
+        # NOTE: no ok_day_bonus anymore — classification is strictly binary (RULE 2).
         self.fail_day_penalty = float(rw.get("fail_day_penalty", cfg.get("FAIL_DAY_PENALTY", -2.0)))
         self.streak_scale = float(rw.get("streak_scale", cfg.get("STREAK_SCALE", 0.1)))
         self.low_dd_threshold = float(rw.get("low_dd_threshold", cfg.get("LOW_DD_THRESHOLD", 0.005)))
@@ -89,36 +89,35 @@ class EpisodeRewardShaper:
 
     def daily_reward(self, r_d: float, dd_d: float) -> float:
         """
-        Progressive cross-day reward applied at day end (ported from the locked
-        REWARD spec). Encourages consistency:
+        Cross-day terminal reward applied at day end — STRICTLY BINARY now
+        (ftmo_rules_fix.md RULE 2): a day is PASS or FAIL, there is NO "OK" tier.
 
-          pass        (r_d >= target AND dd_d <= max_dd) -> +pass_day_bonus
-          acceptable  (0 <= r_d < target AND dd_d <= max_dd) -> +ok_day_bonus
-          fail        (dd_d > max_dd OR r_d < 0) -> +fail_day_penalty (negative)
-          streak bonus: +streak_scale * consecutive_pass_days
-          low-DD bonus: +low_dd_bonus when dd_d < low_dd_threshold
+          pass  (r_d >= target_pct AND dd_d <= max_dd) -> +pass_day_bonus
+          fail  (everything else, incl. green-but-below-target and DD breach)
+                                                        -> +fail_day_penalty
+          streak bonus: +streak_scale * consecutive_pass_days (reset on any fail)
+          low-DD bonus: +low_dd_bonus on a PASS day finishing well under the limit
+
+        NOTE: this helper is percent-based (it only sees the day's RETURN r_d, not
+        absolute equity), so it uses r_d >= target_pct as the binary pass test.
+        The authoritative classification — the FIXED dollar increment off INITIAL
+        equity — lives in BatchedFTMOEnv.step (which trains the agent). This helper
+        mirrors the binary PASS/FAIL split for the Φ/diagnostics path.
 
         Returns the scalar daily reward and updates the internal pass streak.
         """
         is_pass = (r_d >= self.target_pct) and (dd_d <= self.max_dd_pct)
-        is_ok = (0.0 <= r_d < self.target_pct) and (dd_d <= self.max_dd_pct)
-        is_fail = (dd_d > self.max_dd_pct) or (r_d < 0.0)
 
         if is_pass:
             base = self.pass_day_bonus
             self._pass_streak += 1
-        elif is_ok:
-            base = self.ok_day_bonus
-            self._pass_streak = 0
-        elif is_fail:
+        else:                       # binary: anything not a pass is a fail
             base = self.fail_day_penalty
-            self._pass_streak = 0
-        else:
-            base = 0.0
             self._pass_streak = 0
 
         reward = base + self.streak_scale * self._pass_streak
-        if dd_d < self.low_dd_threshold:
+        # low-DD bonus only sweetens a PASS (a fail already takes the penalty).
+        if is_pass and dd_d < self.low_dd_threshold:
             reward += self.low_dd_bonus
         return float(reward)
 

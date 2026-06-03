@@ -18,9 +18,13 @@ Both:
   - force_halt() halts immediately (EMERGENCY HALT button)
   - get_status() -> dict; on halt, calls alert_dispatcher.fire (never crashes)
 
-PASS/FAIL (RULE 7), evaluated against the day's starting balance:
-  PASS  = end_balance >= start * (1 + target_pct)   (regardless of DD)
-  FAIL  = DD breach occurred AND end_balance < start * (1 + target_pct)
+PASS/FAIL — STRICTLY BINARY (ftmo_rules_fix.md RULES 1-2), evaluated against the
+day's OPENING balance plus a FIXED daily increment:
+  daily_increment = initial_balance * target_pct   # fixed $, computed once at open
+  daily_target    = day_start + daily_increment
+  PASS  = (equity >= daily_target)   # at end of day OR at a DD halt (RULE 3)
+  FAIL  = everything else (a DD breach does NOT auto-fail; balance-at-halt decides)
+There is NO "OK" and NO "SKIP" — pass_fail() returns only "PASS" or "FAIL".
 """
 from __future__ import annotations
 
@@ -37,6 +41,10 @@ class DailyGuard:
 
         self.target_pct = float(cfg.get("DAILY_TARGET_PCT", 0.025))
         self.max_dd_pct = float(cfg.get("DAILY_MAX_DD_PCT", 0.010))
+        # FIXED daily profit increment (RULE 1): a flat dollar amount = initial *
+        # target_pct, computed ONCE at open. The target each day is the day's
+        # OPENING balance + this increment — never target_pct of the live balance.
+        self.daily_increment = self.initial_balance * self.target_pct
         self.beast_dd_pct = float(cfg.get("BEAST_TRAILING_DD_PCT", 0.05))
         self.max_trades = cfg.get("MAX_TRADES_PER_DAY", 800)
 
@@ -91,12 +99,13 @@ class DailyGuard:
         if not self._forced:
             self.halted = False
 
-    # ── PASS/FAIL ───────────────────────────────────────────────────────────
+    # ── PASS/FAIL — BINARY (RULES 1-2) ────────────────────────────────────────
     def pass_fail(self) -> str:
-        target = self.day_start * (1.0 + self.target_pct)
-        if self.equity >= target:
-            return "PASS_NO_BREACH" if not self.dd_breached else "PASS"
-        return "FAIL" if self.dd_breached else "IN_PROGRESS"
+        """PASS iff equity has reached the day's fixed-increment target; else FAIL.
+        Binary — a DD breach does NOT auto-fail (balance-at-halt decides), and a
+        day under target is FAIL regardless of whether a breach occurred."""
+        daily_target = self.day_start + self.daily_increment
+        return "PASS" if self.equity >= daily_target else "FAIL"
 
     def get_status(self) -> dict:
         baseline = self.peak if self.mode == "beast" else self.baseline

@@ -8,10 +8,14 @@ Ported from gpu_rl_trading/env/environment.py (REPO1) with these changes:
   (b) Adds a (B, DIRECTION_DIM) direction mask applied to PPO logits before
       argmax. The mask is produced by conditions_engine from the active phase.
   (c) Multi-symbol: load EURUSD / GBPUSD / XAUUSD / US30 (or aligned baskets).
-  (d) PASS/FAIL rule (HARD RULE 7):
-        PASS  = end_balance >= initial_balance * 1.025 (regardless of DD)
-        FAIL  = DD breach occurred AND end_balance < initial_balance * 1.025
-        PASS_NO_BREACH = target hit AND no DD breach -> +0.01 reward bonus
+  (d) PASS/FAIL rule — STRICTLY BINARY (ftmo_rules_fix.md RULES 1-3):
+        daily_increment = initial_equity * target_pct   (FIXED $, once at open)
+        daily_target    = day_start_equity + daily_increment
+        passed          = (final_or_halt_equity >= daily_target)
+        FAIL            = everything else (incl. zero-trade days and DD-breach
+                          days that end under target). A DD breach does NOT
+                          auto-fail: halt_equity >= daily_target still PASSES.
+        There is NO "OK" tier and NO "SKIP" tier — every day is PASS or FAIL.
   (e) Entire feature tensor preloaded to device at __init__; episodes index slices.
   (f) All tensors live on cfg["device"]; day-boundary logic is vectorized
       (no Python per-batch loop in the hot path — fixes bottleneck #1).
@@ -62,6 +66,10 @@ class BatchedFTMOEnv:
 
         self.B = int(cfg.get("BATCH_SIZE_ENV", 4))
         self.lkbk = int(cfg.get("LOOKBACK", 20))
+        # ── FTMO RULE INPUTS (config-driven, never hardcoded; see ftmo_rules_fix.md
+        # RULE 5). target_pct / max_dd_pct come straight from CFG (which the CLI
+        # flags --target-pct / --max-dd-pct populate in train.py). The user changes
+        # these for live accounts, so NOTHING below may bake in 0.025 / 0.01.
         self.target_pct = float(cfg.get("DAILY_TARGET_PCT", 0.025))
         self.max_dd_pct = float(cfg.get("DAILY_MAX_DD_PCT", 0.010))
         # ── ACCOUNT SIZE (learning_loop_fix.md FIX 3) ────────────────────────
@@ -77,6 +85,16 @@ class BatchedFTMOEnv:
         # Left off for now — see reset() for the commented stub.
         self.initial_equity = float(
             cfg.get("ACCOUNT_SIZE", cfg.get("INITIAL_EQUITY", 10_000.0)))
+        # ── FIXED DAILY PROFIT INCREMENT (ftmo_rules_fix.md RULE 1) ──────────────
+        # The FTMO daily target is a FIXED DOLLAR amount computed ONCE at account
+        # open: initial_equity * target_pct. On a $10,000 account @ 2.5% that is a
+        # flat $250 EVERY day — always 2.5% of the ORIGINAL initial equity, never
+        # 2.5% of the current/opening balance. A day passes when the day's profit
+        # (relative to that day's OPENING equity) reaches at least this increment:
+        #     daily_target = day_start_equity + daily_increment
+        #     passed       = (final_or_halt_equity >= daily_target)
+        # So a day opening at 10,300 needs to reach 10,550; a +$20 day FAILS.
+        self.daily_increment = self.initial_equity * self.target_pct
         self.bars_per_day = int(cfg.get("BARS_PER_DAY", 1440))
         self.max_lot = float(cfg.get("MAX_LOT", 2.0))
         self.direction_dim = DIRECTION_DIM
@@ -326,7 +344,9 @@ class BatchedFTMOEnv:
             (close - self._entry_px) * torch.sign(self._position),
             torch.zeros_like(close))
         eq_chg = (self._equity - self.initial_equity) / self.initial_equity
-        target_eq = self._day_start_eq * (1.0 + self.target_pct)
+        # Daily target = day's opening equity + the FIXED increment (RULE 1), NOT
+        # day_start * (1 + target_pct). The increment is a flat dollar amount.
+        target_eq = self._day_start_eq + self.daily_increment
         gap = (target_eq - self._equity) / (self.initial_equity + 1e-8)
         dd_used = (self._day_high_eq - self._equity) / (self._day_high_eq + 1e-8)
         dd_head = (self.max_dd_pct - dd_used).clamp(min=0.0)
@@ -555,10 +575,24 @@ class BatchedFTMOEnv:
         breach_now = dd_used >= self.max_dd_pct
         self._dd_breached = self._dd_breached | breach_now
 
+        # ── count gate-active bars this step, PER EPISODE — BEFORE the day reset ──
+        # ROOT-CAUSE FIX (ftmo_rules_fix.md RULE 4): this MUST happen before the
+        # new_day reset of _gate_bars_today below. Previously the counter was
+        # incremented AFTER the reset, so on every calendar-day-close step the
+        # reported/classified count was 0-or-1 — never the day's true total. That
+        # made the old "gate_was_active" test always read False on day boundaries,
+        # which is what funneled whole zero-trade days into the (now removed) SKIP
+        # bucket instead of FAIL. gate_on is position-independent, so it is the
+        # correct gate-active signal whether or not the episode holds a trade.
+        self._gate_bars_today = self._gate_bars_today + gate_on.long()
+
         self._step_i = self._step_i + 1
         new_day = (self._step_i % self.bars_per_day) == 0
         # Save trades_today BEFORE resetting — info must report the closing day's count
         trades_today_closing = self._trades_today.clone()
+        # Snapshot the CLOSING day's gate-bar count BEFORE the new_day reset so
+        # classification/reporting see the whole day's total (see root-cause note).
+        gate_bars_closing = self._gate_bars_today.clone()
         # Snapshot the CLOSING day's baseline/peak BEFORE rolling them forward.
         # The reward, PASS/FAIL classification, and the honest day report must all
         # measure the day that just ended against ITS OWN start equity — not the
@@ -643,43 +677,46 @@ class BatchedFTMOEnv:
         # (4) overtrade penalty: small cost per NEW position opened this bar.
         reward = reward - float(rw.get("overtrade_penalty", 0.0005)) * opening.float()
 
-        # ── count gate-active bars this step, PER EPISODE ──
-        # Reuse the per-episode gate_on computed for this bar (force-entry above):
-        # it is independent of the live position, so it is the correct gate-active
-        # signal whether or not the episode currently holds a trade.
-        self._gate_bars_today = self._gate_bars_today + gate_on.long()
-
-        # day-end (new_day) OR newly-halted -> classify PASS/OK/FAIL for the day
+        # ════════════════════════════════════════════════════════════════════
+        # DAY CLASSIFICATION — STRICTLY BINARY PASS / FAIL (ftmo_rules_fix.md
+        # RULES 1, 2, 3). There is NO "OK" tier and NO "SKIP" tier anymore:
+        #   • daily_target = day_start_equity + daily_increment   (fixed $ amount,
+        #     RULE 1 — daily_increment = initial_equity * target_pct, NOT a percent
+        #     of the day's opening balance).
+        #   • passed = (final_or_halt_equity >= daily_target).
+        #   • EVERYTHING ELSE IS A FAIL — including a zero-trade day (RULE 2) and a
+        #     DD breach that ends under target (RULE 3). A DD breach does NOT
+        #     auto-fail: if halt_equity >= daily_target the day still PASSES.
+        # The day closes on a calendar boundary (new_day) OR the moment a DD breach
+        # halts trading (newly_halted); equity_now is the closing/halt equity.
+        # ════════════════════════════════════════════════════════════════════
         day_closed = new_day | newly_halted
-        # Use the pre-reset count so day close reports the correct trade count
-        traded_today = trades_today_closing > 0
-        # Gate was meaningfully active today if it fired on >5% of bars
-        gate_was_active = self._gate_bars_today > (self.bars_per_day // 20)
-        dd_today = (day_high_closing - equity_now) / (day_high_closing + 1e-8)
-        passed = traded_today & (daily_ret >= self.target_pct) & (dd_today <= self.max_dd_pct)
-        failed = traded_today & ((dd_today > self.max_dd_pct) | (daily_ret < 0))
-        # No-trade penalty: gate was active but agent never opened a position
-        no_trade_penalty = (~traded_today) & gate_was_active
+        traded_today = trades_today_closing > 0          # reported for diagnostics
+        # RULE 1: fixed-increment target measured off the CLOSING day's opening eq.
+        daily_target = day_start_closing + self.daily_increment
+        passed = equity_now >= daily_target              # the ONLY pass condition
+        failed = ~passed                                 # binary: not-pass == fail
         self._day_passed = torch.where(day_closed & passed,
                                        torch.ones_like(self._day_passed), self._day_passed)
-        # progressive day bonus (pass/ok/fail + streak) applied at day close
-        pass_b    = float(self.cfg.get("REWARD", {}).get("pass_day_bonus",    2.0))
-        ok_b      = float(self.cfg.get("REWARD", {}).get("ok_day_bonus",      0.5))
-        fail_b    = float(self.cfg.get("REWARD", {}).get("fail_day_penalty",  -2.0))
-        no_trade_b = float(self.cfg.get("REWARD", {}).get("no_trade_penalty", -1.0))
-        streak_s  = float(self.cfg.get("REWARD", {}).get("streak_scale",      0.1))
+        # Terminal per-day bonus reflects the BINARY outcome (no OK tier). Kept in
+        # the same normalized O(1) units as the dense shaping. A +2.5% day clears
+        # the target and earns pass_day_bonus; a +$20 day does not.
+        pass_b    = float(rw.get("pass_day_bonus",    2.0))
+        fail_b    = float(rw.get("fail_day_penalty",  -2.0))
+        streak_s  = float(rw.get("streak_scale",      0.1))
+        # Streak: +1 on a passing day, reset to 0 on ANY failing day (binary).
         self._pass_streak = torch.where(day_closed & passed, self._pass_streak + 1,
-                                        torch.where(day_closed & (passed | failed | no_trade_penalty),
+                                        torch.where(day_closed,
                                                     torch.zeros_like(self._pass_streak),
                                                     self._pass_streak))
-        # low-DD bonus: reward days that finished comfortably under the DD limit.
+        # low-DD bonus: still reward passing days that finished comfortably under
+        # the DD limit (only meaningful on a pass; a fail already gets the penalty).
+        dd_today = (day_high_closing - equity_now) / (day_high_closing + 1e-8)
         low_dd_thr = float(rw.get("low_dd_threshold", 0.005))
         low_dd_b   = float(rw.get("low_dd_bonus", 0.3))
-        low_dd_day = traded_today & (dd_today < low_dd_thr)
+        low_dd_day = passed & (dd_today < low_dd_thr)
         day_reward = (passed.float() * pass_b
                       + failed.float() * fail_b
-                      + no_trade_penalty.float() * no_trade_b
-                      + (traded_today & ~passed & ~failed).float() * ok_b
                       + low_dd_day.float() * low_dd_b
                       + streak_s * self._pass_streak.float())
         reward = reward + day_closed.float() * day_reward
@@ -700,21 +737,24 @@ class BatchedFTMOEnv:
         info = {
             "equity": self._equity.detach(),
             "passed": passed.detach(),
-            "failed": failed.detach(),
+            "failed": failed.detach(),       # binary complement of passed (RULE 2)
             "dd_breached": self._dd_breached.detach(),
             "trades_today": trades_today_closing.detach(),
             "pass_no_breach": pass_no_breach.detach(),
             "day_closed": day_closed.detach(),
             "day_halted": self._day_halted.detach(),
             "pass_streak": self._pass_streak.detach(),
-            "no_trade_penalty": no_trade_penalty.detach(),
-            "gate_bars_today": self._gate_bars_today.detach(),
+            # CLOSING day's true gate-bar total (pre-reset snapshot) — used by the
+            # never-flat-through-gate test and diagnostics, NOT for classification
+            # (a zero-trade day is a FAIL regardless of gate activity, RULE 2).
+            "gate_bars_today": gate_bars_closing.detach(),
             "executed_direction": direction.detach(),
             # per-day snapshots for HONEST aggregation (Bug A): the closing day's
             # return and trailing DD as fractions, plus the global day index so
             # the trainer can group all episodes that closed the SAME calendar day.
             "daily_return": daily_ret.detach(),
             "daily_dd": dd_today.detach(),
+            "daily_target": daily_target.detach(),    # fixed-increment target (RULE 1)
             "day_idx": self._day_idx.detach(),
             # report the CLOSING day's baseline so the trainer's day PnL
             # (equity - day_start_eq) reflects the day that just ended, not the

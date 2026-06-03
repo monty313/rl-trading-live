@@ -51,20 +51,21 @@ def test_day_aggregation_covers_full_batch():
     (n == B), never a single episode reported as the day (the old 1/64 bug)."""
     import training.train as T
     B = 8
+    passed = torch.zeros(B, dtype=torch.bool)
+    passed[:5] = True                    # 5 of 8 episodes passed this day
     info = {
-        "passed":           torch.zeros(B, dtype=torch.bool),
-        "failed":           torch.zeros(B, dtype=torch.bool),
-        "no_trade_penalty": torch.zeros(B, dtype=torch.bool),
-        "trades_today":     torch.full((B,), 3, dtype=torch.long),
-        "equity":           torch.full((B,), 10_100.0),
-        "day_start_eq":     torch.full((B,), 10_000.0),
+        "passed":       passed,
+        "failed":       ~passed,         # binary complement (env contract, RULE 2)
+        "trades_today": torch.full((B,), 3, dtype=torch.long),
+        "equity":       torch.full((B,), 10_100.0),
+        "day_start_eq": torch.full((B,), 10_000.0),
     }
-    info["passed"][:5] = True            # 5 of 8 episodes passed this day
     closed = torch.ones(B, dtype=torch.bool)
     agg = T._aggregate_day(info, closed)
     assert agg["n"] == B                 # the whole batch, not 1/8
-    assert agg["pass"] == 5
-    assert agg["day_passed"] is True     # 5 pass > 0 fail -> green bubble
+    assert agg["pass"] == 5 and agg["fail"] == 3
+    assert agg["pass"] + agg["fail"] == B   # strict binary partition
+    assert agg["day_passed"] is True     # 5 pass > 3 fail -> green bubble
     # mean PnL is the batch mean of (equity - day_start), here exactly +$100.
     assert abs(agg["mean_pnl"] - 100.0) < 1e-6
 
@@ -77,7 +78,6 @@ def test_day_line_has_no_1_of_64_and_phase_last(capsys):
     info = {
         "passed": torch.ones(4, dtype=torch.bool),
         "failed": torch.zeros(4, dtype=torch.bool),
-        "no_trade_penalty": torch.zeros(4, dtype=torch.bool),
         "trades_today": torch.full((4,), 2, dtype=torch.long),
         "equity": torch.full((4,), 10_250.0),
         "day_start_eq": torch.full((4,), 10_000.0),
@@ -112,18 +112,21 @@ def _run_day(env: BatchedFTMOEnv, force_equity_fn):
     return float(total[0].item()), info
 
 
-def test_reward_ordering_pass_gt_flat_gt_breach():
-    """Cumulative day reward: PASS day > FLAT day > DD-BREACH day. Verified via
-    the shaper's normalized per-day reward (the env mirrors it at day close)."""
+def test_reward_ordering_pass_gt_fail_binary():
+    """Cumulative day reward is BINARY now (ftmo_rules_fix.md RULE 2): a PASS day
+    earns the pass bonus; EVERY non-pass day (green-but-below-target OR DD breach)
+    earns the same fail penalty. So pass_r > fail, and both green-below-target and
+    breach are negative fails (no separate "OK" middle tier)."""
     from core.reward.shaper import EpisodeRewardShaper
     s = EpisodeRewardShaper(_cfg())
-    pass_r = s.daily_reward(r_d=0.03, dd_d=0.002)     # hit target, tiny DD
+    pass_r = s.daily_reward(r_d=0.03, dd_d=0.002)     # hit +2.5% target, tiny DD
     s2 = EpisodeRewardShaper(_cfg())
-    flat_r = s2.daily_reward(r_d=0.001, dd_d=0.002)   # green but below target
+    green_below = s2.daily_reward(r_d=0.001, dd_d=0.002)   # green but below target = FAIL
     s3 = EpisodeRewardShaper(_cfg())
-    breach_r = s3.daily_reward(r_d=-0.005, dd_d=0.02) # DD breach + negative
-    assert pass_r > flat_r > breach_r
-    assert breach_r < 0
+    breach_r = s3.daily_reward(r_d=-0.005, dd_d=0.02)      # DD breach + negative = FAIL
+    assert pass_r > green_below          # pass beats any fail
+    assert pass_r > breach_r
+    assert green_below < 0 and breach_r < 0   # both are fails (negative), no OK tier
 
 
 def test_reward_magnitude_is_normalized_not_dollars():
