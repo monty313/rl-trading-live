@@ -125,9 +125,10 @@ def test_talib_pin_has_manylinux_wheel():
 # ════════════════════════════════════════════════════════════════════════════
 def test_default_daily_results_and_heartbeat_emit_to_stdout():
     """Run a TINY rollout through the same env + the train.py daily-results/
-    heartbeat code paths, capture stdout, and assert BOTH a daily-results line
-    (📅 DAY) and at least one heartbeat (⏱  HEARTBEAT) appear — proving they are
-    on by DEFAULT (no flag) and flush to stdout for live Colab output."""
+    heartbeat code paths, capture stdout, and assert BOTH a daily line (DAY with
+    a 🟢/🔴 bubble) and a heartbeat (⏱) appear — proving they are on by DEFAULT
+    (no flag) and flush to stdout for live Colab output. (New output format:
+    learning_loop_fix.md FIX 2.)"""
     from core.settings import CFG, auto_tune_batch
     from core.pipeline import build_pipeline
     import training.train as T
@@ -135,53 +136,60 @@ def test_default_daily_results_and_heartbeat_emit_to_stdout():
 
     dev = torch.device("cpu")
     c = auto_tune_batch(dict(CFG), dev)
-    # Small enough to close multiple days fast; heartbeat every 64 steps.
     c.update({"FEATURES": make_synthetic_ohlcv_array(n=1500, seed=4),
               "EPISODE_BARS": 250, "BARS_PER_DAY": 80, "ROLLOUT_STEPS": 64,
-              "USE_AMP": False, "USE_TORCH_COMPILE": False, "HEARTBEAT_EVERY": 64})
+              "USE_AMP": False, "USE_TORCH_COMPILE": False})
     phase = {"name": "phase0_cci_extreme", "mask": "phase0_cci_extreme",
              "mask_type": "force_in_and_gate", "gate_timeframes": [1, 15]}
     env, agent, *_ = build_pipeline(c, dev, phase=phase)
-    initial_equity = float(c["INITIAL_EQUITY"])
+    bars_per_day = int(c["BARS_PER_DAY"])
 
     buf = io.StringIO()
     with contextlib.redirect_stdout(buf):
         state = env.reset()
         done = torch.zeros(env.B, dtype=torch.bool)
         steps = 0
-        day_num = 0
+        streak = 0
         while not done.all() and steps < env.ep_bars:
             mask = env.current_direction_mask()
             out = agent.select_actions(state, mask=mask)
             state, r, done, info = env.step(out)
             steps += 1
-            if steps % c["HEARTBEAT_EVERY"] == 0:
-                # mirrors the heartbeat line emitted in train.run_phase
-                print(f"  ⏱  HEARTBEAT  step {steps}", flush=True)
-            closed = info["day_closed"]
-            if bool(closed.any().item()):
-                T._print_daily_results(phase, 0, day_num, info, closed,
-                                       initial_equity, c)
-                day_num += 1
+            if steps % 64 == 0:
+                # mirrors the wall-clock heartbeat one-liner in train.run_phase
+                print(f"  ⏱  heartbeat  step {steps}", flush=True)
+            if steps % bars_per_day == 0:
+                closed = torch.ones(env.B, dtype=torch.bool)
+                agg = T._aggregate_day(info, closed)
+                T._print_daily_results(phase, steps // bars_per_day, agg, streak)
 
     out = buf.getvalue()
-    assert "📅 DAY" in out, f"no daily-results line in stdout:\n{out[:500]}"
-    assert "⏱  HEARTBEAT" in out, f"no heartbeat line in stdout:\n{out[:500]}"
+    assert "DAY" in out and ("🟢" in out or "🔴" in out), \
+        f"no daily-results line with bubble in stdout:\n{out[:500]}"
+    assert "⏱" in out, f"no heartbeat line in stdout:\n{out[:500]}"
+    # phase must be the LAST field on the day line (FIX 2 column order)
+    day_line = next(ln for ln in out.splitlines() if " DAY " in ln)
+    assert day_line.rstrip().endswith(phase["name"]), \
+        f"phase is not the last column:\n{day_line}"
 
 
-def test_classify_days_counts_consistent():
-    """_classify_days must partition the closed episodes into PASS/FAIL/OK/SKIP
-    with counts summing to the number of closed episodes (no double-count / gap)."""
+def test_aggregate_day_counts_consistent():
+    """_aggregate_day must partition the full batch into PASS/FAIL/OK/SKIP with
+    counts summing to the number of episodes (no double-count / gap) and aggregate
+    the WHOLE batch (Bug A — no 1/64 leakage)."""
     import training.train as T
     B = 6
     info = {
         "passed":           torch.tensor([1, 0, 0, 0, 0, 0], dtype=torch.bool),
+        "failed":           torch.tensor([0, 1, 0, 0, 0, 0], dtype=torch.bool),
         "day_halted":       torch.tensor([0, 1, 0, 0, 0, 0], dtype=torch.bool),
         "no_trade_penalty": torch.tensor([0, 0, 1, 0, 0, 0], dtype=torch.bool),
         "trades_today":     torch.tensor([3, 2, 0, 5, 0, 1], dtype=torch.long),
+        "equity":           torch.full((B,), 10_000.0),
+        "day_start_eq":     torch.full((B,), 10_000.0),
     }
     closed = torch.ones(B, dtype=torch.bool)
-    cls = T._classify_days(info, closed)
+    cls = T._aggregate_day(info, closed)
     assert cls["n"] == B
     assert cls["pass"] + cls["fail"] + cls["ok"] + cls["skip"] == B
 

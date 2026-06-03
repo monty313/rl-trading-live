@@ -64,13 +64,50 @@ class BatchedFTMOEnv:
         self.lkbk = int(cfg.get("LOOKBACK", 20))
         self.target_pct = float(cfg.get("DAILY_TARGET_PCT", 0.025))
         self.max_dd_pct = float(cfg.get("DAILY_MAX_DD_PCT", 0.010))
-        self.initial_equity = float(cfg.get("INITIAL_EQUITY", 100_000.0))
+        # ── ACCOUNT SIZE (learning_loop_fix.md FIX 3) ────────────────────────
+        # Default starting equity is $10,000 (configurable via CLI --account-size
+        # or CFG["INITIAL_EQUITY"] / CFG["ACCOUNT_SIZE"], supporting 10k/25k/50k/
+        # 100k). FTMO targets/limits stay PERCENTAGE-based off start-of-day equity
+        # so they scale automatically; reward is normalized so it is account-size
+        # invariant. NOTHING here is hard-coded to 100k.
+        #
+        # FUTURE HOOK (documented, DISABLED): to teach size-relative risk, a per-
+        # episode random account size could be drawn in reset() from
+        # cfg["ACCOUNT_SIZE_CHOICES"] when cfg["RANDOMIZE_ACCOUNT_SIZE"] is True.
+        # Left off for now — see reset() for the commented stub.
+        self.initial_equity = float(
+            cfg.get("ACCOUNT_SIZE", cfg.get("INITIAL_EQUITY", 10_000.0)))
         self.bars_per_day = int(cfg.get("BARS_PER_DAY", 1440))
         self.max_lot = float(cfg.get("MAX_LOT", 2.0))
         self.direction_dim = DIRECTION_DIM
 
-        # ── Preload the feature matrix to device (built if raw OHLCV passed) ──
-        feat = self._ensure_feature_matrix(features)
+        # Per-timeframe indicator rows for phase gating (populated below or from
+        # the cache). Phase masks gate on TF pairs (e.g. [1m,15m]); the conditions
+        # engine reads named indicator columns per bar from these DataFrames.
+        self._tf_indicators: Dict[int, pd.DataFrame] = {}
+        self._raw_ohlcv = self._extract_raw_ohlcv(features)
+
+        # ── Build (or LOAD-FROM-CACHE) the feature matrix + TF indicators ─────
+        # The feature build (1.9M bars -> indicators) is a deterministic pure
+        # function of (CSV bytes, feature-config), so it is memoized to disk via
+        # core/env/feature_cache (learning_loop_fix.md FIX 4.1). On restart a
+        # valid cache loads in seconds instead of a ~10-15 min rebuild. The cache
+        # only engages when a CSV path is known (cfg["DATA_CSV_EURUSD"]); for raw
+        # arrays / synthetic fixtures (tests) we build directly with no caching.
+        from core.env.feature_cache import build_or_load
+
+        def _build():
+            feat_t = self._ensure_feature_matrix(features).to("cpu")
+            if self._raw_ohlcv is not None:
+                self._build_tf_indicators()
+            return feat_t, dict(self._tf_indicators)
+
+        csv_path = cfg.get("DATA_CSV_EURUSD")
+        if csv_path and cfg.get("FEATURES") is None:
+            feat, tf_ind = build_or_load(csv_path, cfg, _build)
+            self._tf_indicators = tf_ind
+        else:
+            feat, _tf = _build()      # tests / synthetic — no CSV, no cache
         self.features = feat.to(device=device, dtype=torch.float32)
         self.T, self.F = self.features.shape
 
@@ -81,18 +118,11 @@ class BatchedFTMOEnv:
         self.state_dim = self.lkbk * self.F + 6
         self._alloc_episode_tensors()
 
-        # ── Per-timeframe indicator rows for phase gating ────────────────────
-        # Phase masks gate on TF pairs (e.g. [1m,15m]). We precompute the full
-        # indicator DataFrame per gate timeframe from the raw 1m OHLCV so the
-        # conditions engine can read named columns per bar. Built lazily from
-        # the raw series passed in (or skipped when only a feature matrix exists).
-        self._tf_indicators: Dict[int, pd.DataFrame] = {}
-        self._raw_ohlcv = self._extract_raw_ohlcv(features)
-        if self._raw_ohlcv is not None:
-            self._build_tf_indicators()
-            print(f"[env] TF indicators built for timeframes: {sorted(self._tf_indicators.keys())} "
-                  f"({len(self._raw_ohlcv)} bars raw OHLCV)", flush=True)
-        else:
+        if self._tf_indicators:
+            print(f"[env] TF indicators ready for timeframes: {sorted(self._tf_indicators.keys())} "
+                  f"({0 if self._raw_ohlcv is None else len(self._raw_ohlcv)} bars raw OHLCV)",
+                  flush=True)
+        elif self._raw_ohlcv is None:
             print("[env] WARNING: no raw OHLCV available — phase gate masks DISABLED. "
                   "Pass raw (N,5) OHLCV, not a prebuilt feature matrix.", flush=True)
 
@@ -161,6 +191,15 @@ class BatchedFTMOEnv:
         self._equity_prev = torch.full((B,), self.initial_equity, device=d)
         # tracks bars where the gate was active this day (condition TRUE)
         self._gate_bars_today = torch.zeros(B, dtype=torch.long, device=d)
+        # GLOBAL day index — the calendar-day counter shared by ALL B episodes.
+        # Because reset() zeroes _step_i for every episode and step() increments
+        # it in lockstep, `new_day = (_step_i % bars_per_day) == 0` fires on the
+        # SAME step for all episodes. _day_idx therefore aligns every episode to
+        # the same trading day, which is what lets the trainer aggregate one
+        # honest per-day line across the whole batch (Bug A fix). A DD-halt does
+        # NOT advance _day_idx (the calendar day still spans bars_per_day bars);
+        # it only closes that episode's day early for classification.
+        self._day_idx = torch.zeros(B, dtype=torch.long, device=d)
 
     def _abs_idx(self) -> torch.Tensor:
         return (self._start + self._step_i).clamp(0, self.T - 1)
@@ -260,6 +299,15 @@ class BatchedFTMOEnv:
         # (DESIGN_DECISIONS.md #7 — consecutive pass-days counter is phase-level).
         self._equity_prev.fill_(self.initial_equity)
         self._gate_bars_today.zero_()
+        self._day_idx.zero_()
+        # FUTURE HOOK (DISABLED — see __init__): per-episode account-size
+        # randomization to teach size-relative risk. Reward is already normalized
+        # so enabling this needs no reward retuning. Left off intentionally.
+        # if self.cfg.get("RANDOMIZE_ACCOUNT_SIZE"):
+        #     choices = torch.tensor(self.cfg.get("ACCOUNT_SIZE_CHOICES",
+        #                            [10_000., 25_000., 50_000., 100_000.]))
+        #     pick = choices[torch.randint(len(choices), (self.B,))]
+        #     self._equity = pick.to(self.device); self._day_start_eq = pick...
         return self._get_state()
 
     # ── state ──────────────────────────────────────────────────────────────────
@@ -511,6 +559,13 @@ class BatchedFTMOEnv:
         new_day = (self._step_i % self.bars_per_day) == 0
         # Save trades_today BEFORE resetting — info must report the closing day's count
         trades_today_closing = self._trades_today.clone()
+        # Snapshot the CLOSING day's baseline/peak BEFORE rolling them forward.
+        # The reward, PASS/FAIL classification, and the honest day report must all
+        # measure the day that just ended against ITS OWN start equity — not the
+        # post-reset baseline (which would make daily_ret ≈ 0 on every calendar
+        # boundary and silently prevent PASS from ever firing there).
+        day_start_closing = self._day_start_eq.clone()
+        day_high_closing = self._day_high_eq.clone()
         # On a new day: roll baseline forward (vectorized)
         self._day_start_eq = torch.where(new_day, equity_now, self._day_start_eq)
         self._day_high_eq = torch.where(new_day, equity_now, self._day_high_eq)
@@ -536,12 +591,57 @@ class BatchedFTMOEnv:
         self._position = torch.where(self._day_halted, torch.zeros_like(self._position),
                                      self._position)
 
-        # ── per-day reward (progressive consistency) at each day boundary ──
-        daily_ret = (self._equity - self._day_start_eq) / (self._day_start_eq + 1e-8)
+        # ════════════════════════════════════════════════════════════════════
+        # REWARD — fully NORMALIZED (percent-of-start-equity) units so it is
+        # account-size invariant and O(1) per step (NOT raw dollars, which the
+        # PnL fix made ~10,000x larger and would blow up PPO). See learning_loop
+        # _fix.md FIX 1. Every term below is a fraction of start-of-day equity,
+        # tuned so a typical day's cumulative reward is roughly O(1).
+        #
+        #   daily_ret    = (equity - day_start_eq) / day_start_eq      [percent]
+        #   target_pct   = +2.5% daily goal       max_dd_pct = 1% trailing DD
+        #
+        # Dense per-step shaping (points the gradient toward the FTMO objective
+        # before the sparse terminal pass/fail ever fires):
+        #   (1) step PnL    : Δequity / day_start_eq   — direct progress signal.
+        #   (2) target pull : reward closing the gap to +2.5% (only while below
+        #                     target and positive), scaled small so it nudges,
+        #                     doesn't dominate.
+        #   (3) DD proximity: penalty that grows as intraday DD approaches the 1%
+        #                     limit (risk awareness) — quadratic in dd_used/limit.
+        #   (4) overtrade   : tiny per-new-trade cost so it won't churn ~100
+        #                     trades/day of noise, but small enough it still trades.
+        # The terminal pass/fail/streak day bonus (below) is kept but is ALSO in
+        # these normalized units now (see _day_reward_norm), so all terms share
+        # one scale.
+        # ════════════════════════════════════════════════════════════════════
+        rw = self.cfg.get("REWARD", {}) or {}
+        # Measure the day that JUST traded against its OWN baseline (the pre-reset
+        # snapshot). On a calendar boundary the live _day_start_eq has already
+        # rolled forward to equity_now, so using it here would zero out the day's
+        # return; day_start_closing preserves it.
+        daily_ret = (self._equity - day_start_closing) / (day_start_closing + 1e-8)
         reward = torch.zeros_like(daily_ret)
-        # small step signal = change in unrealised/realised equity this bar
-        reward = reward + (equity_now - self._equity_prev) / (self.initial_equity + 1e-8)
+
+        # (1) step PnL in percent-of-day-start (NOT dollars).
+        step_pnl_pct = (equity_now - self._equity_prev) / (day_start_closing + 1e-8)
+        reward = reward + float(rw.get("step_pnl_scale", 1.0)) * step_pnl_pct
         self._equity_prev = equity_now.clone()
+
+        # (2) target-progress pull: while below target and in profit, reward the
+        #     fraction of the +2.5% goal achieved this bar (delta of clipped ratio).
+        prog = (daily_ret / (self.target_pct + 1e-8)).clamp(min=0.0, max=1.0)
+        reward = reward + float(rw.get("target_progress_scale", 0.0)) * step_pnl_pct \
+            * (prog > 0).float()
+
+        # (3) drawdown-proximity penalty: 0 when flat-to-peak, grows quadratically
+        #     as intraday DD eats into the 1% headroom; hard breach handled below.
+        dd_used_now = (day_high_closing - equity_now) / (day_high_closing + 1e-8)
+        dd_frac = (dd_used_now / (self.max_dd_pct + 1e-8)).clamp(min=0.0, max=2.0)
+        reward = reward - float(rw.get("dd_proximity_scale", 0.02)) * dd_frac.pow(2)
+
+        # (4) overtrade penalty: small cost per NEW position opened this bar.
+        reward = reward - float(rw.get("overtrade_penalty", 0.0005)) * opening.float()
 
         # ── count gate-active bars this step, PER EPISODE ──
         # Reuse the per-episode gate_on computed for this bar (force-entry above):
@@ -555,7 +655,7 @@ class BatchedFTMOEnv:
         traded_today = trades_today_closing > 0
         # Gate was meaningfully active today if it fired on >5% of bars
         gate_was_active = self._gate_bars_today > (self.bars_per_day // 20)
-        dd_today = (self._day_high_eq - equity_now) / (self._day_high_eq + 1e-8)
+        dd_today = (day_high_closing - equity_now) / (day_high_closing + 1e-8)
         passed = traded_today & (daily_ret >= self.target_pct) & (dd_today <= self.max_dd_pct)
         failed = traded_today & ((dd_today > self.max_dd_pct) | (daily_ret < 0))
         # No-trade penalty: gate was active but agent never opened a position
@@ -572,12 +672,23 @@ class BatchedFTMOEnv:
                                         torch.where(day_closed & (passed | failed | no_trade_penalty),
                                                     torch.zeros_like(self._pass_streak),
                                                     self._pass_streak))
+        # low-DD bonus: reward days that finished comfortably under the DD limit.
+        low_dd_thr = float(rw.get("low_dd_threshold", 0.005))
+        low_dd_b   = float(rw.get("low_dd_bonus", 0.3))
+        low_dd_day = traded_today & (dd_today < low_dd_thr)
         day_reward = (passed.float() * pass_b
                       + failed.float() * fail_b
                       + no_trade_penalty.float() * no_trade_b
                       + (traded_today & ~passed & ~failed).float() * ok_b
+                      + low_dd_day.float() * low_dd_b
                       + streak_s * self._pass_streak.float())
         reward = reward + day_closed.float() * day_reward
+
+        # Advance the GLOBAL day index on the calendar new-day boundary only
+        # (every bars_per_day bars, synchronized across all episodes). A DD-halt
+        # closes an episode's day early for classification but does NOT advance
+        # the calendar index — so the trainer still aggregates by aligned day.
+        self._day_idx = self._day_idx + new_day.long()
 
         # episode termination: reached ep_bars or trade cap
         max_trades = int(self.cfg.get("MAX_TRADES_PER_DAY", 800))
@@ -589,6 +700,7 @@ class BatchedFTMOEnv:
         info = {
             "equity": self._equity.detach(),
             "passed": passed.detach(),
+            "failed": failed.detach(),
             "dd_breached": self._dd_breached.detach(),
             "trades_today": trades_today_closing.detach(),
             "pass_no_breach": pass_no_breach.detach(),
@@ -598,6 +710,16 @@ class BatchedFTMOEnv:
             "no_trade_penalty": no_trade_penalty.detach(),
             "gate_bars_today": self._gate_bars_today.detach(),
             "executed_direction": direction.detach(),
+            # per-day snapshots for HONEST aggregation (Bug A): the closing day's
+            # return and trailing DD as fractions, plus the global day index so
+            # the trainer can group all episodes that closed the SAME calendar day.
+            "daily_return": daily_ret.detach(),
+            "daily_dd": dd_today.detach(),
+            "day_idx": self._day_idx.detach(),
+            # report the CLOSING day's baseline so the trainer's day PnL
+            # (equity - day_start_eq) reflects the day that just ended, not the
+            # post-reset baseline (which would always read ~0).
+            "day_start_eq": day_start_closing.detach(),
         }
         return self._get_state(), reward, self._done.clone(), info
 

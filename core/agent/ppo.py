@@ -37,7 +37,8 @@ _NEG_INF = -1e9
 class ActorCritic(nn.Module):
     """Shared MLP trunk + direction/exit/lot/value heads."""
 
-    def __init__(self, state_dim: int, hidden: int = 256):
+    def __init__(self, state_dim: int, hidden: int = 256,
+                 lot_log_std_init: float = -0.5):
         super().__init__()
         self.state_dim = state_dim
         self.trunk = nn.Sequential(
@@ -47,7 +48,11 @@ class ActorCritic(nn.Module):
         self.dir_head = nn.Linear(hidden, DIRECTION_DIM)
         self.exit_head = nn.Linear(hidden, EXIT_DIM)
         self.lot_mean = nn.Linear(hidden, 1)
-        self.lot_log_std = nn.Parameter(torch.zeros(1))   # state-independent std
+        # state-independent log-std for the continuous lot head. Initialized to a
+        # modest exploratory value (exp(-0.5)≈0.61) and FLOORED in PPOAgent._dists
+        # so the sizing head never collapses to a deterministic 0-variance lot
+        # (a collapse symptom of the old do-nothing ~$0 policy).
+        self.lot_log_std = nn.Parameter(torch.full((1,), float(lot_log_std_init)))
         self.value_head = nn.Linear(hidden, 1)
 
     def forward(self, x: torch.Tensor):
@@ -104,8 +109,11 @@ class PPOAgent:
         self.max_grad_norm = float(ppo.get("max_grad_norm", 0.5))
         self.lr = float(ppo.get("learning_rate", cfg.get("LR", 3e-4)))
 
+        self.lot_log_std_min = float(ppo.get("lot_log_std_min", -2.0))
         hidden = int(cfg.get("HIDDEN", 256))
-        self.net = ActorCritic(state_dim, hidden).to(device)
+        self.net = ActorCritic(
+            state_dim, hidden,
+            lot_log_std_init=float(ppo.get("lot_log_std_init", -0.5))).to(device)
         self.optimizer = torch.optim.Adam(self.net.parameters(), lr=self.lr)
         self.buffer = RolloutBuffer()
 
@@ -129,7 +137,11 @@ class PPOAgent:
             dir_logits = dir_logits + (1.0 - dir_mask) * _NEG_INF
         dir_d = Categorical(logits=dir_logits)
         exit_d = Categorical(logits=exit_logits)
-        std = torch.exp(self.net.lot_log_std).expand_as(lot_mean)
+        # Floor the log-std so the continuous lot head keeps exploring (never a
+        # deterministic 0-variance lot). clamp(min=...) is differentiable above
+        # the floor and a no-op gradient at it.
+        log_std = self.net.lot_log_std.clamp(min=self.lot_log_std_min)
+        std = torch.exp(log_std).expand_as(lot_mean)
         lot_d = Normal(lot_mean.squeeze(-1), std.squeeze(-1))
         return dir_d, exit_d, lot_d
 
