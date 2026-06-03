@@ -1,31 +1,66 @@
 # ── rl-trading-live requirements.txt ────────────────────────────────────────
-# Pinned for reproducibility. Tested on Python 3.10+ (Colab A100).
-# Torch is installed by Colab's CUDA image; pinned here for local/dev parity.
-torch==2.7.1
-# numpy<2.0 required by faiss-cpu; numpy>=1.26 required by pandas 2.x
-numpy>=1.26,<2.0
+# COLAB-FIRST STRATEGY (read before editing):
+#
+# The Colab notebook's Cell 3 runs, verbatim and un-editable:
+#     apt-get install -y -q ta-lib          # harmless no-op on Ubuntu (check=False)
+#     pip install -q -r requirements.txt    # MUST succeed (check=True)
+#
+# So this file must `pip install` cleanly on a STANDARD Colab runtime
+# (Python 3.11/3.12, Linux x86_64, CUDA torch + numpy 2.x preinstalled) with NO
+# system C libraries to build. The pins below are chosen for exactly that:
+#
+#   • TA-Lib  : >=0.6.7 ships PREBUILT manylinux cp311/cp312 wheels, so
+#               `pip install TA-Lib` needs NO TA-Lib C source build and NO
+#               apt package. (0.4.x linked against a C lib that apt does not
+#               provide, which is what broke Cell 3.) TA-Lib stays the indicator
+#               single source of truth (DESIGN_DECISIONS.md #3).
+#               If you are ever on a platform with NO prebuilt wheel, run
+#               scripts/colab_setup.sh first to build the TA-Lib C library.
+#
+#   • numpy   : <3.0 (NOT <2.0). Colab preinstalls numpy 2.x alongside its CUDA
+#               torch; pinning <2.0 forced a downgrade that conflicted with the
+#               whole preinstalled stack. faiss-cpu>=1.9 and TA-Lib>=0.6.7 both
+#               support numpy 2.x, so we allow it.
+#
+#   • faiss-cpu : >=1.9 relaxed its numpy pin to "numpy<3,>=1.25" (1.8.0.post1
+#               hard-pinned numpy<2.0 — the root of the resolver conflict). faiss
+#               is optional and import-guarded at runtime (jordan/repo_indexer).
+#
+#   • torch   : floor only (>=2.2), NOT a hard ==pin. Colab already ships a CUDA
+#               build of torch; a hard pin would try to reinstall/override it and
+#               can break CUDA. A floor lets Colab keep its own wheel while still
+#               guaranteeing a recent-enough API for local/dev installs.
+# ─────────────────────────────────────────────────────────────────────────────
+
+# Torch: floor only so Colab keeps its preinstalled CUDA wheel (do NOT hard-pin).
+torch>=2.2
+
+# numpy <3.0 to coexist with Colab's numpy 2.x; >=1.26 for pandas 2.x.
+numpy>=1.26,<3.0
 pandas>=2.0,<3.0
-PyYAML==6.0.2
-python-dotenv==1.0.1
-requests==2.32.3
+PyYAML>=6.0,<7.0
+python-dotenv>=1.0,<2.0
+requests>=2.31,<3.0
 
-# Dashboard
-streamlit==1.39.0
-streamlit-autorefresh==1.0.1
-plotly==5.24.1
+# Dashboard (optional UI; not needed for training)
+streamlit>=1.36,<2.0
+streamlit-autorefresh>=1.0,<2.0
+plotly>=5.20,<6.0
 
-# Jordan repo indexing (FAISS) — optional at runtime; guarded imports
-faiss-cpu==1.8.0.post1
+# Jordan repo indexing (FAISS) — optional at runtime; guarded imports.
+# >=1.9 relaxes the numpy pin so it resolves with Colab's numpy 2.x.
+faiss-cpu>=1.9.0
 
 # Broker (Windows live only; import-guarded so Colab/Linux still works)
 # MetaTrader5==5.0.5120   # uncomment on Windows; not installable on Linux/Colab
 
-# Indicators — REQUIRED single source of truth (DESIGN_DECISIONS.md #3)
-# On Colab: apt-get install -y ta-lib first. On Windows: install the TA-Lib wheel.
-TA-Lib==0.4.32
+# Indicators — REQUIRED single source of truth (DESIGN_DECISIONS.md #3).
+# >=0.6.7 has prebuilt cp311/cp312 manylinux x86_64 wheels -> no C-lib build on
+# Colab. <0.7 guards against an unvetted future major.
+TA-Lib>=0.6.7,<0.7
 
 # Test + lint
-pytest==8.3.3
-pytest-cov==5.0.0
-black==24.10.0
-ruff==0.7.1
+pytest>=8.0,<9.0
+pytest-cov>=5.0,<6.0
+black>=24.0,<25.0
+ruff>=0.7,<0.8

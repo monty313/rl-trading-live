@@ -53,6 +53,78 @@ def _write_heartbeat(metrics_dir: str, episode: int, phase: str, status="running
         json.dump(payload, f)
 
 
+def _classify_days(info: dict, closed: "torch.Tensor") -> dict:
+    """
+    Classify the episodes whose day closed THIS step into PASS / FAIL / OK / SKIP
+    and return counts plus aggregate stats. Mirrors the per-day reward logic in
+    BatchedFTMOEnv.step so the printed class matches the reward the agent got.
+
+    Classes (per closed episode):
+      PASS : traded AND hit the daily target with no DD breach (info["passed"]).
+      FAIL : DD-halted day, OR a losing day (covered by env's `failed`), OR the
+             no-trade penalty fired (gate was active all day but agent never
+             traded — counts as a failure to follow the gate).
+      OK   : traded, neither passed nor failed (small green / flat day).
+      SKIP : no trades and the gate was NOT meaningfully active (nothing to do).
+    """
+    idx = closed.nonzero(as_tuple=True)[0]            # episodes closing a day now
+    passed = info["passed"][idx].bool()
+    halted = info["day_halted"][idx].bool()
+    no_trade = info["no_trade_penalty"][idx].bool()
+    trades = info["trades_today"][idx].long()
+    traded = trades > 0
+
+    is_pass = passed & traded
+    # FAIL: halted, or no-trade-penalty, or traded-and-not-pass-and-(losing/halt).
+    # We approximate the env's `failed` (dd breach OR daily_ret<0) with halted as
+    # the visible proxy plus no_trade_penalty; remaining traded days are OK.
+    is_fail = (~is_pass) & (no_trade | halted)
+    is_skip = (~traded) & (~no_trade)
+    is_ok = traded & (~is_pass) & (~is_fail)
+
+    n = int(idx.numel())
+    return {
+        "n": n,
+        "pass": int(is_pass.sum().item()),
+        "fail": int(is_fail.sum().item()),
+        "ok": int(is_ok.sum().item()),
+        "skip": int(is_skip.sum().item()),
+        "idx": idx,
+    }
+
+
+def _print_daily_results(phase: dict, global_ep: int, day_num: int, info: dict,
+                         closed: "torch.Tensor", initial_equity: float, cfg: dict):
+    """
+    Print ONE aggregated daily-results line for all episodes whose day closed on
+    this step. Streams to stdout with flush=True so Colab shows it live. This is
+    the DEFAULT behavior of `python -m training.train --resume` (Problem 2): no
+    dashboard, no flag — just readable progress.
+
+    Aggregates across the (up to B) episodes that closed: mean day PnL ($), mean
+    equity, mean trades/day, and PASS/FAIL/OK/SKIP counts.
+    """
+    cls = _classify_days(info, closed)
+    idx = cls["idx"]
+    eq = info["equity"][idx].float()
+    trades = info["trades_today"][idx].float()
+    # day PnL in $ ≈ equity - initial_equity (episodes reset equity per episode,
+    # and the day baseline rolls forward; this is the displayed running PnL).
+    day_pnl = eq - initial_equity
+    mean_pnl = float(day_pnl.mean().item())
+    mean_eq = float(eq.mean().item())
+    mean_tr = float(trades.mean().item())
+    print(
+        f"  📅 DAY {day_num:>3}  [{phase['name']}]  ep {global_ep:>4}"
+        f"  │  closed {cls['n']:>2}/{int(closed.numel())} eps"
+        f"  │  PnL $ {mean_pnl:>+10,.2f} (mean)"
+        f"  │  equity {mean_eq:>11,.2f}"
+        f"  │  trades {mean_tr:5.1f}/day"
+        f"  │  ✅{cls['pass']} ❌{cls['fail']} 🟡{cls['ok']} ⬜{cls['skip']}",
+        flush=True,
+    )
+
+
 def train(args) -> int:
     repo_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
     device = get_device()
@@ -91,6 +163,11 @@ def train(args) -> int:
         env.phase = phase
         max_eps = phase.get("max_episodes", cfg["MAX_EPISODES_PER_PHASE"])
         ep_in_phase = 0
+        # ── HEARTBEAT config (Problem 2): how often the rollout prints a live
+        # "still alive + throughput" line. Default ~512 env steps; overridable via
+        # CFG["HEARTBEAT_EVERY"]. This is what makes the Colab cell visibly move
+        # instead of looking frozen, and is how we DIAGNOSED the phase0 stall.
+        heartbeat_every = int(cfg.get("HEARTBEAT_EVERY", 512))
         while True:
             if not infinite and max_eps != -1 and ep_in_phase >= max_eps:
                 break
@@ -101,14 +178,15 @@ def train(args) -> int:
             day_num = 0
             ep_days_passed = ep_days_failed = ep_days_ok = 0
             ep_total_reward = 0.0
-            ep_gate_bars = 0   # bars where gate fired this episode
+            ep_gate_bars = 0   # bars where gate fired this episode (episode-0 ref)
             max_steps = env.ep_bars
             rollout = int(cfg.get("ROLLOUT_STEPS", 2048))
             initial_equity = float(cfg.get("INITIAL_EQUITY", 100_000))
+            ep_t0 = time.time()          # wall-clock start (for steps/sec heartbeat)
             # ── PPO on-policy rollout: collect transitions, update periodically ──
             while not done.all() and steps < max_steps:
                 mask = env.current_direction_mask()
-                # gate fired this bar if FLAT is masked (index 0 = FLAT)
+                # gate fired this bar if FLAT is masked (index 0 = FLAT) for ep 0
                 if mask[0, 0].item() == 0.0:
                     ep_gate_bars += 1
                 out = agent.select_actions(state, mask=mask)
@@ -118,54 +196,44 @@ def train(args) -> int:
                 steps += 1
                 ep_total_reward += float(reward[0].item())
 
-                # ── print a line for each day that closes (env batch item 0) ──
-                if info["day_closed"][0].item():
-                    day_num += 1
-                    eq       = float(info["equity"][0].item())
-                    passed   = bool(info["passed"][0].item())
-                    halted   = bool(info["day_halted"][0].item())
-                    streak   = int(info["pass_streak"][0].item())
-                    trades   = int(info["trades_today"][0].item())
-                    day_ret  = (eq - initial_equity) / (initial_equity + 1e-9) * 100
-
-                    rw       = cfg.get("REWARD", {}) or {}
-                    pass_b   = float(rw.get("pass_day_bonus",   2.0))
-                    ok_b     = float(rw.get("ok_day_bonus",     0.5))
-                    fail_b   = float(rw.get("fail_day_penalty", -2.0))
-                    streak_b = float(rw.get("streak_scale",     0.1)) * streak
-
-                    no_trade_pen = bool(info["no_trade_penalty"][0].item())
-                    if no_trade_pen:
-                        ep_days_failed += 1
-                        label  = "⚠️  NO-TRADE"
-                        base_r = float(rw.get("no_trade_penalty", -1.0))
-                    elif trades == 0:
-                        label  = "⬜ SKIP"
-                        base_r = 0.0
-                    elif passed:
-                        ep_days_passed += 1
-                        label  = "✅ PASS"
-                        base_r = pass_b
-                    elif halted or day_ret < 0:
-                        ep_days_failed += 1
-                        label  = "❌ FAIL"
-                        base_r = fail_b
-                    else:
-                        ep_days_ok += 1
-                        label  = "🟡 OK  "
-                        base_r = ok_b
-
-                    halt_tag = "  ⛔ DD-HALT" if halted else ""
+                # ── HEARTBEAT: print every `heartbeat_every` env steps so the
+                # cell never looks frozen (Problem 2 + stall diagnosis). Reports
+                # global step, throughput (steps/sec), phase, and elapsed time.
+                if steps % heartbeat_every == 0:
+                    elapsed = time.time() - ep_t0
+                    sps = steps / max(elapsed, 1e-9)
+                    global_step = global_ep * max_steps + steps   # approx global
                     print(
-                        f"    Day {day_num:>2}  {label}"
-                        f"  │  equity {eq:>10,.2f}  ({day_ret:+.3f}%)"
-                        f"  │  trades {trades:>3}"
-                        f"  │  streak {streak}"
-                        f"  │  reward {base_r+streak_b:+.2f}"
-                        f"  (base {base_r:+.1f}  streak {streak_b:+.2f})"
-                        f"{halt_tag}",
+                        f"  ⏱  HEARTBEAT  step {steps:>6}/{max_steps}"
+                        f"  │  global ~{global_step:>9,}"
+                        f"  │  {sps:6.1f} steps/s"
+                        f"  │  phase {phase['name']}"
+                        f"  │  elapsed {elapsed:6.1f}s",
                         flush=True,
                     )
+
+                # ── DAILY RESULTS, AGGREGATED ACROSS ALL B EPISODES (Problem 2) ──
+                # A day closes for an episode when info["day_closed"][b] is True.
+                # The 64 parallel episodes drift out of phase (random start bars),
+                # so on a given step only SOME episodes close a day. We aggregate
+                # whatever closed THIS step into one readable line: mean day PnL$,
+                # mean equity, mean trades, and PASS/FAIL/OK/SKIP class counts —
+                # never 64 separate lines.
+                closed = info["day_closed"]
+                if bool(closed.any().item()):
+                    _print_daily_results(phase, global_ep, day_num, info,
+                                         closed, initial_equity, cfg)
+                    day_num += 1
+                    # keep episode-0 running tallies for the episode summary line
+                    if bool(closed[0].item()):
+                        if bool(info["no_trade_penalty"][0].item()):
+                            ep_days_failed += 1
+                        elif bool(info["passed"][0].item()):
+                            ep_days_passed += 1
+                        elif bool(info["day_halted"][0].item()):
+                            ep_days_failed += 1
+                        elif int(info["trades_today"][0].item()) > 0:
+                            ep_days_ok += 1
 
                 if len(agent.buffer) >= rollout:
                     agent.update()        # PPO update, then buffer clears

@@ -35,6 +35,7 @@ from core.env.indicators import (build_feature_matrix, NUM_FEATURES, COL,
                                  feature_row_dict, compute_indicators,
                                  resample_ohlcv)
 from core.env import conditions_engine
+from core.env.gate_precompute import precompute_gate_signal
 
 _NEG_INF = -1e9
 
@@ -48,8 +49,16 @@ class BatchedFTMOEnv:
         self.cfg = cfg
         self.device = device
         self.instrument = instrument
-        self.phase = phase or {"entry_conditions": {"buy": "any", "sell": "any"}}
+        # NOTE: use the private attr here; the public ``phase`` property setter
+        # (defined below) triggers gate precompute, which needs self.features /
+        # self._tf_indicators to already exist. We set those up first, then
+        # assign self.phase at the END of __init__ to fire the first precompute.
+        self._phase = phase or {"entry_conditions": {"buy": "any", "sell": "any"}}
         self.policy = policy or {}
+        # Cache of the vectorized per-bar gate signal for the active phase.
+        # Populated by _refresh_gate_signal() whenever the phase changes. This is
+        # what replaces the per-bar pandas to_dict() that caused the 4h stall.
+        self._gate_signal = None
 
         self.B = int(cfg.get("BATCH_SIZE_ENV", 4))
         self.lkbk = int(cfg.get("LOOKBACK", 20))
@@ -86,6 +95,40 @@ class BatchedFTMOEnv:
         else:
             print("[env] WARNING: no raw OHLCV available — phase gate masks DISABLED. "
                   "Pass raw (N,5) OHLCV, not a prebuilt feature matrix.", flush=True)
+
+        # ── Precompute the vectorized gate signal for the initial phase ──
+        # Assigning through the property setter runs _refresh_gate_signal(), which
+        # builds the length-T per-bar gate tensor ONCE. From here on the hot loop
+        # only does a tensor gather (gate_on[abs_idx]) — no pandas per bar.
+        self.phase = self._phase
+
+    # ── phase property: changing the phase re-precomputes the gate signal ──────
+    @property
+    def phase(self):
+        return self._phase
+
+    @phase.setter
+    def phase(self, new_phase):
+        """Setting env.phase (e.g. train.py's run_phase) swaps the active phase
+        AND rebuilds the vectorized per-bar gate signal for it. This is the only
+        place the (potentially expensive) precompute runs — never in the hot
+        per-step loop."""
+        self._phase = new_phase or {"entry_conditions": {"buy": "any", "sell": "any"}}
+        self._refresh_gate_signal()
+
+    def _refresh_gate_signal(self):
+        """(Re)build the length-T per-bar gate tensor for the active phase.
+
+        Guarded so it is a no-op until the feature matrix + TF indicators exist
+        (during __init__ the setter may run before those are ready — though we
+        intentionally assign self.phase only at the END of __init__, this guard
+        keeps the method safe to call at any time)."""
+        if not hasattr(self, "features"):
+            self._gate_signal = None
+            return
+        tf_ind = getattr(self, "_tf_indicators", {}) or {}
+        self._gate_signal = precompute_gate_signal(
+            self._phase, tf_ind, self.features, self.T, self.device)
 
     # ── helpers ──────────────────────────────────────────────────────────────
     def _ensure_feature_matrix(self, features) -> torch.Tensor:
@@ -244,7 +287,25 @@ class BatchedFTMOEnv:
                                 daily_ret], dim=1)
         return torch.cat([norm, pos_feat], dim=1)
 
-    # ── action mask (RULE 12) ──────────────────────────────────────────────────
+    # ── action mask (RULE 12) — VECTORIZED (stall fix) ─────────────────────────
+    #
+    # PERFORMANCE NOTE (the 4-hour phase0 stall fix):
+    #   The masks below are built from the PRECOMPUTED per-bar gate signal
+    #   (self._gate_signal, length T) with pure tensor ops — a single gather plus
+    #   a few torch.where calls, all O(B). The old implementation rebuilt pandas
+    #   row-dicts every bar (to_dict("records")) and looped in Python over all B
+    #   episodes; profiling showed ~90% of step time there. See
+    #   core/env/gate_precompute.py for the precompute, and
+    #   tests/unit/test_gate_precompute.py for the bar-for-bar parity proof that
+    #   this fast path returns identical masks to the original scalar path.
+
+    def _allow_all_mask(self) -> Tuple[torch.Tensor, torch.Tensor]:
+        """(B, DIRECTION_DIM) all-ones mask + all-False must_enter (free phase /
+        no gating). Allocated fresh each call (callers may store it)."""
+        m = torch.ones(self.B, DIRECTION_DIM, dtype=torch.float32, device=self.device)
+        must = torch.zeros(self.B, dtype=torch.bool, device=self.device)
+        return m, must
+
     def current_mask_and_force(self) -> Tuple[torch.Tensor, torch.Tensor]:
         """
         Per-episode gate mask. Returns:
@@ -254,20 +315,74 @@ class BatchedFTMOEnv:
           must_enter : (B,) bool — True where a force_in_and_gate/open_gate gate is
                        ON and the episode is flat (agent must open BUY or SELL).
 
-        BUG-4 FIX: previously this read only self._position[0] / abs_idx[0] (episode
-        0) and broadcast that single mask to all 64 episodes, so 63/64 episodes got
-        the wrong mask. Now the gate condition + force-entry is evaluated per episode.
+        BUG-4 (still honored): the mask is per-episode — each episode uses its own
+        current bar index (abs_idx) and its own flat/in-trade state.
+
+        Implementation: gather the precomputed per-bar gate booleans at each
+        episode's current bar, then derive the mask with tensor ops. No pandas.
         """
+        sig = self._gate_signal
+        is_flat = (self._position == 0)                      # (B,) bool
+        if sig is None:
+            return self._allow_all_mask()                    # free / ungated phase
+
         abs_idx = self._abs_idx()
-        is_flat = (self._position == 0)                      # (B,) bool tensor
-        rows_batch = self._rows_by_tf_batch(abs_idx)
-        if not rows_batch:
-            # string-condition / no-raw-OHLCV fallback: build the compact feature
-            # row per episode from the feature matrix.
-            rows_batch = {1: [feature_row_dict(self.features[i])
-                              for i in abs_idx.detach().cpu().tolist()]}
-        return conditions_engine.compute_action_mask_batch(
-            self.phase, rows_batch, self.B, self.device, is_flat=is_flat)
+        if sig["kind"] == "named":
+            gate_on = sig["gate_on"][abs_idx]                # (B,) bool — per episode
+            return self._named_mask_from_gate(gate_on, is_flat)
+
+        # string-condition path: per-bar buy/sell triggers
+        buy_on = sig["buy_on"][abs_idx]
+        sell_on = sig["sell_on"][abs_idx]
+        return self._string_mask_from_triggers(buy_on, sell_on)
+
+    def _named_mask_from_gate(self, gate_on: torch.Tensor, is_flat: torch.Tensor
+                              ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Vectorized equivalent of compute_action_mask's force_in_and_gate /
+        open_gate branch (they are identical), evaluated for all B episodes at
+        once from the per-episode gate_on + is_flat booleans:
+
+            gate ON  + flat      -> {BUY, SELL}        must_enter=True
+            gate ON  + in-trade  -> {FLAT, BUY, SELL}  must_enter=False
+            gate OFF + flat      -> {FLAT}             must_enter=False
+            gate OFF + in-trade  -> {FLAT, BUY, SELL}  must_enter=False
+        """
+        B, dev = self.B, self.device
+        # Column-wise allow flags (B,) for FLAT / BUY / SELL.
+        on, off = gate_on, ~gate_on
+        flat, intrade = is_flat, ~is_flat
+        allow_flat = (on & intrade) | (off & flat) | (off & intrade)   # not (on&flat)
+        allow_buy = (on) | (off & intrade)
+        allow_sell = allow_buy
+        mask = torch.zeros(B, DIRECTION_DIM, dtype=torch.float32, device=dev)
+        mask[:, FLAT] = allow_flat.float()
+        mask[:, BUY] = allow_buy.float()
+        mask[:, SELL] = allow_sell.float()
+        must_enter = on & flat
+        return mask, must_enter
+
+    def _string_mask_from_triggers(self, buy_on: torch.Tensor, sell_on: torch.Tensor
+                                   ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Vectorized equivalent of compute_action_mask's string-condition branch:
+
+            buy only  -> {BUY}
+            sell only -> {SELL}
+            both      -> {BUY, SELL}
+            neither   -> {FLAT, BUY, SELL}  (allow all)
+
+        must_enter is always False on the string path (matches the scalar code).
+        """
+        B, dev = self.B, self.device
+        both = buy_on & sell_on
+        neither = (~buy_on) & (~sell_on)
+        only_buy = buy_on & (~sell_on)
+        only_sell = sell_on & (~buy_on)
+        mask = torch.zeros(B, DIRECTION_DIM, dtype=torch.float32, device=dev)
+        mask[:, FLAT] = neither.float()
+        mask[:, BUY] = (only_buy | both | neither).float()
+        mask[:, SELL] = (only_sell | both | neither).float()
+        must_enter = torch.zeros(B, dtype=torch.bool, device=dev)
+        return mask, must_enter
 
     def current_direction_mask(self) -> torch.Tensor:
         """(B, DIRECTION_DIM) per-episode float mask for the PPO direction head."""
@@ -276,19 +391,19 @@ class BatchedFTMOEnv:
 
     def _gate_on_batch(self, abs_idx: Optional[torch.Tensor] = None) -> torch.Tensor:
         """(B,) bool — True where the phase gate condition fires for that episode
-        at bar `abs_idx` (defaults to the current bar), regardless of its position.
-        Computed by masking AS-IF-FLAT: when the gate is ON the FLAT direction is
-        masked, so mask[:,FLAT]==0 is the per-episode gate-on signal."""
+        at bar `abs_idx` (defaults to the current bar), regardless of position.
+
+        Vectorized: a direct gather into the precomputed per-bar gate tensor. For
+        the string-condition path "gate active" means either side triggered. For a
+        free/ungated phase nothing fires (all False)."""
         if abs_idx is None:
             abs_idx = self._abs_idx()
-        rows_batch = self._rows_by_tf_batch(abs_idx)
-        if not rows_batch:
-            rows_batch = {1: [feature_row_dict(self.features[i])
-                              for i in abs_idx.detach().cpu().tolist()]}
-        forced_flat = torch.ones(self.B, dtype=torch.bool, device=self.device)
-        mask, _ = conditions_engine.compute_action_mask_batch(
-            self.phase, rows_batch, self.B, self.device, is_flat=forced_flat)
-        return mask[:, FLAT] == 0.0
+        sig = self._gate_signal
+        if sig is None:
+            return torch.zeros(self.B, dtype=torch.bool, device=self.device)
+        if sig["kind"] == "named":
+            return sig["gate_on"][abs_idx]
+        return sig["buy_on"][abs_idx] | sig["sell_on"][abs_idx]
 
     # ── step ────────────────────────────────────────────────────────────────────
     def step(self, actions) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, Dict]:

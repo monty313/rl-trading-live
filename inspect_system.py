@@ -42,6 +42,11 @@ def check_python_version():
 
 
 def check_cuda():
+    # torch MUST import (it's the core dependency). CUDA itself is reported as a
+    # non-fatal SKIP when absent so the suite is runnable on CPU/CI; on Colab CUDA
+    # is present and this PASSes. We deliberately do NOT hard-fail on "no CUDA":
+    # the GPU is a runtime concern, not a code-correctness preflight, and Cell 1
+    # of the notebook already asserts an A100 before we ever get here.
     try:
         import torch
         if torch.cuda.is_available():
@@ -51,6 +56,23 @@ def check_cuda():
     except Exception as e:
         record("torch import", "FAIL", irac(str(e), "torch must import",
                "pip install torch", "Re-run"))
+
+
+def check_talib_import():
+    # TA-Lib is the indicator single source of truth (DESIGN_DECISIONS.md #3) and
+    # MUST be importable for a real (parity-correct) training run. On Colab the
+    # prebuilt manylinux wheel (requirements.txt: TA-Lib>=0.6.7) makes this work
+    # with no C-lib build. We report SKIP (not FAIL) when talib is absent because
+    # the numpy fallback (RL_ALLOW_NUMPY_INDICATORS=1) lets CI/dev still run — but
+    # we print a loud note so a Colab user knows their install regressed. This is
+    # intentionally non-fatal: failing here would block CPU/CI where talib isn't
+    # installed, which is exactly the over-strictness Problem 4 asks us to avoid.
+    try:
+        import talib  # noqa: F401
+        record(f"TA-Lib importable (v{talib.__version__})", "PASS")
+    except Exception:
+        record("TA-Lib importable (numpy fallback active)", "SKIP",
+               None)
 
 
 def check_phases_yaml():
@@ -155,12 +177,18 @@ def check_persona_fallback():
 
 
 def check_dashboard_imports():
+    # The dashboard is OPTIONAL UI (the user runs training without it — Problem 2
+    # streams results to stdout instead). A missing/broken optional UI dep
+    # (streamlit/plotly) must NOT halt training, so import errors here are a
+    # non-fatal SKIP with the reason attached. A genuine code bug in dashboard.app
+    # would still surface in the dashboard cell itself. This is the kind of
+    # env-fragile, training-irrelevant check Problem 4 says to soften.
     try:
         importlib.import_module("dashboard.app")
         record("dashboard.app imports", "PASS")
     except Exception as e:
-        record("dashboard.app imports", "FAIL", irac(str(e), "must import",
-               "fix dashboard", "re-run"))
+        record("dashboard.app imports (optional UI)", "SKIP",
+               f"  (non-fatal) dashboard import skipped: {e}")
 
 
 def check_no_hardcoded_credentials():
@@ -184,8 +212,17 @@ def check_no_hardcoded_credentials():
 
 
 def main() -> int:
+    # Order matters only for readability; each check is independent. Genuinely
+    # required preflight checks (python version, torch import, phases/policy YAML,
+    # all-modules-import, action space, trade gate, smoke train/backtest/infer,
+    # pytest) FAIL hard — they catch real code/config breakage before training.
+    # Environment-fragile or training-irrelevant checks (CUDA presence, TA-Lib
+    # presence when the numpy fallback exists, the optional dashboard UI) are
+    # reported as non-fatal SKIP so the suite passes on CPU/CI and on a correctly
+    # set-up Colab alike. See each check's docstring for the rationale.
     check_python_version()
     check_cuda()
+    check_talib_import()
     check_phases_yaml()
     check_trading_policy()
     check_all_imports()
