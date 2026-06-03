@@ -388,11 +388,29 @@ _KNOWN_ERRORS = [
         "RULE   : Training requires an A100 runtime (>30GB VRAM).\n"
         "FIX    : Runtime → Change runtime type → A100 GPU.",
     ),
+    # ── MISSING CSV / UNMOUNTED DRIVE ────────────────────────────────────────
+    # FUTURE-LLM NOTE: a FileNotFoundError on the CSV is ALMOST ALWAYS an
+    # unmounted Google Drive in a fresh/restarted Colab session — NOT a code bug.
+    # Drive unmounts on every runtime restart/timeout, so the path goes empty
+    # even though the loader is fine. Do NOT rewrite the data loader. Re-mount
+    # Drive (Cell 2, force_remount=True) and `ls` the data folder. The patterns
+    # below catch our own friendly DataFileNotFoundError message ("PRIMARY DATA
+    # FILE NOT FOUND") AND a raw FileNotFoundError that mentions a .csv path.
     (
-        "PRIMARY DATA FILE NOT FOUND",
-        "ISSUE  : The EURUSD CSV is missing from Google Drive.\n"
-        "RULE   : CSV must exist at RL-Trading-Data/EURUSD_M1_...csv.\n"
-        "FIX    : Re-upload the CSV to your Drive at that exact path.",
+        r"PRIMARY DATA FILE NOT FOUND|DataFileNotFoundError|"
+        r"FileNotFoundError.*\.csv|No such file or directory.*\.csv",
+        "ISSUE  : The training CSV could not be found — Drive is probably not\n"
+        "         mounted (it UNMOUNTS on every Colab restart/timeout), or the\n"
+        "         file path/name is wrong, or the file isn't in that folder.\n"
+        "RULE   : The CSV must exist at the --csv path on a MOUNTED Drive.\n"
+        "FIX    : (a) Re-run Cell 2 (MOUNT DRIVE). If it STILL fails, force it:\n"
+        "             from google.colab import drive\n"
+        "             drive.mount('/content/drive', force_remount=True)\n"
+        "         (b) Verify the file exists:\n"
+        "             !ls -la /content/drive/MyDrive/RL-Trading-Data/\n"
+        "         (c) Confirm the filename EXACTLY matches the --csv argument.\n"
+        "         (d) Then re-run Cell 6 (training).\n"
+        "         See docs/COLAB_RUNBOOK.md for the full checklist.",
     ),
     (
         "FileNotFoundError.*eurusd_gpu",
@@ -428,7 +446,9 @@ def _diagnose(exc: Exception) -> str:
         "RULE   : Check the full traceback above for the root cause.\n"
         "FIX    : Run Cell 4 (git reset --hard) to ensure latest code,\n"
         "         then re-run Cell 5 (inspect_system) to find the failure,\n"
-        "         then re-run Cell 6."
+        "         then re-run Cell 6.\n"
+        "         See docs/COLAB_RUNBOOK.md for the full run order +\n"
+        "         a troubleshooting table mapping each error to its fix."
     )
 
 
@@ -454,6 +474,8 @@ def main() -> int:
         traceback.print_exc()
         print("\n" + "─" * 70, flush=True)
         print(_diagnose(exc), flush=True)
+        print("─" * 70, flush=True)
+        print("  📖 Full run order + troubleshooting: docs/COLAB_RUNBOOK.md", flush=True)
         print("─" * 70 + "\n", flush=True)
         return 1
 

@@ -15,6 +15,8 @@ Data resolution order for the environment:
 """
 from __future__ import annotations
 
+import os
+import sys
 from typing import Optional, Tuple
 
 import numpy as np
@@ -28,12 +30,93 @@ from core.risk.daily_guard import DailyGuard
 from core.risk.trade_gate import TradeGate
 
 
+class DataFileNotFoundError(FileNotFoundError):
+    """Raised when the OHLCV CSV does not exist on disk.
+
+    ────────────────────────────────────────────────────────────────────────
+    NOTE TO A FUTURE LLM / MAINTAINER:
+    If you are reading this because a run crashed with FileNotFoundError on the
+    CSV, it is ALMOST ALWAYS an unmounted Google Drive in a fresh/restarted
+    Colab session — NOT a code bug in the data loader. When the Colab runtime
+    restarts or times out, /content/drive UNMOUNTS, so the CSV path resolves to
+    nothing even though nothing in the code changed.
+
+    DO NOT start rewriting load_ohlcv_csv or the pipeline. Instead:
+      1. Re-run Cell 2 (MOUNT DRIVE). If it still fails, force a remount:
+             from google.colab import drive
+             drive.mount('/content/drive', force_remount=True)
+      2. Verify the file is actually there:
+             !ls -la /content/drive/MyDrive/RL-Trading-Data/
+      3. Confirm the filename EXACTLY matches the --csv argument.
+      4. Re-run Cell 6 (training).
+    See docs/COLAB_RUNBOOK.md for the full ordered checklist + troubleshooting.
+    ────────────────────────────────────────────────────────────────────────
+    """
+
+
+def _missing_csv_message(path: str) -> str:
+    """Build an actionable, copy-pasteable remediation message for a missing CSV.
+
+    Tailors the wording for Colab: if /content/drive is not even mounted we say
+    so explicitly, because that (not a wrong path) is the single most common
+    cause of this error in a fresh/restarted Colab session.
+    """
+    # Detect Colab + whether Drive is mounted at all. On a fresh/restarted Colab
+    # session Drive is UNMOUNTED, so the path is empty and read_csv would crash
+    # with an opaque FileNotFoundError — we get ahead of that with guidance.
+    on_colab = ("google.colab" in sys.modules) or os.path.isdir("/content/drive") \
+        or os.path.isdir("/content")
+    drive_mounted = os.path.ismount("/content/drive") or os.path.exists("/content/drive/MyDrive")
+
+    lines = [
+        "PRIMARY DATA FILE NOT FOUND — the training CSV does not exist.",
+        f"  Missing path: {path}",
+        "",
+        "Most likely cause:",
+        "  • Google Drive is NOT mounted in this Colab session (it unmounts on",
+        "    every runtime restart / timeout), OR",
+        "  • the file path/name is wrong, OR",
+        "  • the CSV simply isn't in that Drive folder.",
+    ]
+    if on_colab and not drive_mounted:
+        lines += [
+            "",
+            "  ⚠️  /content/drive does NOT appear to be mounted — run Cell 2 first.",
+        ]
+    lines += [
+        "",
+        "FIX checklist (do these in order):",
+        "  (a) Re-run Cell 2 (MOUNT DRIVE). If it STILL fails, force a remount:",
+        "          from google.colab import drive",
+        "          drive.mount('/content/drive', force_remount=True)",
+        "  (b) Verify the file exists:",
+        "          !ls -la /content/drive/MyDrive/RL-Trading-Data/",
+        "  (c) Confirm the filename EXACTLY matches the --csv argument.",
+        "  (d) Then re-run Cell 6 (training).",
+        "",
+        "See docs/COLAB_RUNBOOK.md for the full ordered run checklist.",
+    ]
+    return "\n".join(lines)
+
+
 def load_ohlcv_csv(path: str) -> np.ndarray:
     """
     Load an M1 CSV into an (N,5) float32 [open,high,low,close,volume] array.
     Handles the user's schema (time,open,high,low,close,tick_volume,...) and the
     common MT5 tab/`<>`-delimited export. Robust to comma or tab delimiters.
+
+    Raises DataFileNotFoundError (with copy-pasteable remediation steps) BEFORE
+    touching pandas if the path is missing.
+
+    ── FUTURE-LLM NOTE ──────────────────────────────────────────────────────
+    A FileNotFoundError here is NOT a loader bug. In Colab it means Drive isn't
+    mounted (fresh/restarted runtime → /content/drive is gone). Do NOT rewrite
+    this function — re-mount Drive (Cell 2, force_remount=True) and `ls` the
+    RL-Trading-Data folder to confirm the file. See docs/COLAB_RUNBOOK.md.
     """
+    # Guard FIRST: a clear, actionable error beats pandas' opaque crash.
+    if not os.path.exists(path):
+        raise DataFileNotFoundError(_missing_csv_message(path))
     import pandas as pd
     try:
         df = pd.read_csv(path)
@@ -57,6 +140,10 @@ def _resolve_features(cfg: dict) -> np.ndarray:
         return cfg["FEATURES"]
     csv_path = cfg.get("DATA_CSV_EURUSD")
     if csv_path:
+        # load_ohlcv_csv raises DataFileNotFoundError (with full remediation
+        # steps) if the path is missing. In Colab that means Drive isn't mounted
+        # — re-run Cell 2 (force_remount=True) and `ls` the data folder; do NOT
+        # rewrite the loader. See docs/COLAB_RUNBOOK.md.
         data = load_ohlcv_csv(csv_path)
         print(f"[pipeline] Loaded {len(data):,} bars from {csv_path}", flush=True)
         return data

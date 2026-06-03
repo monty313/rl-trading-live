@@ -252,6 +252,9 @@ def main() -> int:
     print("=" * 64)
     print(f"  {len(results)} checks — {failed} failed, {skipped} skipped "
           f"(SKIP = needs Colab GPU/Drive)")
+    # Always point to the runbook: it maps every common Colab error (missing CSV
+    # / unmounted Drive, talib, pip, no-checkpoint, etc.) to its exact fix.
+    print("  📖 Run order + troubleshooting: docs/COLAB_RUNBOOK.md")
     return 0 if failed == 0 else 1
 
 
