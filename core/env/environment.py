@@ -822,8 +822,27 @@ class BatchedFTMOEnv:
         # ── INTRADAY 1% DD ENDS THE TRADING DAY (DESIGN_DECISIONS.md #5) ──
         # When today's trailing DD first hits the limit, halt trading for the
         # rest of the day (positions flattened, no new entries until next day).
-        newly_halted = breach_now & (~self._day_halted)
-        self._day_halted = self._day_halted | breach_now
+        #
+        # ROOT-CAUSE FIX (every-other-day zero-trade bug): breach_now (computed at
+        # the top of step) is measured against the CLOSING day's peak/equity. On a
+        # calendar boundary the block above ALREADY rolled the day forward and
+        # cleared _day_halted to False for the FRESH day. If we then OR breach_now
+        # back into _day_halted unconditionally, a breach on the final bar of the
+        # closing day (or simply a still-below-peak last bar) RE-HALTS the brand-new
+        # day before it has traded a single bar — so the next day opens permanently
+        # halted, produces ZERO trades, then clears at ITS boundary, and the cycle
+        # repeats. That is the perfect odd/even alternating zero-trade signature.
+        #
+        # The closing day's breach is already captured in _dd_breached and the
+        # classification snapshots taken BEFORE the reset, so the halt itself must
+        # only apply to the day the breach actually belongs to — i.e. NOT on a
+        # new_day boundary. We gate the halt with (~new_day): on a calendar rollover
+        # the new day starts fresh (halt stays False); intraday breaches halt as
+        # before. The position flatten is likewise scoped so a freshly-reset day is
+        # never flattened on its opening bar by the previous day's breach.
+        halt_breach = breach_now & (~new_day)
+        newly_halted = halt_breach & (~self._day_halted)
+        self._day_halted = self._day_halted | halt_breach
         self._position = torch.where(self._day_halted, torch.zeros_like(self._position),
                                      self._position)
 

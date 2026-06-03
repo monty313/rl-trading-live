@@ -49,10 +49,26 @@ class ActorCritic(nn.Module):
         self.dir_head = nn.Linear(hidden, DIRECTION_DIM)
         self.exit_head = nn.Linear(hidden, EXIT_DIM)
         self.lot_mean = nn.Linear(hidden, 1)
+        # ── LOT HEAD INITIALIZATION (issue-2 lot-sizing fix) ──────────────────
+        # The lot head emits a pre-squash mean that select_actions turns into a lot
+        # via sigmoid(lot_pre) -> [0,1] -> map_lot -> [MIN_LOT, max_lot]. We want
+        # the INITIAL mean lot to sit ~MID-RANGE (~1.0 lot on a 2.0 max), NOT pinned
+        # at the 0.01 floor — otherwise the agent starts effectively flat-sized and
+        # has to climb out of a saturated sigmoid tail to ever size up. With the
+        # default Linear init the bias is a small RANDOM value, so the mid-range
+        # start was only incidental. We make it ROBUST by construction: zero the
+        # bias so sigmoid(0)=0.5 (=> ~1.0 lot at MAX_LOT=2.0) and keep the weights
+        # small (near state-independent at t=0) so the head starts centered and
+        # LEARNS to differentiate size from there. This guarantees the documented
+        # "initial mean lot is mid-range" invariant regardless of trunk init.
+        nn.init.zeros_(self.lot_mean.bias)
+        nn.init.normal_(self.lot_mean.weight, mean=0.0, std=0.01)
         # state-independent log-std for the continuous lot head. Initialized to a
         # modest exploratory value (exp(-0.5)≈0.61) and FLOORED in PPOAgent._dists
         # so the sizing head never collapses to a deterministic 0-variance lot
-        # (a collapse symptom of the old do-nothing ~$0 policy).
+        # (a collapse symptom of the old do-nothing ~$0 policy). The floor lets PPO
+        # keep SAMPLING a spread of sizes (incl. toward 2.0) so size stays learnable
+        # even if the mean drifts; see PPOAgent.lot_log_std_min.
         self.lot_log_std = nn.Parameter(torch.full((1,), float(lot_log_std_init)))
         self.value_head = nn.Linear(hidden, 1)
 
