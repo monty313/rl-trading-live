@@ -30,6 +30,39 @@ from core.risk.daily_guard import DailyGuard
 from core.risk.trade_gate import TradeGate
 
 
+def resolve_initial_equity(cfg: dict) -> float:
+    """Single source of truth for the account's starting equity.
+
+    The env, the daily guard, and the startup log MUST all agree on this number,
+    otherwise the guard's fixed daily increment (initial_equity * target_pct)
+    would be computed off a different base than the env's. Resolution order
+    mirrors BatchedFTMOEnv.__init__: ACCOUNT_SIZE first, then INITIAL_EQUITY,
+    then a $10,000 default (learning_loop_fix.md FIX 3 — comprehensible numbers).
+    """
+    return float(cfg.get("ACCOUNT_SIZE", cfg.get("INITIAL_EQUITY", 10_000.0)))
+
+
+def ftmo_rule_summary(cfg: dict) -> str:
+    """Build the authoritative one-line startup banner describing the ACTIVE FTMO
+    rules for this run, e.g.:
+
+        [ftmo] daily target = 2.50% (=$250 on $10,000 account)  |  daily max DD = 1.00%
+
+    These values are read STRAIGHT from cfg at RUNTIME (the CLI flags
+    --target-pct / --max-dd-pct / --daily-target-usd populate them), so the line
+    always reflects what is actually enforced THIS run — including on a resume,
+    where the CURRENT cfg/CLI wins over anything a checkpoint might have carried.
+    See the principles block in core/env/environment.py for the full rule set.
+    """
+    init_eq = resolve_initial_equity(cfg)
+    target_pct = float(cfg.get("DAILY_TARGET_PCT", 0.025))
+    max_dd_pct = float(cfg.get("DAILY_MAX_DD_PCT", 0.010))
+    daily_increment = init_eq * target_pct
+    return (f"[ftmo] daily target = {target_pct * 100:.2f}% "
+            f"(=${daily_increment:,.2f} on ${init_eq:,.0f} account)"
+            f"  |  daily max DD = {max_dd_pct * 100:.2f}%")
+
+
 class DataFileNotFoundError(FileNotFoundError):
     """Raised when the OHLCV CSV does not exist on disk.
 
@@ -162,6 +195,13 @@ def build_pipeline(cfg: dict, device: torch.device,
     cfg = auto_tune_batch(dict(cfg), device)
     cfg["device"] = device
 
+    # ── FTMO RULE BANNER (ftmo_rules_fix.md RULE 5) ──────────────────────────
+    # Print the ACTIVE daily target / max-DD for THIS run before anything trades.
+    # Because it reads cfg (which the CLI flags --target-pct / --max-dd-pct /
+    # --daily-target-usd just populated), it is correct for backtest, eval, live,
+    # AND a resumed training run — the current cfg always wins over a checkpoint.
+    print(ftmo_rule_summary(cfg), flush=True)
+
     features = _resolve_features(cfg)
     env = BatchedFTMOEnv(features, cfg, device,
                          instrument=cfg.get("SYMBOL", "EURUSD"),
@@ -172,7 +212,10 @@ def build_pipeline(cfg: dict, device: torch.device,
 
     sizer = PositionSizer(cfg)
     mode = (policy or {}).get("mode", "ftmo") if policy else cfg.get("MODE", "ftmo")
-    guard = DailyGuard(mode, cfg.get("INITIAL_EQUITY", 100_000.0), cfg)
+    # The guard's initial_balance MUST match the env's initial_equity so its fixed
+    # daily increment (initial_balance * target_pct) is computed off the SAME base
+    # as the env's classification. Use the shared resolver, not a divergent default.
+    guard = DailyGuard(mode, resolve_initial_equity(cfg), cfg)
     gate = TradeGate(daily_guard=guard,
                      log_path=cfg.get("TRADE_LOG", "logs/daily_trade_log.csv"))
     return env, agent, sizer, guard, gate

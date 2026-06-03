@@ -25,6 +25,15 @@ day's OPENING balance plus a FIXED daily increment:
   PASS  = (equity >= daily_target)   # at end of day OR at a DD halt (RULE 3)
   FAIL  = everything else (a DD breach does NOT auto-fail; balance-at-halt decides)
 There is NO "OK" and NO "SKIP" — pass_fail() returns only "PASS" or "FAIL".
+
+SINGLE SOURCE OF TRUTH for the FTMO principles (daily target, trailing DD, binary
+classification, runtime config) is the principles block at the top of
+core/env/environment.py — read it first. That env is the authoritative training/
+classification path (per-bar peak that resets each day). THIS guard is the live/
+backtest risk gate; it mirrors the same binary PASS/FAIL target rule, and its DD
+halt enforces the same "halt the day on a trailing-DD breach" principle (the FTMO
+branch trails from the day baseline, the beast branch from the high-water peak).
+target_pct / max_dd_pct here are read from cfg at RUNTIME — never hardcoded.
 """
 from __future__ import annotations
 

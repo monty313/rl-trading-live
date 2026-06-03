@@ -44,6 +44,50 @@ from core.env.gate_precompute import precompute_gate_signal
 _NEG_INF = -1e9
 
 
+# ╔══════════════════════════════════════════════════════════════════════════╗
+# ║  FTMO DAILY PRINCIPLES — SINGLE SOURCE OF TRUTH                            ║
+# ║  (referenced by core/risk/daily_guard.py and core/reward/shaper.py)       ║
+# ╠══════════════════════════════════════════════════════════════════════════╣
+# ║  This block is written in plain language for a future human/LLM. The code ║
+# ║  in BatchedFTMOEnv.step() below is the authoritative implementation; if    ║
+# ║  the two ever disagree, the CODE wins and this comment is the bug.         ║
+# ║                                                                            ║
+# ║  ── 1. DAILY TARGET (a FIXED dollar amount) ───────────────────────────── ║
+# ║    daily_increment = initial_equity * target_pct                          ║
+# ║       • a FLAT dollar amount, computed ONCE at account open.              ║
+# ║       • ALWAYS a percentage of the ORIGINAL initial equity — NEVER of the  ║
+# ║         current/opening balance, and it does not grow as the account does. ║
+# ║    daily_target = day_start_equity + daily_increment                      ║
+# ║    PASS  iff  final_or_halt_equity >= daily_target                        ║
+# ║    Worked example — $10,000 account @ target_pct = 2.5%:                  ║
+# ║       daily_increment = 10,000 * 0.025 = $250  (every single day)         ║
+# ║       a day OPENING at 10,300  ->  target = 10,300 + 250 = 10,550         ║
+# ║       (NOT 10,300 * 1.025 = 10,557.50 — it is +$250 flat, not +2.5%).     ║
+# ║                                                                            ║
+# ║  ── 2. TRAILING DRAWDOWN (per-bar peak, resets daily) ─────────────────── ║
+# ║    peak_equity updates EVERY bar:   peak = max(peak, equity)              ║
+# ║    peak RESETS to day_start_equity at each new-day boundary.              ║
+# ║    BREACH when:   equity < peak * (1 - max_dd_pct)                        ║
+# ║    On breach -> HALT the day: flatten the position, suppress force-entry, ║
+# ║      open no new trades until the next day. A breach does NOT auto-fail:  ║
+# ║      the balance AT THE HALT is what decides PASS/FAIL against the target  ║
+# ║      (halt_equity >= daily_target still PASSES).                          ║
+# ║                                                                            ║
+# ║  ── 3. BINARY CLASSIFICATION ──────────────────────────────────────────── ║
+# ║    Every day is exactly PASS or FAIL. There is NO "OK" tier and NO "SKIP"  ║
+# ║    tier. A zero-trade day ends under target, so it is a FAIL.             ║
+# ║                                                                            ║
+# ║  ── 4. RUNTIME CONFIG INPUTS ──────────────────────────────────────────── ║
+# ║    Both target_pct (CFG["DAILY_TARGET_PCT"]) and max_dd_pct               ║
+# ║    (CFG["DAILY_MAX_DD_PCT"]) are RUNTIME inputs set via the CLI flags     ║
+# ║    --target-pct / --max-dd-pct (or --daily-target-usd). Changing them     ║
+# ║    changes RULE ENFORCEMENT immediately — including on a resume, where the ║
+# ║    current cfg wins (checkpoints never store these). The learned POLICY,  ║
+# ║    though, was tuned for the values it trained on; large runtime changes  ║
+# ║    classify correctly but may need a retrain for best behaviour.          ║
+# ╚══════════════════════════════════════════════════════════════════════════╝
+
+
 class BatchedFTMOEnv:
     """Vectorized FTMO trading environment over B parallel episodes."""
 

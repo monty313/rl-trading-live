@@ -12,8 +12,12 @@
 mode: ftmo             # ftmo | beast
 
 ftmo_settings:
-  daily_target_pct: 2.5      # PASS target: end balance >= start * 1.025
-  daily_max_dd_pct: 1.0      # trailing DD halt threshold (% below prior-day close)
+  # daily_increment = initial_equity * (daily_target_pct/100), a FIXED $ amount
+  # computed once at open (e.g. $250 on $10k @ 2.5%). PASS iff final-or-halt equity
+  # >= day_start_equity + daily_increment. NOT "start * 1.025". See the principles
+  # block in core/env/environment.py.
+  daily_target_pct: 2.5      # daily profit target, % of INITIAL equity (fixed $/day)
+  daily_max_dd_pct: 1.0      # trailing intraday DD halt threshold (% below day peak)
   max_trades_per_day: 800    # FTMO trade-count cap
 
 beast_settings:

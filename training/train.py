@@ -15,6 +15,42 @@ with the spec's changes (STEP 4.14):
 Run:
   python -m training.train --csv DATA.csv --checkpoint-dir CK --metrics-dir M \
       --manifest CK/manifest.json --resume
+
+────────────────────────────────────────────────────────────────────────────
+SETTING THE DAILY TARGET & DAILY DRAWDOWN AT RUNTIME (no retraining of the RULES)
+────────────────────────────────────────────────────────────────────────────
+The FTMO daily profit target and the daily trailing-DD limit are RUNTIME config
+inputs. There is exactly ONE obvious place to set them — the CLI flags (which
+populate CFG["DAILY_TARGET_PCT"] / CFG["DAILY_MAX_DD_PCT"]):
+
+  # 2.5% daily target, 1% daily max DD on a $10k account  (the defaults)
+  python -m training.train --csv DATA.csv --checkpoint-dir CK --metrics-dir M \
+      --manifest CK/manifest.json --resume \
+      --target-pct 0.025 --max-dd-pct 0.01
+
+  # Same thing expressed as an ABSOLUTE dollar target (equivalent to 2.5% on $10k):
+  python -m training.train ... --daily-target-usd 250 --max-dd-pct 0.01
+
+On startup you will see the AUTHORITATIVE banner (printed by build_pipeline, the
+single place every entry point emits it — train / backtest / eval / live):
+
+  [ftmo] daily target = 2.50% (=$250 on $10,000 account)  |  daily max DD = 1.00%
+
+CHANGING THESE ON A RESUME WORKS: a checkpoint stores only network weights +
+optimizer + {phase,episode,phi,pass_rate}. It does NOT persist target_pct /
+max_dd_pct, so a resumed run enforces the CURRENT CLI/cfg values — pass new
+--target-pct / --max-dd-pct on resume and the new rules apply immediately.
+
+HONESTY NOTE — "rules are config-driven (instant)" vs "policy is learned":
+  • RULE ENFORCEMENT (PASS/FAIL classification + the 1% DD halt) is recomputed at
+    RUNTIME from these config values everywhere (env, daily_guard, reward shaper,
+    backtest, eval). Change them and enforcement changes on the NEXT bar — no
+    retraining needed for the rules.
+  • The trained POLICY, however, was OPTIMIZED for the target/risk it trained on.
+    Running live at a very different target/DD (e.g. 5%/2% on a policy trained at
+    2.5%/1%) will correctly classify days under the new rules, but the agent's
+    BEHAVIOUR may be sub-optimal until you retrain at the new values. Small tweaks
+    are usually fine; large changes warrant a retrain/fine-tune.
 """
 from __future__ import annotations
 
@@ -39,7 +75,8 @@ except Exception:  # pragma: no cover
     pass
 
 from core.settings import CFG, get_device, auto_tune_batch  # noqa: E402
-from core.pipeline import build_pipeline, load_ohlcv_csv  # noqa: E402
+from core.pipeline import (build_pipeline, load_ohlcv_csv,  # noqa: E402
+                           resolve_initial_equity)
 from core.reward.shaper import EpisodeRewardShaper  # noqa: E402
 from training.checkpoint_manager import CheckpointManager  # noqa: E402
 from training.eval_loop import run_eval  # noqa: E402
@@ -166,16 +203,30 @@ def train(args) -> int:
     # ── FTMO RULE INPUTS (ftmo_rules_fix.md RULE 5): CLI flags override CFG so the
     # user can dial target / DD per live account. NOTHING downstream hardcodes
     # 0.025 / 0.01 / 250 / 100 — env, reward, eval, and guard all read these.
+    #
+    # RUNTIME-OVERRIDE-ON-RESUME (the important guarantee): these flags are applied
+    # to cfg BEFORE the pipeline / checkpoint load runs, and PPOAgent checkpoints
+    # store ONLY network weights + optimizer + {phase,episode,phi,pass_rate} — they
+    # do NOT persist target_pct / max_dd_pct. So a resumed run ALWAYS enforces the
+    # CURRENT cfg/CLI values, never a stale value baked into the checkpoint. Change
+    # --target-pct / --max-dd-pct on resume and the new rules take effect at once.
     if getattr(args, "target_pct", None) is not None:
         cfg["DAILY_TARGET_PCT"] = float(args.target_pct)
     if getattr(args, "max_dd_pct", None) is not None:
         cfg["DAILY_MAX_DD_PCT"] = float(args.max_dd_pct)
-    _acct = float(cfg.get("ACCOUNT_SIZE", cfg["INITIAL_EQUITY"]))
-    print(f"[train] account size = ${_acct:,.0f}"
-          f"  target {cfg['DAILY_TARGET_PCT']*100:.2f}%"
-          f" (= ${_acct * cfg['DAILY_TARGET_PCT']:,.2f}/day fixed)"
-          f"  max_dd {cfg['DAILY_MAX_DD_PCT']*100:.2f}%",
-          flush=True)
+    # Optional ABSOLUTE-DOLLAR target: if given it OVERRIDES the percentage by
+    # back-computing target_pct = usd / initial_equity (so the whole stack stays
+    # percent-driven and account-size invariant — only the input form differs).
+    _acct = resolve_initial_equity(cfg)
+    if getattr(args, "daily_target_usd", None) is not None:
+        usd = float(args.daily_target_usd)
+        cfg["DAILY_TARGET_PCT"] = usd / (_acct + 1e-9)
+        print(f"[train] --daily-target-usd ${usd:,.2f} overrides --target-pct "
+              f"-> {cfg['DAILY_TARGET_PCT']*100:.4f}% on ${_acct:,.0f}", flush=True)
+    print(f"[train] account size = ${_acct:,.0f}", flush=True)
+    # NOTE: the authoritative active-rules banner ("[ftmo] daily target = ...")
+    # is printed once by build_pipeline() below — the SINGLE place every entry
+    # point (train/backtest/eval/live) emits it — so we don't duplicate it here.
 
     phases = _load_phases(repo_root)
     print(f"[train] device={device}  phases={[p['name'] for p in phases]}", flush=True)
@@ -194,7 +245,13 @@ def train(args) -> int:
     if not args.force_fresh:
         resume = ckpt_mgr.find_best_resume()
         if resume is not None:
-            print(f"[train] resuming from {resume}", flush=True)
+            # Resume loads WEIGHTS ONLY. The FTMO rules (target_pct / max_dd_pct)
+            # in force are the CURRENT cfg/CLI values printed in the [ftmo] banner
+            # above — they are NOT restored from the checkpoint (which never stored
+            # them). So changing --target-pct / --max-dd-pct on resume takes effect.
+            print(f"[train] resuming WEIGHTS from {resume} "
+                  f"(FTMO rules come from current CLI/cfg, not the checkpoint)",
+                  flush=True)
             agent.load(str(resume), partial=True)   # partial best-effort transfer on shared layers
         else:
             print("[train] no checkpoint found — fresh start", flush=True)
@@ -479,6 +536,10 @@ def main() -> int:
     ap.add_argument("--max-dd-pct", type=float, default=None,
                     help="Max trailing intraday drawdown as a fraction "
                          "(default 0.010 = 1%%). Breach halts trading for the day.")
+    ap.add_argument("--daily-target-usd", type=float, default=None,
+                    help="ABSOLUTE daily profit target in account currency. If "
+                         "given, OVERRIDES --target-pct by setting target_pct = "
+                         "usd / initial_equity (e.g. 250 on a $10k acct == 2.5%%).")
     try:
         return train(ap.parse_args())
     except Exception as exc:

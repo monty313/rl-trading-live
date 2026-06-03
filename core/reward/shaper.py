@@ -12,7 +12,15 @@ Because Φ is normalized to configured targets, the same α/clip work for any
 daily_target_pct / max_dd_pct combination (no retuning).
 
 Changes vs REPO1 (per STEP 4.7):
-  (a) PASS rule = end_balance >= start_balance * 1.025 (RULE 7).
+  (a) PASS rule (CURRENT, ftmo_rules_fix.md RULE 1 — NOT the old "start * 1.025"):
+      daily_increment = initial_equity * target_pct   # FIXED $, computed once at open
+      daily_target    = day_start_equity + daily_increment
+      PASS iff (final-or-halt equity >= daily_target); everything else is FAIL.
+      The increment is a flat dollar amount off the ORIGINAL initial equity — never
+      a percent of the day's opening balance. The authoritative classification
+      lives in BatchedFTMOEnv.step (see the principles block in
+      core/env/environment.py); this shaper mirrors the binary PASS/FAIL split for
+      the Φ / diagnostics path only.
   (b) weekly_consistency_bonus: if this week's 7-day pass rate beats last week's,
       add +0.02. Tracks a 14-entry deque of daily pass/fail outcomes.
 """

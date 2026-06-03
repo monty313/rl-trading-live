@@ -67,9 +67,26 @@ CFG = {
     "LOOKBACK":        20,        # bars of history in state
     "TF_FACTORS":      [1, 15, 60, 1440],   # resample factors from 1m
 
-    # FTMO / risk (mirrors config/trading_policy.yaml; YAML wins at runtime)
-    "DAILY_TARGET_PCT":   0.025,  # PASS target = start * 1.025
-    "DAILY_MAX_DD_PCT":   0.010,  # 1% trailing DD
+    # ── FTMO / risk — RUNTIME-CONFIGURABLE RULE INPUTS ───────────────────────
+    # (mirrors config/trading_policy.yaml; CLI flags --target-pct / --max-dd-pct /
+    #  --daily-target-usd override these at runtime; YAML/CLI win.)
+    #
+    # daily_increment = INITIAL_EQUITY * DAILY_TARGET_PCT  (a FIXED dollar amount
+    # computed once at account open — e.g. $250 on $10k @ 2.5%). The day's target
+    # is day_start_equity + daily_increment; PASS iff final-or-halt equity >= that.
+    # NOT "start * 1.025" — the increment is a flat dollar amount off the ORIGINAL
+    # initial equity, not a percent of the day's opening balance. See the single-
+    # source-of-truth principles block in core/env/environment.py.
+    #
+    # HONESTY NOTE (rules vs policy): changing these at RUNTIME correctly changes
+    # RULE ENFORCEMENT (PASS/FAIL + the DD halt) immediately, everywhere they are
+    # used — no retraining needed for the RULES. BUT the trained POLICY was
+    # optimized for the target/risk it trained on; running live at very different
+    # values still classifies correctly but may degrade the agent's behaviour
+    # until retrained. "Rules are config-driven (instant); policy is learned
+    # (needs retraining for big changes)."
+    "DAILY_TARGET_PCT":   0.025,  # daily profit target as a fraction of INITIAL equity
+    "DAILY_MAX_DD_PCT":   0.010,  # 1% trailing intraday DD (breach halts the day)
     # ── ACCOUNT SIZE (learning_loop_fix.md FIX 3) ────────────────────────────
     # Default $10,000 so numbers are comprehensible. Override via the CLI flag
     # --account-size or by setting CFG["ACCOUNT_SIZE"] (10000/25000/50000/100000).

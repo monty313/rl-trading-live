@@ -50,7 +50,9 @@ serves future LLMs maintaining the code.)
 
 ## core/reward/shaper.py
 - `class EpisodeRewardShaper(cfg)`: `compute_bonus(daily_log:list[dict])->float`,
-  `weekly_consistency_bonus()->float`, tracks 14-day deque. PASS rule = end>=start*1.025.
+  `weekly_consistency_bonus()->float`, tracks 14-day deque. PASS rule = final-or-halt
+  equity >= day_start + daily_increment (daily_increment = initial_equity*target_pct,
+  a fixed $ amount; NOT start*1.025).
 
 ## core/risk/position_sizer.py
 - `class PositionSizer(cfg)`: `size(lot_idx, max_lot, balance)->float` (clamp 0.01..max_lot, risk warn).
