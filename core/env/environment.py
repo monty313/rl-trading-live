@@ -52,18 +52,103 @@ _NEG_INF = -1e9
 # Bumped whenever the observation LAYOUT changes (number/meaning of features),
 # so a checkpoint's input-layer width can be validated on resume. v1 was the
 # original `lkbk*F + 6` layout (position/unrealised/eq-change/gap/dd-head/daily-
-# ret). v2 ADDS 7 target/risk-aware features (target_pct, max_dd_pct, day
+# ret). v2 ADDED 7 target/risk-aware features (target_pct, max_dd_pct, day
 # difficulty, progress_to_target, dd_headroom, fraction_of_day_remaining,
-# account_size) so the policy can CONDITION on the FTMO inputs. A v1 checkpoint's
-# input layer no longer matches v2 state_dim; PPOAgent.load() detects this and
-# reinitializes just the input layer (loud log) instead of silently mis-loading.
-OBS_SCHEMA_VERSION = 2
+# account_size) so the policy can CONDITION on the FTMO inputs. v3 (reward
+# redesign Section 6) APPENDS 7 SESSION/CONTEXT features (CEST time-of-day,
+# progress-to-target, remaining-time-in-day, session one-hot-ish label, DD budget
+# remaining, signed streak length, per-symbol commission cost). A checkpoint whose
+# input layer no longer matches the current state_dim is detected by
+# PPOAgent.load(), which reinitializes JUST the input layer (loud log) instead of
+# silently mis-loading — the existing partial-reinit-on-resume path is reused.
+OBS_SCHEMA_VERSION = 3
 
-# Number of target/risk-aware features appended in v2 (kept in sync with the
-# block built in _get_state(); state_dim = lkbk*F + N_POSITION_FEATS + N_FTMO_FEATS).
+# Number of features in each appended block (kept in sync with the blocks built in
+# _get_state(); state_dim = lkbk*F + N_POSITION_FEATS + N_FTMO_FEATS + N_SESSION_FEATS).
 N_POSITION_FEATS = 6     # position, unrealised, eq_chg, gap, dd_head, daily_ret (v1)
 N_FTMO_FEATS = 7         # target_pct, max_dd_pct, difficulty, progress, dd_headroom,
                          # frac_day_remaining, account_size_log (v2, item 1)
+N_SESSION_FEATS = 7      # cest_tod, progress_to_target, remaining_time, session_code,
+                         # dd_budget_remaining, signed_streak, commission_cost (v3, S6)
+
+# ── FTMO SESSION CLOCK (Section 6) ───────────────────────────────────────────
+# FTMO's trading day runs on CEST (Europe/Berlin). Our 1m bars carry no real
+# timestamp (alignment is by integer row position), so we derive a SYNTHETIC
+# time-of-day from the bar-of-day index: bar i of the day -> minute-of-day
+# (i % bars_per_day) / bars_per_day * 1440, offset by the configured session open.
+# This is sufficient for the policy to learn intraday timing (session edges,
+# remaining time) without needing a real calendar. All session boundaries are
+# config-driven (TRADING_SESSIONS in settings) so nothing is hardcoded here.
+def session_code_for_minute(minute_of_day: float, sessions: list) -> float:
+    """Map a CEST minute-of-day (0..1440) to a normalized session CODE in [0,1].
+
+    `sessions` is a list of (name, start_min, end_min, code) rows from CFG
+    ("TRADING_SESSIONS"). Returns the matching row's normalized code (code/ N so
+    the four sessions map to ~{0.25,0.5,0.75,1.0}); 0.0 if outside all sessions
+    (market effectively closed / thin). Pure + vectorizable per element; the env
+    builds the whole batch with a tensor version inline."""
+    for name, start, end, code in sessions:
+        if start <= minute_of_day < end:
+            return float(code)
+    return 0.0
+
+
+# ── COMMISSION (Section 5 — multi-asset framework, EURUSD active) ────────────
+def resolve_commission(symbol: str, lots: float, price: float, cfg: dict,
+                       side: str = "round_trip") -> float:
+    """Return the commission in ACCOUNT CURRENCY for trading `lots` of `symbol`
+    at `price`, for one SIDE ("open"/"close") or the full "round_trip".
+
+    The CFG["COMMISSION"] table is keyed by ASSET CLASS; the symbol is mapped to
+    its class (explicit lists in CFG["COMMISSION_SYMBOLS"], else heuristic). Two
+    cost kinds (Section 5.1):
+      • per_lot_round_trip — flat $/standard-lot for the FULL round trip (forex).
+        per-side = value/2 * lots; round_trip = value * lots.
+      • pct_notional       — fraction of NOTIONAL (lots*contract*price) PER SIDE
+        (metals/crypto). round_trip = 2 * per-side.
+      • zero               — no commission (indices/oils/agriculture).
+
+    EURUSD worked example (the active path): value=$5.00 round trip per std lot,
+    so 0.5 lot -> $2.50 round trip ($1.25/side); 2.0 lot -> $10.00 round trip.
+    Pure function so commission is independently unit-testable; the env calls a
+    vectorized mirror for forex (the active class) on the hot path."""
+    table = cfg.get("COMMISSION", {}) or {}
+    cls = classify_symbol(symbol, cfg)
+    spec = table.get(cls, {"kind": "zero", "value": 0.0})
+    kind = spec.get("kind", "zero")
+    value = float(spec.get("value", 0.0))
+    lots = float(lots)
+    if kind == "zero" or value == 0.0:
+        return 0.0
+    if kind == "per_lot_round_trip":
+        rt = value * lots
+        return rt if side == "round_trip" else rt * 0.5
+    if kind == "pct_notional":
+        contract = float(cfg.get("CONTRACT_SIZE", 100_000.0))
+        notional = lots * contract * float(price)
+        per_side = value * notional
+        return per_side * (2.0 if side == "round_trip" else 1.0)
+    return 0.0
+
+
+def classify_symbol(symbol: str, cfg: dict) -> str:
+    """Map a trading SYMBOL to its commission ASSET CLASS. Explicit lists in
+    CFG["COMMISSION_SYMBOLS"] win; otherwise heuristic: BTC*/ETH* -> crypto,
+    trailing ".cash" -> indices, a 6-letter all-alpha pair -> forex, else the
+    default forex (so an unknown FX-looking symbol still gets the active path)."""
+    sym = (symbol or "").upper()
+    routing = cfg.get("COMMISSION_SYMBOLS", {}) or {}
+    for cls, names in routing.items():
+        if any(sym == str(n).upper() for n in names):
+            return cls
+    if sym.startswith("BTC") or sym.startswith("ETH"):
+        return "crypto"
+    if sym.endswith(".CASH"):
+        return "indices"
+    alpha = sym.replace(".", "").replace("_", "")
+    if len(alpha) == 6 and alpha.isalpha():
+        return "forex"
+    return "forex"
 
 
 def proportional_lot_scale(current_target_pct: float, current_max_dd_pct: float,
@@ -223,6 +308,35 @@ class BatchedFTMOEnv:
         self.max_lot = float(cfg.get("MAX_LOT", 2.0))
         self.direction_dim = DIRECTION_DIM
 
+        # ── REWARD weights + Section-6/7/8 config (all from CFG, never hardcoded) ──
+        self._rw = cfg.get("REWARD", {}) or {}
+        # Section 2 streak-curve coefficients + state-machine weights (shared with
+        # core/reward/shaper.py — the env mirrors that scalar reference vectorized).
+        from core.reward.shaper import _STREAK_A_DEFAULT, _STREAK_B_DEFAULT
+        self._streak_a = float(self._rw.get("streak_curve_a", _STREAK_A_DEFAULT))
+        self._streak_b = float(self._rw.get("streak_curve_b", _STREAK_B_DEFAULT))
+        # Section 5 commission: resolve THIS instrument's per-round-trip $/std-lot
+        # once (EURUSD is forex -> $5/lot RT). Forex is a flat per-lot cost so the
+        # hot path multiplies a scalar by lots; non-forex classes fall back to the
+        # pure resolve_commission() (price-dependent) when used.
+        self._commission_class = classify_symbol(self.instrument, cfg)
+        comm_spec = (cfg.get("COMMISSION", {}) or {}).get(
+            self._commission_class, {"kind": "zero", "value": 0.0})
+        self._comm_kind = comm_spec.get("kind", "zero")
+        self._comm_value = float(comm_spec.get("value", 0.0))
+        # Section 6 sessions (synthetic CEST clock) + filter.
+        self._sessions = list(cfg.get("TRADING_SESSIONS", []))
+        self._n_sessions = float(cfg.get("N_SESSIONS", 4))
+        self._session_day_open = float(cfg.get("SESSION_DAY_OPEN_MIN", 120.0))
+        # Section 7 speed-bonus window (in bars == minutes on M1).
+        self._speed_bonus = float(self._rw.get("speed_bonus", 0.0))
+        self._speed_window = int(cfg.get("SPEED_BONUS_MINUTES", 3))
+        # Section 8 lot curriculum: resolve the [lo, hi] clamp window for the active
+        # strategy phase (widens as the curriculum advances). Beast mode lifts the
+        # narrowing (cap == BEAST_MAX_LOT). Recomputed when the phase changes.
+        self._lot_curriculum_enabled = bool(cfg.get("LOT_CURRICULUM_ENABLED", True))
+        self._beast_mode = bool(cfg.get("BEAST_MODE", False))
+
         # Per-timeframe indicator rows for phase gating (populated below or from
         # the cache). Phase masks gate on TF pairs (e.g. [1m,15m]); the conditions
         # engine reads named indicator columns per bar from these DataFrames.
@@ -258,9 +372,12 @@ class BatchedFTMOEnv:
                            max(self.bars_per_day, self.T - self.lkbk - 2))
 
         # state_dim = lookback window (lkbk*F) + v1 position/account features
-        # (N_POSITION_FEATS) + v2 target/risk-aware features (N_FTMO_FEATS, item 1).
-        self.state_dim = self.lkbk * self.F + N_POSITION_FEATS + N_FTMO_FEATS
+        # (N_POSITION_FEATS) + v2 target/risk-aware features (N_FTMO_FEATS, item 1)
+        # + v3 session/context features (N_SESSION_FEATS, Section 6).
+        self.state_dim = (self.lkbk * self.F + N_POSITION_FEATS + N_FTMO_FEATS
+                          + N_SESSION_FEATS)
         self._alloc_episode_tensors()
+        self._refresh_lot_window()
 
         if self._tf_indicators:
             print(f"[env] TF indicators ready for timeframes: {sorted(self._tf_indicators.keys())} "
@@ -289,6 +406,31 @@ class BatchedFTMOEnv:
         per-step loop."""
         self._phase = new_phase or {"entry_conditions": {"buy": "any", "sell": "any"}}
         self._refresh_gate_signal()
+        self._refresh_lot_window()
+
+    def _refresh_lot_window(self):
+        """(Re)resolve the Section-8 lot-curriculum [lo, hi] clamp for the active
+        strategy phase. The clamp is applied ON TOP of the PPO lot head (which keeps
+        its full [0.01, MAX_LOT] range): early phases trade NARROW (learn direction
+        first), later phases widen toward the full head. Beast mode (or a phase
+        flagged "beast"/"live") lifts the narrowing and clamps only to BEAST_MAX_LOT.
+        All windows come from CFG["LOT_CURRICULUM"]; nothing is hardcoded."""
+        cfg = self.cfg
+        cur = cfg.get("LOT_CURRICULUM", {}) or {}
+        default_win = cur.get("_default", [0.10, 0.50])
+        phase_name = (self._phase or {}).get("name", "") if isinstance(self._phase, dict) else ""
+        beast = self._beast_mode or phase_name in ("beast", "live_improve")
+        if not self._lot_curriculum_enabled:
+            lo, hi = 0.01, self.max_lot          # curriculum off -> full head
+        elif beast:
+            lo, hi = 0.01, float(cfg.get("BEAST_MAX_LOT", self.max_lot))
+        else:
+            win = cur.get(phase_name, default_win)
+            lo, hi = float(win[0]), float(win[1])
+        # Never exceed the head ceiling; keep lo < hi.
+        hi = min(hi, self.max_lot)
+        lo = min(lo, hi)
+        self._lot_lo, self._lot_hi = float(lo), float(hi)
 
     def _refresh_gate_signal(self):
         """(Re)build the length-T per-bar gate tensor for the active phase.
@@ -346,6 +488,36 @@ class BatchedFTMOEnv:
         self._equity_prev = torch.full((B,), self.initial_equity, device=d)
         # tracks bars where the gate was active this day (condition TRUE)
         self._gate_bars_today = torch.zeros(B, dtype=torch.long, device=d)
+
+        # ── Section 2 STREAK STATE MACHINE (vectorized mirror of shaper.StreakTracker) ──
+        # consec_fail_count drives the mulligan (1 free fail; 2 consecutive break the
+        # pass streak). fail_streak is the length of the current losing run. last_was
+        # _pass carries the momentum bias into the next day. _signed_streak is the
+        # signed run length exposed in the observation (S6.6): +pass_streak / -fail_streak.
+        self._consec_fail = torch.zeros(B, dtype=torch.long, device=d)
+        self._fail_streak = torch.zeros(B, dtype=torch.long, device=d)
+        self._last_was_pass = torch.zeros(B, dtype=torch.bool, device=d)
+        self._signed_streak = torch.zeros(B, dtype=torch.long, device=d)
+        # best pass-streak reached this EPISODE (Section 4.2 composite episode bonus)
+        self._best_streak = torch.zeros(B, dtype=torch.long, device=d)
+
+        # ── Section 3 give-back protection ──
+        # _day_open_progress_reward accrues the intra-day progress shaping (S3.1) so
+        # a FAIL day can retroactively WIPE it (S3.2). _multi_day_peak is the running
+        # cross-episode/day equity peak for the cross-day give-back penalty (S3.3).
+        self._day_progress_reward = torch.zeros(B, device=d)
+        # last bar's clamped progress-to-target (for the per-bar increment, S3.1)
+        self._day_progress_prev = torch.zeros(B, device=d)
+        self._intraday_high_eq = torch.full((B,), self.initial_equity, device=d)
+        self._multi_day_peak = torch.full((B,), self.initial_equity, device=d)
+
+        # ── Section 7 speed bonus ──
+        # _entry_bar records the bar index a position was opened; _speed_pending holds
+        # the accrued-but-unconfirmed speed bonus (kept on a profitable close, else
+        # revoked). _speed_armed marks a position that showed green within the window.
+        self._entry_bar = torch.zeros(B, dtype=torch.long, device=d)
+        self._speed_pending = torch.zeros(B, device=d)
+        self._speed_armed = torch.zeros(B, dtype=torch.bool, device=d)
         # GLOBAL day index — the calendar-day counter shared by ALL B episodes.
         # Because reset() zeroes _step_i for every episode and step() increments
         # it in lockstep, `new_day = (_step_i % bars_per_day) == 0` fires on the
@@ -452,9 +624,24 @@ class BatchedFTMOEnv:
         self._day_passed.zero_()
         # NOTE: _pass_streak intentionally persists across episodes within a phase
         # (DESIGN_DECISIONS.md #7 — consecutive pass-days counter is phase-level).
+        # The full Section-2 streak machine (consec_fail/fail_streak/last_was_pass/
+        # signed_streak) ALSO persists with it so mulligan/momentum carry across the
+        # episode boundary like the pass streak does. _best_streak is PER EPISODE
+        # (it scores "the best run THIS episode" for the S4.2 composite bonus), so it
+        # resets here.
+        self._best_streak.zero_()
         self._equity_prev.fill_(self.initial_equity)
         self._gate_bars_today.zero_()
         self._day_idx.zero_()
+
+        # Section 3 / 7 per-episode state (intra-day + speed). The multi-day peak is
+        # phase-level (protects gains ACROSS episodes), so it is NOT reset here.
+        self._day_progress_reward.zero_()
+        self._day_progress_prev.zero_()
+        self._intraday_high_eq.fill_(self.initial_equity)
+        self._entry_bar.zero_()
+        self._speed_pending.zero_()
+        self._speed_armed.zero_()
 
         # ── PER-EPISODE FTMO INPUTS (target_aware_policy.md item 2) ──────────
         # DEFAULT: hold the constant scalar cfg values (so the obs still carries
@@ -480,6 +667,8 @@ class BatchedFTMOEnv:
                 self._day_start_eq = pick.clone()
                 self._day_high_eq = pick.clone()
                 self._equity_prev = pick.clone()
+                self._intraday_high_eq = pick.clone()
+                self._multi_day_peak = pick.clone()
             else:
                 self._initial_equity_t.fill_(self.initial_equity)
         else:
@@ -555,7 +744,88 @@ class BatchedFTMOEnv:
         f_acct = (torch.log10(init_eq.clamp(min=1.0)) - 4.0)
         ftmo_feat = torch.stack([f_target, f_maxdd, f_difficulty, f_progress,
                                  f_dd_headroom, f_day_remaining, f_acct], dim=1)
-        return torch.cat([norm, pos_feat, ftmo_feat], dim=1)
+
+        # ── v3 SESSION/CONTEXT FEATURES (Section 6) ──────────────────────────
+        # All finite, O(1)-scaled, built from the synthetic CEST clock + state so
+        # the policy can learn intraday timing, session edges, give-back protection,
+        # and per-symbol cost. Each commented below.
+        bars_elapsed_i = (self._step_i % self.bars_per_day).float()
+        # minute-of-day on the synthetic CEST clock: day opens at SESSION_DAY_OPEN
+        # and advances one minute per bar (M1), wrapping at 1440.
+        minute_of_day = torch.remainder(
+            self._session_day_open + bars_elapsed_i
+            * (1440.0 / float(self.bars_per_day)), 1440.0)
+        # (6.1) time-of-day in CEST, normalized to [0,1] (0=00:00, 1=24:00).
+        s_tod = minute_of_day / 1440.0
+        # (6.2) progress toward daily target (% achieved, clamped [0,1]). Same as
+        #       the FTMO f_progress above but kept here as the Section-6 obs too so
+        #       the schema is self-describing; cheap to duplicate.
+        s_progress = f_progress
+        # (6.3) remaining time in the trading day (1.0 at open -> 0 at close).
+        s_remaining = (1.0 - bars_elapsed_i / float(self.bars_per_day)).clamp(0.0, 1.0)
+        # (6.4) session label as a normalized code in [0,1] (overlap>NY>London>Asian;
+        #       0 outside all sessions). Vectorized lookup over TRADING_SESSIONS.
+        s_session = torch.zeros(self.B, device=self.device)
+        for _name, start, end, code in self._sessions:
+            in_sess = (minute_of_day >= float(start)) & (minute_of_day < float(end))
+            # first matching row wins -> only fill where still 0 (overlap listed first)
+            s_session = torch.where(in_sess & (s_session == 0),
+                                    torch.full_like(s_session,
+                                                    float(code) / self._n_sessions),
+                                    s_session)
+        # (6.5) DD budget remaining (% of max DD still available right now, [0,1]).
+        #       Reuses f_dd_headroom (already the fraction of budget left).
+        s_dd_budget = f_dd_headroom
+        # (6.6) current streak length, SIGNED and normalized: +pass / -fail run,
+        #       squashed by /10 then clamped to [-1.5,1.5] so a long run stays O(1).
+        s_streak = (self._signed_streak.float() / 10.0).clamp(min=-1.5, max=1.5)
+        # (6.7) commission cost for the CURRENT symbol at a reference 1.0 lot,
+        #       normalized by day-start equity (so it is account-size invariant and
+        #       O(1)). Forex EURUSD: $5 RT / $10k ≈ 0.0005. Lets the net price-in cost.
+        ref_comm = self._commission_per_lot_round_trip(close)   # (B,) $ per 1.0 lot RT
+        s_comm = ref_comm / (self._day_start_eq + 1e-8)
+        session_feat = torch.stack([s_tod, s_progress, s_remaining, s_session,
+                                    s_dd_budget, s_streak, s_comm], dim=1)
+        return torch.cat([norm, pos_feat, ftmo_feat, session_feat], dim=1)
+
+    # ── Section 8 lot curriculum mapping (head [0,1] -> [lot_lo, lot_hi]) ─────
+    def _map_lot_curriculum(self, lot_raw: torch.Tensor) -> torch.Tensor:
+        """Map the PPO lot head's raw [0,1] onto the active phase's curriculum
+        window [lot_lo, lot_hi] (Section 8). Early phases narrow the EFFECTIVE size;
+        later phases / beast widen toward the full [0.01, MAX_LOT] head. The window
+        is resolved by _refresh_lot_window() on phase change."""
+        lo, hi = self._lot_lo, self._lot_hi
+        return lo + lot_raw.clamp(0, 1) * (hi - lo)
+
+    # ── Section 5 commission helpers (vectorized for the active forex path) ───
+    def _commission_per_lot_round_trip(self, price: torch.Tensor) -> torch.Tensor:
+        """(B,) commission in $ for a 1.0-lot ROUND TRIP of THIS instrument at the
+        given price. Forex: flat self._comm_value (price-independent). pct_notional
+        (metals/crypto): value * (1.0*contract*price) * 2 sides. zero otherwise.
+        Vectorized so it can feed the obs + the per-trade deduction on the hot path."""
+        if self._comm_kind == "zero" or self._comm_value == 0.0:
+            return torch.zeros_like(price)
+        if self._comm_kind == "per_lot_round_trip":
+            return torch.full_like(price, self._comm_value)
+        if self._comm_kind == "pct_notional":
+            contract = float(self.cfg.get("CONTRACT_SIZE", 100_000.0))
+            return self._comm_value * contract * price * 2.0
+        return torch.zeros_like(price)
+
+    def _commission_for_lots(self, lots: torch.Tensor, price: torch.Tensor,
+                             side: str) -> torch.Tensor:
+        """(B,) commission in $ for trading `lots` of THIS instrument at `price` for
+        one SIDE ("open"/"close"). Scales with lots (Section 5.2) and is charged at
+        BOTH open and close (Section 5.3). per_lot_round_trip is split in half per
+        side; pct_notional is one side of the notional cost."""
+        if self._comm_kind == "zero" or self._comm_value == 0.0:
+            return torch.zeros_like(lots)
+        if self._comm_kind == "per_lot_round_trip":
+            return 0.5 * self._comm_value * lots.abs()
+        if self._comm_kind == "pct_notional":
+            contract = float(self.cfg.get("CONTRACT_SIZE", 100_000.0))
+            return self._comm_value * lots.abs() * contract * price
+        return torch.zeros_like(lots)
 
     # ── action mask (RULE 12) — VECTORIZED (stall fix) ─────────────────────────
     #
@@ -703,8 +973,11 @@ class BatchedFTMOEnv:
         dirs = torch.zeros(self.B, device=self.device)
         dirs = torch.where(direction == BUY, torch.ones_like(dirs), dirs)
         dirs = torch.where(direction == SELL, -torch.ones_like(dirs), dirs)
-        # map raw [0,1] -> [MIN_LOT, max_lot] (same mapping as action_space.map_lot)
-        lots = 0.01 + lot_raw.clamp(0, 1) * (self.max_lot - 0.01)
+        # map raw [0,1] -> [lot_lo, lot_hi] (Section 8 CURRICULUM clamp window for
+        # the active phase; the head still emits the full [0,1] — the clamp narrows
+        # the EFFECTIVE size early in the curriculum and widens later). The agent
+        # still learns WHERE inside the window to size (contextual sizing, S8.3).
+        lots = self._map_lot_curriculum(lot_raw)
         lots = torch.where(dirs != 0, lots, torch.zeros_like(lots))
 
         # Once the day is halted (DD hit), no new positions open this day.
@@ -725,6 +998,29 @@ class BatchedFTMOEnv:
         exit_realized = (do_close.float() * pnl_per_unit
                          + do_reduce.float() * pnl_per_unit * 0.5)
         self._equity = self._equity + exit_realized
+        # ── Section 5 commission at trade CLOSE (charged on the lots being closed) ──
+        # The CLOSE side of the round-trip cost is deducted here, scaled by the lots
+        # actually closed (full for EXIT_CLOSE, half for EXIT_REDUCE). Agent feels
+        # the real per-trade cost (5.3). Forex EURUSD: $2.50/std-lot per side.
+        closed_lots = (do_close.float() * self._position.abs()
+                       + do_reduce.float() * self._position.abs() * 0.5)
+        close_comm = self._commission_for_lots(closed_lots, close, side="close")
+        self._equity = self._equity - close_comm
+        # ── Section 7 speed bonus: confirm/revoke on CLOSE ──
+        # A position that armed the speed bonus (showed green within the window)
+        # KEEPS its pending bonus only if it CLOSES in profit (price_move0>0); a
+        # losing close REVOKES it. We fold the realized speed bonus into a per-step
+        # accumulator applied to reward below.
+        closed_now = do_close & had_pos0
+        profitable_close = closed_now & (price_move0 > 0)
+        speed_realized = torch.where(profitable_close & self._speed_armed,
+                                     self._speed_pending,
+                                     torch.zeros_like(self._speed_pending))
+        # clear pending/armed for any fully-closed position (win or loss).
+        self._speed_pending = torch.where(closed_now, torch.zeros_like(self._speed_pending),
+                                          self._speed_pending)
+        self._speed_armed = torch.where(closed_now, torch.zeros_like(self._speed_armed),
+                                        self._speed_armed)
         # shrink/close the position per the exit action
         self._position = torch.where(do_close, torch.zeros_like(self._position),
                                      self._position)
@@ -749,18 +1045,33 @@ class BatchedFTMOEnv:
         # FLAT in the SAME bar — going flat mid-gate. The rule is "re-enter that
         # same bar", so here we re-open any episode that is gate-ON, not halted,
         # and now flat. The code never PICKS the side: we reuse the agent's own
-        # sampled direction, defaulting to BUY only when it sampled FLAT.
+        # sampled direction, defaulting to BUY only when it sampled FLAT. The forced
+        # lot uses the SAME Section-8 curriculum clamp as a normal entry.
         need_entry = gate_on & (~self._day_halted) & (self._position == 0)
         if bool(need_entry.any().item()):
             forced_dir = torch.where(direction == SELL,
                                      -torch.ones(self.B, device=self.device),
                                      torch.ones(self.B, device=self.device))
-            forced_lot = 0.01 + lot_raw.clamp(0, 1) * (self.max_lot - 0.01)
+            forced_lot = self._map_lot_curriculum(lot_raw)
             self._trades_today = self._trades_today + need_entry.long()
             self._position = torch.where(need_entry, forced_dir * forced_lot,
                                          self._position)
             opening = opening | need_entry
         self._entry_px = torch.where(opening, close, self._entry_px)
+
+        # ── Section 5 commission at trade OPEN + Section 7 entry-bar stamp ──
+        # The OPEN side of the round-trip cost is deducted on any bar a NEW position
+        # was opened (agent or force-entry), scaled by the opened lots. We also
+        # stamp the entry bar and reset the speed-bonus arm flag for the new trade.
+        opened_lots = torch.where(opening, self._position.abs(),
+                                  torch.zeros_like(self._position))
+        open_comm = self._commission_for_lots(opened_lots, close, side="open")
+        self._equity = self._equity - open_comm
+        self._entry_bar = torch.where(opening, self._step_i, self._entry_bar)
+        self._speed_armed = torch.where(opening, torch.zeros_like(self._speed_armed),
+                                        self._speed_armed)
+        self._speed_pending = torch.where(opening, torch.zeros_like(self._speed_pending),
+                                          self._speed_pending)
 
         # mark-to-market with next close
         # PnL = price_move (raw price units) * lots * contract_size (100000).
@@ -771,6 +1082,27 @@ class BatchedFTMOEnv:
         equity_now = self._equity + torch.where(self._position != 0, mtm,
                                                 torch.zeros_like(mtm))
         self._day_high_eq = torch.maximum(self._day_high_eq, equity_now)
+        # intra-day equity HIGH (Section 3.2 give-back-from-high) + multi-day PEAK
+        # (Section 3.3 cross-day give-back). Both track on the mark-to-market equity.
+        self._intraday_high_eq = torch.maximum(self._intraday_high_eq, equity_now)
+        self._multi_day_peak = torch.maximum(self._multi_day_peak, equity_now)
+
+        # ── Section 7 speed bonus: ARM within the window on unrealized profit ──
+        # While a position is open and within SPEED_BONUS_MINUTES bars of entry, if
+        # the trade shows unrealized profit NET of this symbol's (round-trip)
+        # commission, accrue the pending speed bonus and mark it armed. The bonus is
+        # only KEPT if the trade later closes in profit (confirmed on close above).
+        if self._speed_bonus > 0.0:
+            in_window = ((self._step_i - self._entry_bar) <= self._speed_window) \
+                & (self._position != 0)
+            rt_comm = self._commission_per_lot_round_trip(next_close) \
+                * self._position.abs()
+            unrealized_net = mtm - rt_comm
+            arm_now = in_window & (unrealized_net > 0) & (~self._speed_armed)
+            self._speed_armed = self._speed_armed | arm_now
+            self._speed_pending = torch.where(
+                arm_now, torch.full_like(self._speed_pending, self._speed_bonus),
+                self._speed_pending)
 
         # ── vectorized DD + day boundary (no per-batch python loop) ──
         dd_used = (self._day_high_eq - equity_now) / (self._day_high_eq + 1e-8)
@@ -802,9 +1134,15 @@ class BatchedFTMOEnv:
         # boundary and silently prevent PASS from ever firing there).
         day_start_closing = self._day_start_eq.clone()
         day_high_closing = self._day_high_eq.clone()
+        # Snapshot the CLOSING day's intra-day equity HIGH + accrued progress reward
+        # for the Section-3.2 give-back/wipeout (computed below), then reset them on
+        # the new day so each day's give-back is measured within its own bounds.
+        intraday_high_closing = self._intraday_high_eq.clone()
+        progress_reward_closing = self._day_progress_reward.clone()
         # On a new day: roll baseline forward (vectorized)
         self._day_start_eq = torch.where(new_day, equity_now, self._day_start_eq)
         self._day_high_eq = torch.where(new_day, equity_now, self._day_high_eq)
+        self._intraday_high_eq = torch.where(new_day, equity_now, self._intraday_high_eq)
         self._trades_today = torch.where(new_day,
                                          torch.zeros_like(self._trades_today),
                                          self._trades_today)
@@ -816,6 +1154,13 @@ class BatchedFTMOEnv:
         self._gate_bars_today = torch.where(new_day,
                                             torch.zeros_like(self._gate_bars_today),
                                             self._gate_bars_today)
+        # Reset the per-day accrued intra-day progress reward on the new day (S3.2).
+        self._day_progress_reward = torch.where(new_day,
+                                                torch.zeros_like(self._day_progress_reward),
+                                                self._day_progress_reward)
+        self._day_progress_prev = torch.where(new_day,
+                                              torch.zeros_like(self._day_progress_prev),
+                                              self._day_progress_prev)
 
         self._equity = equity_now
 
@@ -889,6 +1234,17 @@ class BatchedFTMOEnv:
         reward = reward + float(rw.get("target_progress_scale", 0.0)) * step_pnl_pct \
             * (prog > 0).float()
 
+        # (2b) Section 3.1 INTRA-DAY PROGRESSIVE reward: a smooth LINEAR pull as
+        #      equity climbs toward today's target. We reward the per-bar INCREMENT
+        #      of clamped progress (so it accrues once as the day advances toward the
+        #      target, not every bar held). The accrued total is tracked so a FAIL
+        #      day can WIPE it (S3.2 below). intraday_progress_scale weights it.
+        progress_inc = (prog - self._day_progress_prev).clamp(min=0.0)
+        intraday_progress_r = float(rw.get("intraday_progress_scale", 0.5)) * progress_inc
+        reward = reward + intraday_progress_r
+        self._day_progress_reward = self._day_progress_reward + intraday_progress_r
+        self._day_progress_prev = prog
+
         # (3) drawdown-proximity penalty: 0 when flat-to-peak, grows quadratically
         #     as intraday DD eats into the 1% headroom; hard breach handled below.
         dd_used_now = (day_high_closing - equity_now) / (day_high_closing + 1e-8)
@@ -898,48 +1254,172 @@ class BatchedFTMOEnv:
         # (4) overtrade penalty: small cost per NEW position opened this bar.
         reward = reward - float(rw.get("overtrade_penalty", 0.0005)) * opening.float()
 
+        # (5) Section 7 SPEED BONUS realized on a profitable close this bar (the
+        #     pending bonus confirmed when the armed trade closed green).
+        reward = reward + speed_realized
+
         # ════════════════════════════════════════════════════════════════════
-        # DAY CLASSIFICATION — STRICTLY BINARY PASS / FAIL (ftmo_rules_fix.md
-        # RULES 1, 2, 3). There is NO "OK" tier and NO "SKIP" tier anymore:
-        #   • daily_target = day_start_equity + daily_increment   (fixed $ amount,
-        #     RULE 1 — daily_increment = initial_equity * target_pct, NOT a percent
-        #     of the day's opening balance).
-        #   • passed = (final_or_halt_equity >= daily_target).
-        #   • EVERYTHING ELSE IS A FAIL — including a zero-trade day (RULE 2) and a
-        #     DD breach that ends under target (RULE 3). A DD breach does NOT
-        #     auto-fail: if halt_equity >= daily_target the day still PASSES.
+        # DAY CLASSIFICATION — FIVE TIERS (reward_redesign_plan.md Section 1 +
+        # RESOLVED DECISIONS 1 & 2). This is the vectorized mirror of the pure
+        # reference functions in core/reward/shaper.py (classify_day / day_reward /
+        # StreakTracker / give-back). Classification is PURELY by where the ending
+        # /halt balance lands vs the daily target:
+        #   progress = (equity_now - day_start) / daily_increment
+        #     progress >= 1.0   -> PASS  (EXCEED if >1.0 AND never breached)
+        #     0.5 <= progress<1 -> OK    (linear partial credit)
+        #     progress < 0.5    -> FAIL  (scaled by how negative; red-day on top)
+        # RESOLVED DECISION 2: the halt balance still decides PASS/OK/FAIL (a breach
+        # does NOT auto-fail), but a BREACHED day can never earn SURVIVAL or EXCEED.
+        # A zero-trade day ends under target -> FAIL (RULE 2 preserved). Binary
+        # `passed`/`failed` are still exported (passed == PASS|EXCEED) so the FTMO
+        # guard, eval loop, and existing aggregation keep working unchanged.
         # The day closes on a calendar boundary (new_day) OR the moment a DD breach
         # halts trading (newly_halted); equity_now is the closing/halt equity.
         # ════════════════════════════════════════════════════════════════════
         day_closed = new_day | newly_halted
-        traded_today = trades_today_closing > 0          # reported for diagnostics
+        traded_today = trades_today_closing > 0          # day actually traded
         # RULE 1: fixed-increment target measured off the CLOSING day's opening eq.
         daily_target = day_start_closing + self._daily_increment_t
-        passed = equity_now >= daily_target              # the ONLY pass condition
-        failed = ~passed                                 # binary: not-pass == fail
+        inc = self._daily_increment_t.clamp(min=1e-9)
+        progress = (equity_now - day_start_closing) / inc
+        breached = self._dd_breached                      # breached this day (any bar)
+
+        # ── TIER MASKS ──
+        is_pass = progress >= 1.0
+        is_exceed = is_pass & (progress > 1.0) & (~breached)   # PASS upgraded
+        is_ok = (progress >= 0.5) & (progress < 1.0)
+        is_fail = progress < 0.5
+        # binary compatibility: PASS or EXCEED counts as a "passed" day.
+        passed = is_pass
+        failed = ~passed
         self._day_passed = torch.where(day_closed & passed,
                                        torch.ones_like(self._day_passed), self._day_passed)
-        # Terminal per-day bonus reflects the BINARY outcome (no OK tier). Kept in
-        # the same normalized O(1) units as the dense shaping. A +2.5% day clears
-        # the target and earns pass_day_bonus; a +$20 day does not.
-        pass_b    = float(rw.get("pass_day_bonus",    2.0))
-        fail_b    = float(rw.get("fail_day_penalty",  -2.0))
-        streak_s  = float(rw.get("streak_scale",      0.1))
-        # Streak: +1 on a passing day, reset to 0 on ANY failing day (binary).
-        self._pass_streak = torch.where(day_closed & passed, self._pass_streak + 1,
-                                        torch.where(day_closed,
+
+        # ── TIER REWARD (Section 1) — vectorized day_reward() ──
+        pass_b = float(rw.get("pass_day_bonus", 2.0))
+        fail_b = float(rw.get("fail_day_penalty", -2.0))
+        ok_lo = float(rw.get("ok_partial_lo", 0.25))
+        ok_hi = float(rw.get("ok_partial_hi", 0.95))
+        exceed_scale = float(rw.get("exceed_scale", 1.0))
+        survival_b = float(rw.get("survival_bonus", 1.5))
+        red_scale = float(rw.get("red_day_scale", 1.0))
+        dd_eff_w = float(rw.get("dd_efficiency_weight", 0.5))
+
+        tier_reward = torch.zeros_like(progress)
+        # FAIL: base penalty scaled LINEARLY by how negative (severity 1x at 0%
+        # progress, growing as progress goes negative). max(1, 1-min(progress,0)).
+        severity = (1.0 - progress.clamp(max=0.0)).clamp(min=1.0)
+        tier_reward = torch.where(is_fail, fail_b * severity, tier_reward)
+        # OK: linear partial credit ok_lo..ok_hi of pass_b as progress climbs 0.5->1.
+        ok_frac = ok_lo + (ok_hi - ok_lo) * ((progress - 0.5) / 0.5)
+        tier_reward = torch.where(is_ok, pass_b * ok_frac, tier_reward)
+        # PASS / EXCEED: full pass_b, plus progressive (progress-1) for EXCEED.
+        tier_reward = torch.where(is_pass, torch.full_like(progress, pass_b), tier_reward)
+        tier_reward = torch.where(is_exceed,
+                                  pass_b + exceed_scale * (progress - 1.0).clamp(min=0.0),
+                                  tier_reward)
+
+        # ── Section 1.3 DD-EFFICIENCY multiplier (positive days only) ──
+        dd_today = (day_high_closing - equity_now) / (day_high_closing + 1e-8)
+        used_frac = (dd_today / (self._max_dd_pct_t + 1e-8)).clamp(min=0.0, max=1.0)
+        dd_eff_mult = 1.0 - dd_eff_w * used_frac
+        positive_day = (is_ok | is_pass) & (tier_reward > 0)
+        tier_reward = torch.where(positive_day, tier_reward * dd_eff_mult, tier_reward)
+
+        # ── Section 1.2 RED-DAY linear penalty (on top of FAIL) ──
+        loss_frac = ((day_start_closing - equity_now) / inc).clamp(min=0.0)
+        red_pen = torch.where(equity_now < day_start_closing,
+                              -red_scale * loss_frac, torch.zeros_like(progress))
+        tier_reward = tier_reward + red_pen
+
+        # ── Section 1.1 SURVIVAL bonus (stacked; traded AND never breached) ──
+        survived = traded_today & (~breached)
+        tier_reward = tier_reward + survived.float() * survival_b
+
+        # ════════════════════════════════════════════════════════════════════
+        # SECTION 2 — STREAK STATE MACHINE (vectorized StreakTracker mirror).
+        # On each CLOSED day: momentum bias (from prior pass), positive/negative
+        # exponential streak curve, mulligan (2 consecutive fails break the streak),
+        # escalating consecutive-fail penalty, recovery bonus. Only the closed
+        # episodes update; the rest carry state unchanged.
+        # ════════════════════════════════════════════════════════════════════
+        streak_base = float(rw.get("streak_base", 0.5))
+        neg_mult = float(rw.get("negative_streak_mult", 1.5))
+        escalation = float(rw.get("consec_fail_escalation", 0.5))
+        recovery_b = float(rw.get("recovery_bonus", 3.0))
+        momentum_b = float(rw.get("momentum_bonus", 0.2))
+        a, b = self._streak_a, self._streak_b
+
+        # Momentum: small positive bias on a closed day that FOLLOWS a pass.
+        streak_reward = torch.where(day_closed & self._last_was_pass,
+                                    torch.full_like(progress, momentum_b),
+                                    torch.zeros_like(progress))
+
+        # --- PASS branch (closed & passed) ---
+        cp = day_closed & passed
+        recovering = cp & (self._fail_streak > 0)
+        new_pass_streak = torch.where(cp, self._pass_streak + 1, self._pass_streak)
+        # positive streak reward = base + a*(exp(b*(s-1))-1)
+        pos_extra = a * (torch.exp(b * (new_pass_streak.float() - 1.0)) - 1.0)
+        streak_reward = streak_reward + torch.where(
+            cp, streak_base + pos_extra, torch.zeros_like(progress))
+        streak_reward = streak_reward + recovering.float() * recovery_b
+
+        # --- FAIL branch (closed & failed) ---
+        cf = day_closed & failed
+        new_consec_fail = torch.where(cf, self._consec_fail + 1, self._consec_fail)
+        new_fail_streak = torch.where(cf, self._fail_streak + 1, self._fail_streak)
+        # negative streak mirrors the positive curve at neg_mult magnitude.
+        neg_mag = streak_base + a * (torch.exp(b * (new_fail_streak.float() - 1.0)) - 1.0)
+        streak_reward = streak_reward + torch.where(
+            cf, -neg_mult * neg_mag, torch.zeros_like(progress))
+        # escalating consecutive-fail penalty (in addition to the negative streak).
+        streak_reward = streak_reward - cf.float() * escalation * new_consec_fail.float()
+
+        # Commit the streak-machine state for closed episodes (mulligan: the pass
+        # streak survives a SINGLE fail; a SECOND consecutive fail breaks it).
+        broke = cf & (new_consec_fail > int(rw.get("mulligan_count", 1)))
+        self._pass_streak = torch.where(cp, new_pass_streak,
+                                        torch.where(broke,
                                                     torch.zeros_like(self._pass_streak),
                                                     self._pass_streak))
-        # low-DD bonus: still reward passing days that finished comfortably under
-        # the DD limit (only meaningful on a pass; a fail already gets the penalty).
-        dd_today = (day_high_closing - equity_now) / (day_high_closing + 1e-8)
-        low_dd_thr = float(rw.get("low_dd_threshold", 0.005))
-        low_dd_b   = float(rw.get("low_dd_bonus", 0.3))
-        low_dd_day = passed & (dd_today < low_dd_thr)
-        day_reward = (passed.float() * pass_b
-                      + failed.float() * fail_b
-                      + low_dd_day.float() * low_dd_b
-                      + streak_s * self._pass_streak.float())
+        self._fail_streak = torch.where(cp, torch.zeros_like(self._fail_streak),
+                                        torch.where(cf, new_fail_streak,
+                                                    self._fail_streak))
+        self._consec_fail = torch.where(cp, torch.zeros_like(self._consec_fail),
+                                        torch.where(cf, new_consec_fail,
+                                                    self._consec_fail))
+        self._last_was_pass = torch.where(cp, torch.ones_like(self._last_was_pass),
+                                          torch.where(cf,
+                                                      torch.zeros_like(self._last_was_pass),
+                                                      self._last_was_pass))
+        # signed streak for the observation (S6.6): +pass run / -fail run.
+        self._signed_streak = torch.where(self._pass_streak > 0, self._pass_streak,
+                                          -self._fail_streak)
+        # best pass-streak achieved THIS episode (S4.2 composite episode bonus).
+        self._best_streak = torch.maximum(self._best_streak, self._pass_streak)
+
+        # ════════════════════════════════════════════════════════════════════
+        # SECTION 3.2 / 3.3 — GIVE-BACK PENALTIES (applied on the closed day).
+        #  • intra-day WIPEOUT on FAIL: erase this day's accrued progress reward and
+        #    penalize the give-back from the intra-day HIGH to the close.
+        #  • cross-day give-back: penalize any drop from the multi-day PEAK.
+        # ════════════════════════════════════════════════════════════════════
+        giveback = torch.zeros_like(progress)
+        if bool(rw.get("intraday_wipeout", True)):
+            from_high = ((intraday_high_closing - equity_now)
+                         / (day_start_closing + 1e-8)).clamp(min=0.0)
+            wipe = is_fail & day_closed
+            giveback = giveback + wipe.float() * (
+                -progress_reward_closing
+                - float(rw.get("giveback_from_high_scale", 1.0)) * from_high)
+        cross_drop = ((self._multi_day_peak - equity_now)
+                      / (self._initial_equity_t + 1e-8)).clamp(min=0.0)
+        giveback = giveback - day_closed.float() \
+            * float(rw.get("cross_day_giveback_scale", 0.5)) * cross_drop
+
+        # ── Compose the terminal day reward (only on closed days) ──
+        day_reward = tier_reward + streak_reward + giveback
         reward = reward + day_closed.float() * day_reward
 
         # Advance the GLOBAL day index on the calendar new-day boundary only
@@ -955,16 +1435,30 @@ class BatchedFTMOEnv:
         self._done = self._done | ep_end
 
         pass_no_breach = passed & (~self._dd_breached)
+        # SURVIVAL is exported as its own flag: a breached day can never earn it
+        # (RESOLVED DECISION 2). It is the `survived` mask scoped to closed days.
+        survival = (survived & day_closed)
         info = {
             "equity": self._equity.detach(),
-            "passed": passed.detach(),
-            "failed": failed.detach(),       # binary complement of passed (RULE 2)
+            "passed": passed.detach(),       # PASS or EXCEED (binary-compatible)
+            "failed": failed.detach(),       # complement of passed
+            # ── 5-tier flags (Section 1). Exactly one of fail/ok/pass is true on a
+            # closed day; exceed is a subset of pass; survival stacks (never on a
+            # breached day). All scoped to closed days so non-closing bars read 0.
+            "tier_fail":   (is_fail & day_closed).detach(),
+            "tier_ok":     (is_ok & day_closed).detach(),
+            "tier_pass":   (is_pass & day_closed).detach(),
+            "tier_exceed": (is_exceed & day_closed).detach(),
+            "survival":    survival.detach(),
             "dd_breached": self._dd_breached.detach(),
             "trades_today": trades_today_closing.detach(),
             "pass_no_breach": pass_no_breach.detach(),
             "day_closed": day_closed.detach(),
             "day_halted": self._day_halted.detach(),
             "pass_streak": self._pass_streak.detach(),
+            "fail_streak": self._fail_streak.detach(),
+            "signed_streak": self._signed_streak.detach(),
+            "best_streak": self._best_streak.detach(),
             # CLOSING day's true gate-bar total (pre-reset snapshot) — used by the
             # never-flat-through-gate test and diagnostics, NOT for classification
             # (a zero-trade day is a FAIL regardless of gate activity, RULE 2).

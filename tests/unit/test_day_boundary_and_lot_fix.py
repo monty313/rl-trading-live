@@ -205,7 +205,10 @@ def test_chosen_lot_flows_to_env_sizing_and_proportional_pnl():
                       np.ones(n) * 100], axis=1).astype(np.float32)
     cfg = {"BATCH_SIZE_ENV": B, "LOOKBACK": 20, "BARS_PER_DAY": BPD,
            "DAILY_TARGET_PCT": 0.025, "DAILY_MAX_DD_PCT": 0.010, "MAX_LOT": 2.0,
-           "MAX_TRADES_PER_DAY": 100000, "FEATURES": None}
+           "MAX_TRADES_PER_DAY": 100000, "FEATURES": None,
+           # Isolate the proportional-PnL invariant from the Section-8 lot
+           # curriculum clamp: the full [MIN_LOT, MAX_LOT] head must map 0.5->0.5.
+           "LOT_CURRICULUM_ENABLED": False}
     env = BatchedFTMOEnv(ohlcv, cfg, DEV,
                          phase={"entry_conditions": {"buy": "any", "sell": "any"}})
     env.reset()

@@ -281,6 +281,11 @@ def train(args) -> int:
     pass_streak = 0
     target_pct = float(cfg.get("DAILY_TARGET_PCT", 0.025))
     max_dd_pct = float(cfg.get("DAILY_MAX_DD_PCT", 0.010))
+    # Section 11 — strategy-phase gate: advance to the next phase once an episode
+    # reaches this many consecutive passing DAYS (config-driven; CLI override).
+    phase_advance_streak = int(
+        getattr(args, "phase_advance_streak", None)
+        or cfg.get("PHASE_ADVANCE_STREAK", 10))
 
     def run_phase(phase: dict, infinite: bool):
         nonlocal global_ep, last_hb, best_phi, pass_streak
@@ -300,12 +305,20 @@ def train(args) -> int:
                 break
             state = env.reset()
             shaper.global_ep = global_ep
+            # Section 9: anneal the entropy coefficient for THIS episode (high
+            # exploration early, stable by ENTROPY_ANNEAL_EPISODES).
+            agent.anneal_entropy(global_ep)
             done = torch.zeros(env.B, dtype=torch.bool, device=device)
             steps = 0
             ep_total_reward = 0.0
             ep_gate_bars = 0
             # running per-episode pass/ret/dd tallies for the always-on phi metric
             ep_day_pass, ep_day_ret, ep_day_dd, ep_day_count = 0, 0.0, 0.0, 0
+            # Section 4.2: best consecutive-pass streak + mean good-day DD efficiency
+            # accrued THIS episode, feeding the composite episode bonus at ep end.
+            ep_best_streak = 0
+            ep_dd_eff_sum, ep_dd_eff_n = 0.0, 0
+            phase_advanced = False
             max_steps = env.ep_bars
             rollout = int(cfg.get("ROLLOUT_STEPS", 2048))
             ep_t0 = time.time()
@@ -355,6 +368,26 @@ def train(args) -> int:
                     ep_day_count += agg["n"]
                     ep_day_ret += float(info["daily_return"].mean().item())
                     ep_day_dd += float(info["daily_dd"].mean().item())
+                    # Section 4.2 composite-bonus inputs: track the best per-episode
+                    # streak (max over batch) and mean DD efficiency on positive days.
+                    ep_best_streak = max(ep_best_streak,
+                                         int(info["best_streak"].max().item()))
+                    pos = info["daily_return"] > 0
+                    if bool(pos.any()):
+                        eff = (1.0 - (info["daily_dd"][pos]
+                               / (max_dd_pct + 1e-9)).clamp(max=1.0))
+                        ep_dd_eff_sum += float(eff.sum().item())
+                        ep_dd_eff_n += int(pos.sum().item())
+                    # Section 11 — strategy-phase gate: a single episode reaching the
+                    # configured consecutive-pass streak advances to the next phase.
+                    if (not infinite
+                            and int(info["best_streak"].max().item()) >= phase_advance_streak):
+                        phase_advanced = True
+                        print(f"  ⏩ PHASE ADVANCE: best streak "
+                              f"{int(info['best_streak'].max().item())} "
+                              f">= {phase_advance_streak} in [{phase['name']}]",
+                              flush=True)
+                        break
 
                 if len(agent.buffer) >= rollout:
                     agent.update()        # PPO update, then buffer clears
@@ -368,6 +401,13 @@ def train(args) -> int:
             pass_rate = ep_day_pass / n_days
             avg_ret = ep_day_ret / max(global_day, 1)
             avg_dd = ep_day_dd / max(global_day, 1)
+            # ── Section 4.2/4.3 — composite EPISODE bonus + improvement multiplier.
+            # The shaper turns best_streak (priority #1) + pass-rate + DD efficiency
+            # into a scalar and amplifies it when the pass rate improved over the
+            # previous episode. Folded into the running reward print so it is visible.
+            ep_dd_eff = (ep_dd_eff_sum / ep_dd_eff_n) if ep_dd_eff_n else 0.0
+            episode_bonus = shaper.episode_bonus(ep_best_streak, pass_rate, ep_dd_eff)
+            ep_total_reward += episode_bonus
             run_phi = _phi_metric(pass_rate, avg_ret, avg_dd, target_pct, max_dd_pct)
             new_best = run_phi > best_phi
             if new_best:
@@ -416,6 +456,13 @@ def train(args) -> int:
             if now - last_hb >= 60:
                 _write_heartbeat(args.metrics_dir or "logs", global_ep, phase["name"])
                 last_hb = now
+
+            # Section 11: leave this phase early once an episode hit the advance
+            # streak (the infinite live_improve phase never advances).
+            if phase_advanced:
+                ckpt_mgr.save(agent, phase["name"], global_ep, phi=best_phi,
+                              pass_rate=pass_rate)
+                break
 
     # Numbered phases (order < 999), then the infinite live_improve phase.
     for phase in phases:
@@ -542,6 +589,11 @@ def main() -> int:
     ap.add_argument("--resume", action="store_true")
     ap.add_argument("--start-phase", type=int, default=0)
     ap.add_argument("--force-fresh", action="store_true")
+    # ── SECTION 11 — strategy-phase gate (never hardcoded) ──
+    ap.add_argument("--phase-advance-streak", type=int, default=None,
+                    help="Consecutive passing DAYS within a single episode that "
+                         "advance to the next strategy phase (config/phases.yaml). "
+                         "Default CFG['PHASE_ADVANCE_STREAK'] (=10).")
     ap.add_argument("--account-size", type=float, default=None,
                     help="Starting equity (10000/25000/50000/100000). "
                          "Default 10000. Rules stay percent-based.")

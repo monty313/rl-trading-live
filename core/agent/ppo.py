@@ -121,6 +121,17 @@ class PPOAgent:
         self.gae_lambda = float(ppo.get("gae_lambda", 0.95))
         self.clip = float(ppo.get("clip_range", 0.2))
         self.ent_coef = float(ppo.get("ent_coef", 0.01))
+        # ── Section 9 — ENTROPY ANNEALING (high exploration -> stable ent_coef) ──
+        # The STABLE coefficient is the PPO ent_coef above; the LIVE coefficient
+        # (self.ent_coef, used in update()) starts at ENTROPY_START_COEF and is
+        # annealed linearly down to it by ENTROPY_ANNEAL_EPISODES via
+        # anneal_entropy(episode). All values are config-driven (nothing hardcoded).
+        self.ent_coef_stable = self.ent_coef
+        self._ent_anneal_on = bool(cfg.get("ENTROPY_ANNEAL_ENABLED", True))
+        self._ent_start = float(cfg.get("ENTROPY_START_COEF", self.ent_coef))
+        self._ent_anneal_eps = max(1, int(cfg.get("ENTROPY_ANNEAL_EPISODES", 20)))
+        if self._ent_anneal_on:
+            self.ent_coef = self._ent_start          # begin high at episode 0
         self.vf_coef = float(ppo.get("vf_coef", 0.5))
         self.epochs = int(ppo.get("n_epochs", 4))
         self.max_grad_norm = float(ppo.get("max_grad_norm", 0.5))
@@ -157,6 +168,20 @@ class PPOAgent:
                 self._fwd = torch.compile(self.net, mode="default")
             except Exception:                                  # pragma: no cover
                 self._fwd = self.net
+
+    def anneal_entropy(self, episode: int) -> float:
+        """Section 9: linearly anneal the LIVE entropy coefficient from
+        ENTROPY_START_COEF (episode 0) down to the stable PPO ent_coef by episode
+        ENTROPY_ANNEAL_EPISODES, then hold it EXACTLY at the stable value (no
+        residual perturbation). No-op (returns the stable coef) when annealing is
+        disabled. Call once per episode before/after the rollout. Returns the
+        coefficient now in force."""
+        if not self._ent_anneal_on:
+            self.ent_coef = self.ent_coef_stable
+            return self.ent_coef
+        frac = min(1.0, max(0.0, episode / self._ent_anneal_eps))
+        self.ent_coef = self._ent_start + frac * (self.ent_coef_stable - self._ent_start)
+        return self.ent_coef
 
     # ── helpers ──────────────────────────────────────────────────────────────
     def _dists(self, dir_logits, exit_logits, lot_mean,
