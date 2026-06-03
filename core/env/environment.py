@@ -20,9 +20,14 @@ Ported from gpu_rl_trading/env/environment.py (REPO1) with these changes:
   (f) All tensors live on cfg["device"]; day-boundary logic is vectorized
       (no Python per-batch loop in the hot path — fixes bottleneck #1).
 
-State layout: a normalized lookback window of the feature matrix plus 6 FTMO
+State layout: a normalized lookback window of the feature matrix, then 6 v1 FTMO
 position/account features (position, unrealised, equity change, gap-to-target,
-dd-headroom, daily-return). state_dim is computed in __init__.
+dd-headroom, daily-return), then 7 v2 TARGET/RISK-AWARE features (target_pct,
+max_dd_pct, today's difficulty, progress_to_target, dd_headroom,
+fraction_of_day_remaining, log-normalized account size) so the policy can
+CONDITION on the active FTMO inputs (target_aware_policy.md item 1). state_dim is
+computed in __init__ as lkbk*F + N_POSITION_FEATS + N_FTMO_FEATS; the obs layout
+is versioned by OBS_SCHEMA_VERSION so a resume can detect an input-dim change.
 """
 from __future__ import annotations
 
@@ -42,6 +47,52 @@ from core.env import conditions_engine
 from core.env.gate_precompute import precompute_gate_signal
 
 _NEG_INF = -1e9
+
+# ── OBSERVATION SCHEMA VERSION (target_aware_policy.md item 1 + 4) ───────────
+# Bumped whenever the observation LAYOUT changes (number/meaning of features),
+# so a checkpoint's input-layer width can be validated on resume. v1 was the
+# original `lkbk*F + 6` layout (position/unrealised/eq-change/gap/dd-head/daily-
+# ret). v2 ADDS 7 target/risk-aware features (target_pct, max_dd_pct, day
+# difficulty, progress_to_target, dd_headroom, fraction_of_day_remaining,
+# account_size) so the policy can CONDITION on the FTMO inputs. A v1 checkpoint's
+# input layer no longer matches v2 state_dim; PPOAgent.load() detects this and
+# reinitializes just the input layer (loud log) instead of silently mis-loading.
+OBS_SCHEMA_VERSION = 2
+
+# Number of target/risk-aware features appended in v2 (kept in sync with the
+# block built in _get_state(); state_dim = lkbk*F + N_POSITION_FEATS + N_FTMO_FEATS).
+N_POSITION_FEATS = 6     # position, unrealised, eq_chg, gap, dd_head, daily_ret (v1)
+N_FTMO_FEATS = 7         # target_pct, max_dd_pct, difficulty, progress, dd_headroom,
+                         # frac_day_remaining, account_size_log (v2, item 1)
+
+
+def proportional_lot_scale(current_target_pct: float, current_max_dd_pct: float,
+                           trained_target_pct: float, trained_max_dd_pct: float,
+                           lo: float = 0.25, hi: float = 2.0) -> float:
+    """Deterministic, BOUNDED lot/aggression scaler (target_aware_policy.md item 6).
+
+    Returns a multiplier applied ON TOP of the agent's own chosen lot at
+    inference/eval/live — it NEVER forces direction or exit, only scales exposure.
+    It expresses "behave the way you learned, but proportional to how the new
+    target/DD differ from the trained baseline":
+
+        target_ratio = current_target_pct / trained_target_pct
+        dd_ratio     = current_max_dd_pct / trained_max_dd_pct
+        effective_lot_scale = clamp(dd_ratio * f(target_ratio), lo, hi)
+
+    Design of f(target_ratio): a HIGHER target permits more aggression but we damp
+    it with a square root so a 2x target does not blindly double exposure
+    (f = sqrt(target_ratio)). A TIGHTER DD (dd_ratio<1) scales exposure DOWN
+    linearly (the risk budget shrank). At the trained baseline both ratios are 1,
+    so the scaler is EXACTLY 1.0 — no behaviour change. Always clamped to [lo, hi]
+    so it can never do anything wild even far out of the trained range.
+    """
+    tt = max(float(trained_target_pct), 1e-9)
+    td = max(float(trained_max_dd_pct), 1e-9)
+    target_ratio = float(current_target_pct) / tt
+    dd_ratio = float(current_max_dd_pct) / td
+    raw = dd_ratio * (target_ratio ** 0.5)        # f(target_ratio) = sqrt(target_ratio)
+    return float(min(max(raw, lo), hi))
 
 
 # ╔══════════════════════════════════════════════════════════════════════════╗
@@ -85,6 +136,22 @@ _NEG_INF = -1e9
 # ║    current cfg wins (checkpoints never store these). The learned POLICY,  ║
 # ║    though, was tuned for the values it trained on; large runtime changes  ║
 # ║    classify correctly but may need a retrain for best behaviour.          ║
+# ║                                                                            ║
+# ║  ── 5. TARGET/RISK-AWARE POLICY (target_aware_policy.md) ──────────────── ║
+# ║    The agent does NOT only have the rules ENFORCED on it — it OBSERVES the  ║
+# ║    active target_pct, max_dd_pct, today's difficulty, its progress_to_      ║
+# ║    target, its dd_headroom, the fraction of the day remaining, and the      ║
+# ║    account size (see _get_state, item 1). It is meant to ACT PURSUANT to    ║
+# ║    them: size up when progress is behind and DD headroom is ample, protect  ║
+# ║    gains as headroom thins, etc. Train with --randomize-ftmo to sample a    ║
+# ║    (target_pct, max_dd_pct[, account]) PER EPISODE from configurable ranges ║
+# ║    so ONE network learns a policy that GENERALIZES across target/risk,      ║
+# ║    instead of being implicitly hardwired to 2.5%/1%. At inference the item-6 ║
+# ║    proportional_lot_scale() additionally scales exposure relative to the    ║
+# ║    trained baseline (bounded, deterministic, never forcing direction/exit). ║
+# ║    HONESTY: observation-conditioning + randomized training substantially    ║
+# ║    improve generalization, but EXTREME out-of-range target/DD may still     ║
+# ║    need a retrain.                                                          ║
 # ╚══════════════════════════════════════════════════════════════════════════╝
 
 
@@ -116,6 +183,19 @@ class BatchedFTMOEnv:
         # these for live accounts, so NOTHING below may bake in 0.025 / 0.01.
         self.target_pct = float(cfg.get("DAILY_TARGET_PCT", 0.025))
         self.max_dd_pct = float(cfg.get("DAILY_MAX_DD_PCT", 0.010))
+        # ── RANDOMIZED-TARGET/DD TRAINING MODE (target_aware_policy.md item 2) ───
+        # When RANDOMIZE_FTMO_INPUTS is ON, reset() samples target_pct / max_dd_pct
+        # (and optionally account_size) PER EPISODE from the ranges below; the env
+        # then uses the sampled values for THAT episode's classification/DD AND
+        # exposes them in the observation (item 1). DEFAULT OFF — existing
+        # curriculum is unchanged; the fixed cfg values are used and still appear
+        # (constant) in the obs so inference-time changes still shift behaviour.
+        self.randomize_ftmo = bool(cfg.get("RANDOMIZE_FTMO_INPUTS", False))
+        self._target_range = tuple(cfg.get("RANDOMIZE_TARGET_RANGE", [0.01, 0.05]))
+        self._dd_range = tuple(cfg.get("RANDOMIZE_DD_RANGE", [0.005, 0.02]))
+        self._randomize_account = bool(cfg.get("RANDOMIZE_FTMO_ACCOUNT", False))
+        # Observation schema version (validated against checkpoints on resume).
+        self.obs_schema_version = OBS_SCHEMA_VERSION
         # ── ACCOUNT SIZE (learning_loop_fix.md FIX 3) ────────────────────────
         # Default starting equity is $10,000 (configurable via CLI --account-size
         # or CFG["INITIAL_EQUITY"] / CFG["ACCOUNT_SIZE"], supporting 10k/25k/50k/
@@ -177,7 +257,9 @@ class BatchedFTMOEnv:
         self.ep_bars = min(int(cfg.get("EPISODE_BARS", 43_200)),
                            max(self.bars_per_day, self.T - self.lkbk - 2))
 
-        self.state_dim = self.lkbk * self.F + 6
+        # state_dim = lookback window (lkbk*F) + v1 position/account features
+        # (N_POSITION_FEATS) + v2 target/risk-aware features (N_FTMO_FEATS, item 1).
+        self.state_dim = self.lkbk * self.F + N_POSITION_FEATS + N_FTMO_FEATS
         self._alloc_episode_tensors()
 
         if self._tf_indicators:
@@ -241,6 +323,17 @@ class BatchedFTMOEnv:
         self._equity = torch.full((B,), self.initial_equity, device=d)
         self._day_start_eq = torch.full((B,), self.initial_equity, device=d)
         self._day_high_eq = torch.full((B,), self.initial_equity, device=d)
+        # ── PER-EPISODE FTMO INPUTS (item 1 + item 2) ────────────────────────
+        # The env classifies/DD-checks and builds the observation off these
+        # per-episode tensors. When RANDOMIZE_FTMO_INPUTS is OFF they hold the
+        # constant scalar cfg values (so the obs still carries them and inference
+        # changes still shift behaviour); when ON, reset() resamples them per
+        # episode. _initial_equity_t supports optional per-episode account-size
+        # randomization so the fixed-dollar daily increment scales with it.
+        self._initial_equity_t = torch.full((B,), self.initial_equity, device=d)
+        self._target_pct_t = torch.full((B,), self.target_pct, device=d)
+        self._max_dd_pct_t = torch.full((B,), self.max_dd_pct, device=d)
+        self._daily_increment_t = self._initial_equity_t * self._target_pct_t
         self._position = torch.zeros(B, device=d)       # +lots buy / -lots sell / 0
         self._entry_px = torch.zeros(B, device=d)
         self._dd_breached = torch.zeros(B, dtype=torch.bool, device=d)
@@ -362,14 +455,39 @@ class BatchedFTMOEnv:
         self._equity_prev.fill_(self.initial_equity)
         self._gate_bars_today.zero_()
         self._day_idx.zero_()
-        # FUTURE HOOK (DISABLED — see __init__): per-episode account-size
-        # randomization to teach size-relative risk. Reward is already normalized
-        # so enabling this needs no reward retuning. Left off intentionally.
-        # if self.cfg.get("RANDOMIZE_ACCOUNT_SIZE"):
-        #     choices = torch.tensor(self.cfg.get("ACCOUNT_SIZE_CHOICES",
-        #                            [10_000., 25_000., 50_000., 100_000.]))
-        #     pick = choices[torch.randint(len(choices), (self.B,))]
-        #     self._equity = pick.to(self.device); self._day_start_eq = pick...
+
+        # ── PER-EPISODE FTMO INPUTS (target_aware_policy.md item 2) ──────────
+        # DEFAULT: hold the constant scalar cfg values (so the obs still carries
+        # target/DD and inference-time changes still shift behaviour). When
+        # RANDOMIZE_FTMO_INPUTS is ON, sample a fresh (target_pct, max_dd_pct[,
+        # account_size]) per EPISODE — the env uses these sampled values for THIS
+        # episode's PASS/FAIL + DD-halt AND exposes them in the observation, which
+        # is what teaches the policy to CONDITION on the inputs.
+        d, B = self.device, self.B
+        if self.randomize_ftmo:
+            tlo, thi = self._target_range
+            dlo, dhi = self._dd_range
+            self._target_pct_t = (torch.rand(B, device=d) * (thi - tlo) + tlo)
+            self._max_dd_pct_t = (torch.rand(B, device=d) * (dhi - dlo) + dlo)
+            if self._randomize_account:
+                choices = torch.tensor(
+                    self.cfg.get("ACCOUNT_SIZE_CHOICES",
+                                 [10_000., 25_000., 50_000., 100_000.]),
+                    device=d, dtype=torch.float32)
+                pick = choices[torch.randint(len(choices), (B,), device=d)]
+                self._initial_equity_t = pick
+                self._equity = pick.clone()
+                self._day_start_eq = pick.clone()
+                self._day_high_eq = pick.clone()
+                self._equity_prev = pick.clone()
+            else:
+                self._initial_equity_t.fill_(self.initial_equity)
+        else:
+            self._target_pct_t.fill_(self.target_pct)
+            self._max_dd_pct_t.fill_(self.max_dd_pct)
+            self._initial_equity_t.fill_(self.initial_equity)
+        # Fixed daily increment = initial_equity * target_pct, per episode (RULE 1).
+        self._daily_increment_t = self._initial_equity_t * self._target_pct_t
         return self._get_state()
 
     # ── state ──────────────────────────────────────────────────────────────────
@@ -387,17 +505,57 @@ class BatchedFTMOEnv:
             self._position != 0,
             (close - self._entry_px) * torch.sign(self._position),
             torch.zeros_like(close))
-        eq_chg = (self._equity - self.initial_equity) / self.initial_equity
+        init_eq = self._initial_equity_t
+        eq_chg = (self._equity - init_eq) / (init_eq + 1e-8)
         # Daily target = day's opening equity + the FIXED increment (RULE 1), NOT
         # day_start * (1 + target_pct). The increment is a flat dollar amount.
-        target_eq = self._day_start_eq + self.daily_increment
-        gap = (target_eq - self._equity) / (self.initial_equity + 1e-8)
+        target_eq = self._day_start_eq + self._daily_increment_t
+        gap = (target_eq - self._equity) / (init_eq + 1e-8)
         dd_used = (self._day_high_eq - self._equity) / (self._day_high_eq + 1e-8)
-        dd_head = (self.max_dd_pct - dd_used).clamp(min=0.0)
+        dd_head = (self._max_dd_pct_t - dd_used).clamp(min=0.0)
         daily_ret = (self._equity - self._day_start_eq) / (self._day_start_eq + 1e-8)
+        # v1 position/account features (N_POSITION_FEATS).
         pos_feat = torch.stack([self._position, unrealised, eq_chg, gap, dd_head,
                                 daily_ret], dim=1)
-        return torch.cat([norm, pos_feat], dim=1)
+
+        # ── v2 TARGET/RISK-AWARE FEATURES (target_aware_policy.md item 1) ────
+        # All finite, O(1)-scaled, and built from the PER-EPISODE FTMO inputs so a
+        # randomized-training episode and an inference-time --target-pct/--max-dd
+        # change both flow through identically. Each feature is commented below.
+        #
+        # (a) target_pct — the active daily profit target as a fraction of initial
+        #     equity (already O(1), e.g. 0.025). Lets the net see "how big a day".
+        f_target = self._target_pct_t
+        # (b) max_dd_pct — the active daily trailing-DD limit as a fraction
+        #     (e.g. 0.01). Lets the net see "how much risk budget the regime gives".
+        f_maxdd = self._max_dd_pct_t
+        # (c) difficulty = daily_increment / day_start_equity — today's required
+        #     gain as a fraction of TODAY's opening balance (how hard today is;
+        #     grows as the account compounds since the increment is fixed dollars).
+        f_difficulty = self._daily_increment_t / (self._day_start_eq + 1e-8)
+        # (d) progress_to_target = clamp((equity - day_start)/daily_increment,0,1)
+        #     — how close to hitting today's target (1.0 = target reached).
+        f_progress = ((self._equity - self._day_start_eq)
+                      / (self._daily_increment_t + 1e-8)).clamp(min=0.0, max=1.0)
+        # (e) dd_headroom = (equity - peak*(1-max_dd))/(peak*max_dd) — fraction of
+        #     the DD budget still available right now (1.0 = full room, 0 = at
+        #     breach). Clamped to [0,1] so a breach reads 0, not negative.
+        peak = self._day_high_eq
+        dd_floor = peak * (1.0 - self._max_dd_pct_t)
+        f_dd_headroom = ((self._equity - dd_floor)
+                         / (peak * self._max_dd_pct_t + 1e-8)).clamp(min=0.0, max=1.0)
+        # (f) fraction_of_day_remaining = (bars_per_day - bars_elapsed_today)/
+        #     bars_per_day — time pressure within the trading day (1.0 = day start).
+        bars_elapsed = (self._step_i % self.bars_per_day).float()
+        f_day_remaining = (1.0 - bars_elapsed / float(self.bars_per_day)).clamp(
+            min=0.0, max=1.0)
+        # (g) account_size (log-normalized) so size-relative risk is visible. We
+        #     normalize log10(equity) around a $10k reference and /1.0 decade so a
+        #     10k->100k span maps to ~[0,1]; finite and O(1).
+        f_acct = (torch.log10(init_eq.clamp(min=1.0)) - 4.0)
+        ftmo_feat = torch.stack([f_target, f_maxdd, f_difficulty, f_progress,
+                                 f_dd_headroom, f_day_remaining, f_acct], dim=1)
+        return torch.cat([norm, pos_feat, ftmo_feat], dim=1)
 
     # ── action mask (RULE 12) — VECTORIZED (stall fix) ─────────────────────────
     #
@@ -616,7 +774,7 @@ class BatchedFTMOEnv:
 
         # ── vectorized DD + day boundary (no per-batch python loop) ──
         dd_used = (self._day_high_eq - equity_now) / (self._day_high_eq + 1e-8)
-        breach_now = dd_used >= self.max_dd_pct
+        breach_now = dd_used >= self._max_dd_pct_t
         self._dd_breached = self._dd_breached | breach_now
 
         # ── count gate-active bars this step, PER EPISODE — BEFORE the day reset ──
@@ -708,14 +866,14 @@ class BatchedFTMOEnv:
 
         # (2) target-progress pull: while below target and in profit, reward the
         #     fraction of the +2.5% goal achieved this bar (delta of clipped ratio).
-        prog = (daily_ret / (self.target_pct + 1e-8)).clamp(min=0.0, max=1.0)
+        prog = (daily_ret / (self._target_pct_t + 1e-8)).clamp(min=0.0, max=1.0)
         reward = reward + float(rw.get("target_progress_scale", 0.0)) * step_pnl_pct \
             * (prog > 0).float()
 
         # (3) drawdown-proximity penalty: 0 when flat-to-peak, grows quadratically
         #     as intraday DD eats into the 1% headroom; hard breach handled below.
         dd_used_now = (day_high_closing - equity_now) / (day_high_closing + 1e-8)
-        dd_frac = (dd_used_now / (self.max_dd_pct + 1e-8)).clamp(min=0.0, max=2.0)
+        dd_frac = (dd_used_now / (self._max_dd_pct_t + 1e-8)).clamp(min=0.0, max=2.0)
         reward = reward - float(rw.get("dd_proximity_scale", 0.02)) * dd_frac.pow(2)
 
         # (4) overtrade penalty: small cost per NEW position opened this bar.
@@ -737,7 +895,7 @@ class BatchedFTMOEnv:
         day_closed = new_day | newly_halted
         traded_today = trades_today_closing > 0          # reported for diagnostics
         # RULE 1: fixed-increment target measured off the CLOSING day's opening eq.
-        daily_target = day_start_closing + self.daily_increment
+        daily_target = day_start_closing + self._daily_increment_t
         passed = equity_now >= daily_target              # the ONLY pass condition
         failed = ~passed                                 # binary: not-pass == fail
         self._day_passed = torch.where(day_closed & passed,

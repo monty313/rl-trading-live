@@ -224,6 +224,23 @@ def train(args) -> int:
         print(f"[train] --daily-target-usd ${usd:,.2f} overrides --target-pct "
               f"-> {cfg['DAILY_TARGET_PCT']*100:.4f}% on ${_acct:,.0f}", flush=True)
     print(f"[train] account size = ${_acct:,.0f}", flush=True)
+    # ── RANDOMIZED-TARGET/DD TRAINING (target_aware_policy.md item 2) ─────────
+    # --randomize-ftmo turns on per-episode sampling of target_pct/max_dd_pct so
+    # ONE policy learns to CONDITION on the FTMO inputs (it OBSERVES them, item 1)
+    # and GENERALIZES across target/risk. DEFAULT OFF. When ON, the checkpoint's
+    # proportional-scaler baseline is stored as the MIDPOINT of the ranges (see
+    # PPOAgent.save). With it OFF the fixed cfg target/DD is used and still appears
+    # (constant) in the observation, so inference-time changes still shift behaviour.
+    if getattr(args, "randomize_ftmo", False):
+        cfg["RANDOMIZE_FTMO_INPUTS"] = True
+        cfg["RANDOMIZE_FTMO_ACCOUNT"] = bool(getattr(args, "randomize_ftmo_account", False))
+        tlo, thi = cfg.get("RANDOMIZE_TARGET_RANGE", [0.01, 0.05])
+        dlo, dhi = cfg.get("RANDOMIZE_DD_RANGE", [0.005, 0.02])
+        print(f"[train] --randomize-ftmo ON: per-episode target_pct in "
+              f"[{tlo:.3f},{thi:.3f}], max_dd_pct in [{dlo:.4f},{dhi:.4f}]"
+              f"{' + account_size' if cfg['RANDOMIZE_FTMO_ACCOUNT'] else ''}. "
+              f"Trained baseline (scaler) = midpoint "
+              f"({0.5*(tlo+thi)*100:.2f}% / {0.5*(dlo+dhi)*100:.3f}%).", flush=True)
     # NOTE: the authoritative active-rules banner ("[ftmo] daily target = ...")
     # is printed once by build_pipeline() below — the SINGLE place every entry
     # point (train/backtest/eval/live) emits it — so we don't duplicate it here.
@@ -540,6 +557,16 @@ def main() -> int:
                     help="ABSOLUTE daily profit target in account currency. If "
                          "given, OVERRIDES --target-pct by setting target_pct = "
                          "usd / initial_equity (e.g. 250 on a $10k acct == 2.5%%).")
+    # ── RANDOMIZED-TARGET/DD TRAINING (target_aware_policy.md item 2) ──
+    ap.add_argument("--randomize-ftmo", action="store_true",
+                    help="Domain-randomization: sample target_pct in "
+                         "[0.01,0.05] and max_dd_pct in [0.005,0.02] PER EPISODE "
+                         "(ranges configurable in CFG). Trains ONE policy that "
+                         "GENERALIZES across target/risk so changing --target-pct/"
+                         "--max-dd-pct at inference adapts behaviour. DEFAULT OFF.")
+    ap.add_argument("--randomize-ftmo-account", action="store_true",
+                    help="With --randomize-ftmo, ALSO sample account_size per "
+                         "episode from ACCOUNT_SIZE_CHOICES (10k/25k/50k/100k).")
     try:
         return train(ap.parse_args())
     except Exception as exc:

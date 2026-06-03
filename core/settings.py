@@ -97,6 +97,39 @@ CFG = {
     "INITIAL_EQUITY":     10_000.0,
     "ACCOUNT_SIZE_CHOICES": [10_000.0, 25_000.0, 50_000.0, 100_000.0],
     "RANDOMIZE_ACCOUNT_SIZE": False,   # FUTURE HOOK — disabled (see env.reset)
+
+    # ── TARGET/RISK-AWARE POLICY (target_aware_policy.md) ────────────────────
+    # The policy OBSERVES the active target_pct / max_dd_pct / account-size and is
+    # meant to act PURSUANT to them (sizing, timing, risk). To learn a policy that
+    # GENERALIZES across target/risk, train with --randomize-ftmo (default OFF):
+    # then each EPISODE samples a (target_pct, max_dd_pct[, account_size]) from the
+    # ranges below, the env uses them for that episode's classification/DD AND
+    # exposes them in the observation. With it OFF the fixed cfg values are used
+    # and STILL appear (constant) in the obs, so inference-time changes still shift
+    # behaviour via the observation. See item 2 of target_aware_policy.md.
+    "RANDOMIZE_FTMO_INPUTS":   False,                 # domain-randomization mode (default OFF)
+    "RANDOMIZE_TARGET_RANGE":  [0.01, 0.05],          # per-episode target_pct sample range
+    "RANDOMIZE_DD_RANGE":      [0.005, 0.02],         # per-episode max_dd_pct sample range
+    "RANDOMIZE_FTMO_ACCOUNT":  False,                 # also sample account_size from CHOICES
+
+    # ── PROPORTIONAL ADAPTATION TO TRAINED BASELINE (item 6) ─────────────────
+    # The deterministic, no-retrain scaler layered ON TOP of the agent's chosen lot
+    # at inference/eval/live (NEVER forcing direction/exit). It tracks how the
+    # CURRENT target/DD differ from what the policy trained on:
+    #   target_ratio = current_target_pct / TRAINED_TARGET_PCT
+    #   dd_ratio     = current_max_dd_pct / TRAINED_MAX_DD_PCT
+    #   effective_lot_scale = clamp(dd_ratio * f(target_ratio), lo, hi)
+    # where tighter DD (dd_ratio<1) scales exposure DOWN and a higher target
+    # (target_ratio>1) permits more aggression. At baseline (ratios==1) it is
+    # EXACTLY 1.0 (no behaviour change). Bounds are configurable. The baseline
+    # itself is persisted in the checkpoint metadata (TRAINED_TARGET_PCT /
+    # TRAINED_MAX_DD_PCT); these cfg values are the fallback default (0.025/0.01),
+    # or the MIDPOINT of the randomization ranges when --randomize-ftmo is used.
+    "PROPORTIONAL_SCALER":     True,                  # toggle the item-6 scaler (default ON)
+    "PROPORTIONAL_SCALE_LO":   0.25,                  # lower clamp on effective_lot_scale
+    "PROPORTIONAL_SCALE_HI":   2.0,                   # upper clamp on effective_lot_scale
+    "TRAINED_TARGET_PCT":      0.025,                 # baseline the policy trained at (fallback)
+    "TRAINED_MAX_DD_PCT":      0.010,                 # baseline the policy trained at (fallback)
     "MAX_TRADES_PER_DAY": 800,
     "LEVERAGE":           100,    # 1:100 FTMO leverage. Affects margin only —
                                   # PnL per lot is always price_move * lots * 10

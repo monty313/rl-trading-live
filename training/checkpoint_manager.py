@@ -92,6 +92,10 @@ class CheckpointManager:
             "episode": int(blob.get("episode", 0) or 0),
             "phi": float(blob.get("phi", 0.0) or 0.0),
             "pass_rate": float(blob.get("pass_rate", 0.0) or 0.0),
+            # obs_schema_version (target_aware_policy.md item 4): recorded for
+            # diagnostics. A mismatch does NOT make a checkpoint ineligible —
+            # PPOAgent.load() handles the input-layer reinit loudly on resume.
+            "obs_schema_version": blob.get("obs_schema_version"),
             "corrupt": False,
         }
 
@@ -109,6 +113,7 @@ class CheckpointManager:
             checkpoints[p.name] = {
                 "phase": meta["phase"], "episode": meta["episode"],
                 "phi": meta["phi"], "pass_rate": meta["pass_rate"],
+                "obs_schema_version": meta.get("obs_schema_version"),
                 "timestamp": _now_iso(), "size_bytes": p.stat().st_size,
                 "corrupt": meta["corrupt"],
                 "protected": (p.name in PROTECTED) or (largest is not None and p.name == largest.name),

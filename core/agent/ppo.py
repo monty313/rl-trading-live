@@ -30,6 +30,7 @@ import torch.nn.functional as F
 from torch.distributions import Categorical, Normal
 
 from core.agent.action_space import DIRECTION_DIM, EXIT_DIM, FLAT
+from core.env.environment import OBS_SCHEMA_VERSION
 
 _NEG_INF = -1e9
 
@@ -117,6 +118,17 @@ class PPOAgent:
         self.optimizer = torch.optim.Adam(self.net.parameters(), lr=self.lr)
         self.buffer = RolloutBuffer()
 
+        # ── PROPORTIONAL-SCALER BASELINE (target_aware_policy.md item 6) ──────
+        # The target/DD the policy was trained at. Defaults to the cfg fallback
+        # (0.025/0.01) and is OVERWRITTEN by whatever a loaded checkpoint persisted
+        # (its training-time midpoint when --randomize-ftmo was used). The item-6
+        # scaler reads these at inference; see core/env/environment.proportional_
+        # lot_scale and training/estimate_pass_prob.py.
+        self.trained_target_pct = float(cfg.get("TRAINED_TARGET_PCT",
+                                        cfg.get("DAILY_TARGET_PCT", 0.025)))
+        self.trained_max_dd_pct = float(cfg.get("TRAINED_MAX_DD_PCT",
+                                        cfg.get("DAILY_MAX_DD_PCT", 0.010)))
+
         self.use_amp = bool(cfg.get("USE_AMP", True)) and device.type == "cuda"
         self.scaler = torch.amp.GradScaler("cuda", enabled=self.use_amp)
         self._fwd = self.net
@@ -184,6 +196,41 @@ class PPOAgent:
             lot_raw = float(torch.sigmoid(Normal(
                 lot_mean.squeeze(-1), torch.exp(self.net.lot_log_std)).sample()).item())
         return direction, lot_raw, exit_a
+
+    # ── proportional lot scaler (item 6) ──────────────────────────────────────
+    def proportional_scale(self, current_target_pct: float,
+                           current_max_dd_pct: float) -> float:
+        """The bounded, deterministic effective_lot_scale for the CURRENT
+        target/DD vs the policy's TRAINED baseline (target_aware_policy.md item 6).
+        1.0 at baseline; tighter DD scales DOWN, higher target scales UP; always
+        within [PROPORTIONAL_SCALE_LO, PROPORTIONAL_SCALE_HI]. Returns 1.0 when the
+        scaler is toggled OFF (CFG['PROPORTIONAL_SCALER'] = False)."""
+        from core.env.environment import proportional_lot_scale
+        if not bool(self.cfg.get("PROPORTIONAL_SCALER", True)):
+            return 1.0
+        return proportional_lot_scale(
+            current_target_pct, current_max_dd_pct,
+            self.trained_target_pct, self.trained_max_dd_pct,
+            lo=float(self.cfg.get("PROPORTIONAL_SCALE_LO", 0.25)),
+            hi=float(self.cfg.get("PROPORTIONAL_SCALE_HI", 2.0)))
+
+    @torch.no_grad()
+    def select_actions_eval(self, state: torch.Tensor,
+                            mask: Optional[torch.Tensor] = None,
+                            lot_scale: float = 1.0) -> Dict[str, torch.Tensor]:
+        """Batched DETERMINISTIC action selection for eval/estimation: argmax
+        direction/exit and the MEAN lot (sigmoid of the lot-head mean), with the
+        item-6 proportional `lot_scale` applied ON TOP of the chosen lot (clamped
+        back into [0,1]). Returns the same dict shape env.step() expects. The
+        scaler only resizes exposure — direction/exit remain the policy's choice."""
+        dir_logits, exit_logits, lot_mean, value = self._fwd(state)
+        dir_d, exit_d, _lot_d = self._dists(dir_logits, exit_logits, lot_mean, mask)
+        dir_a = dir_d.probs.argmax(dim=-1)
+        exit_a = exit_d.probs.argmax(dim=-1)
+        lot_raw = torch.sigmoid(lot_mean.squeeze(-1))
+        lot_raw = (lot_raw * float(lot_scale)).clamp(0.0, 1.0)
+        return {"direction": dir_a, "exit": exit_a, "lot_raw": lot_raw,
+                "value": value}
 
     # ── rollout storage ───────────────────────────────────────────────────────
     def store(self, state, out: dict, reward, done, dir_mask):
@@ -253,17 +300,81 @@ class PPOAgent:
 
     # ── checkpoint I/O (PPO only) ──────────────────────────────────────────────
     def save(self, path: str, extra: dict = None):
+        # obs_schema_version (target_aware_policy.md item 4/6) lets a resume detect
+        # an input-layer width mismatch instead of silently mis-loading. The
+        # trained target/DD BASELINE is also persisted so the item-6 proportional
+        # scaler knows what regime the policy learned at (defaults 0.025/0.01; the
+        # MIDPOINT of the randomization ranges when --randomize-ftmo was used).
+        ppo = self.cfg.get("PPO", {}) or {}
+        if bool(self.cfg.get("RANDOMIZE_FTMO_INPUTS", False)):
+            tlo, thi = self.cfg.get("RANDOMIZE_TARGET_RANGE", [0.01, 0.05])
+            dlo, dhi = self.cfg.get("RANDOMIZE_DD_RANGE", [0.005, 0.02])
+            trained_target = 0.5 * (float(tlo) + float(thi))
+            trained_dd = 0.5 * (float(dlo) + float(dhi))
+        else:
+            trained_target = float(self.cfg.get("TRAINED_TARGET_PCT",
+                                   self.cfg.get("DAILY_TARGET_PCT", 0.025)))
+            trained_dd = float(self.cfg.get("TRAINED_MAX_DD_PCT",
+                               self.cfg.get("DAILY_MAX_DD_PCT", 0.010)))
         payload = {"net": self.net.state_dict(),
                    "optimizer": self.optimizer.state_dict(),
-                   "state_dim": self.state_dim, "agent": "ppo"}
+                   "state_dim": self.state_dim, "agent": "ppo",
+                   "obs_schema_version": OBS_SCHEMA_VERSION,
+                   "trained_target_pct": trained_target,
+                   "trained_max_dd_pct": trained_dd}
         if extra:
             payload.update(extra)
         torch.save(payload, path)
 
     def load(self, path: str, partial: bool = False) -> dict:
+        """Load a checkpoint. Detects an OBSERVATION-SCHEMA mismatch (the input
+        layer width / obs_schema_version differs from THIS agent's) and handles it
+        CLEANLY rather than silently loading a mismatched net (target_aware_policy
+        .md item 4): the trunk's input layer (trunk.0.*) is reinitialized fresh
+        while every other layer that still matches is loaded, with a LOUD log. This
+        is the documented behaviour for the v1->v2 obs bump (7 new target/risk
+        features). A full match loads normally."""
         # weights_only=False: our checkpoints store metadata dicts (trusted, ours).
         ckpt = torch.load(path, map_location=self.device, weights_only=False)
+        # Restore the trained target/DD baseline for the item-6 proportional scaler
+        # (falls back to the current values if the checkpoint predates the field).
+        if ckpt.get("trained_target_pct") is not None:
+            self.trained_target_pct = float(ckpt["trained_target_pct"])
+        if ckpt.get("trained_max_dd_pct") is not None:
+            self.trained_max_dd_pct = float(ckpt["trained_max_dd_pct"])
         sd = ckpt.get("net", {})
+        ckpt_schema = ckpt.get("obs_schema_version")
+        ckpt_state_dim = ckpt.get("state_dim")
+        in_w = sd.get("trunk.0.weight")
+        ckpt_in_dim = int(in_w.shape[1]) if in_w is not None else ckpt_state_dim
+        schema_mismatch = (
+            (ckpt_schema is not None and ckpt_schema != OBS_SCHEMA_VERSION)
+            or (ckpt_in_dim is not None and int(ckpt_in_dim) != int(self.state_dim))
+        )
+        if schema_mismatch:
+            print("─" * 70, flush=True)
+            print("[ppo] ⚠️  OBSERVATION-SCHEMA MISMATCH on resume:", flush=True)
+            print(f"      checkpoint obs_schema_version={ckpt_schema} "
+                  f"(input dim {ckpt_in_dim}) vs current v{OBS_SCHEMA_VERSION} "
+                  f"(input dim {self.state_dim}).", flush=True)
+            print("      The observation layout changed (target/risk-aware "
+                  "features were added).", flush=True)
+            print("      → Reinitializing JUST the input layer (trunk.0.*) fresh "
+                  "and loading every other matching layer.", flush=True)
+            print("      Training continues from these partially-transferred "
+                  "weights; the new input layer learns the added features.",
+                  flush=True)
+            print("─" * 70, flush=True)
+            own = self.net.state_dict()
+            for k, v in sd.items():
+                # Skip the input layer on a mismatch (its width changed); load the
+                # rest only where the shape still matches exactly.
+                if k.startswith("trunk.0."):
+                    continue
+                if k in own and own[k].shape == v.shape:
+                    own[k] = v
+            self.net.load_state_dict(own)
+            return ckpt
         if partial:
             own = self.net.state_dict()
             for k, v in sd.items():

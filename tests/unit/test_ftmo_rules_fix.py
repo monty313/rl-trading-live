@@ -342,6 +342,11 @@ def test_no_hardcoded_constants_in_rule_paths():
     # literal 0.025 / 250 in the pass test.
     cls_region = env_src[env_src.index("DAY CLASSIFICATION"):]
     cls_region = cls_region[:cls_region.index("info = {")]
-    assert "self.daily_increment" in cls_region
+    # The increment is config-derived (target_aware_policy.md item 2 made it a
+    # PER-EPISODE tensor `self._daily_increment_t` so randomized/inference target
+    # changes flow through; the scalar `self.daily_increment` remains for the
+    # guard/eval). Either reference is acceptable — what matters is no bare literal.
+    assert ("self._daily_increment_t" in cls_region
+            or "self.daily_increment" in cls_region)
     assert not re.search(r">=\s*.*0\.025", cls_region)
     assert not re.search(r"\b250\b", cls_region)

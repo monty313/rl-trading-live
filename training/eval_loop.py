@@ -32,11 +32,14 @@ def run_eval(env, agent, cfg: dict, n_days: int = 10) -> dict:
     # RULE 1): daily_target = day_start_eq + daily_increment, NOT a percentage of
     # the day's opening balance.
     daily_increment = float(env.daily_increment)
+    # item-6 proportional scaler: at eval, scale exposure relative to the policy's
+    # trained baseline so behaviour tracks the active target/DD (1.0 at baseline).
+    lot_scale = agent.proportional_scale(env.target_pct, env.max_dd_pct)
 
     for step in range(steps):
         mask = env.current_direction_mask()
         state = env._get_state()
-        out = agent.select_actions(state, mask=mask)
+        out = agent.select_actions_eval(state, mask=mask, lot_scale=lot_scale)
         _s, _r, done, info = env.step(out)
         eq = float(info["equity"][0].item())
         day_high = max(day_high, eq)
