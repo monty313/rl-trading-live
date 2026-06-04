@@ -199,10 +199,15 @@ _WIDGET_SPECS: Dict[str, Dict[str, Any]] = {
                          "label": "Auto-tune batch/rollout to GPU tier"},
     "USE_AMP":          {"kind": "checkbox", "default": True, "group": "gpu",
                          "label": "Mixed precision (AMP, CUDA only)"},
-    "USE_TORCH_COMPILE": {"kind": "checkbox", "default": True, "group": "gpu",
-                          "label": "torch.compile model (CUDA only) — "
-                                   "first step warms up ~10-15 min on A100; "
-                                   "uncheck to skip warmup (slower steady-state)"},
+    # DEFAULT OFF — mirrors CFG["USE_TORCH_COMPILE"]=False (no_holdups_default.md):
+    # training is CPU-bound so compile's steady-state win is marginal while its
+    # ~10-15 min first-step warmup is the biggest startup hold-up. Off = instant
+    # start; CHECK this to claim the steady-state speedup (then warmup applies).
+    "USE_TORCH_COMPILE": {"kind": "checkbox", "default": False, "group": "gpu",
+                          "label": "torch.compile model (CUDA only) — OFF by "
+                                   "default for instant start (training is "
+                                   "CPU-bound). Check for steady-state speedup; "
+                                   "first step then warms up ~10-15 min on A100"},
     "COMPILE_WATCHDOG_ENABLED": {"kind": "checkbox", "default": True, "group": "gpu",
                                  "label": "Compile watchdog (prints 'still "
                                           "compiling…' during torch.compile warmup)"},

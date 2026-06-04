@@ -92,10 +92,20 @@ look for, and the most common failure + its one-line fix.
   - `no checkpoint found — fresh start` → normal on a brand-new run.
 - **Note:** The `--manifest` path **must live in the `gpu/` dir** (next to the
   `--checkpoint-dir` checkpoints) so `find_best_resume()` can locate them.
-- **Note — `torch.compile` warmup is NOW VISIBLE (not a freeze):** The first
-  rollout step compiles the model and **blocks ~10–15 min on an A100**. You used
-  to see ZERO output during this and it looked frozen. It is now provably alive —
-  the startup output appears **in this exact order**:
+- **Note — `torch.compile` is OFF by DEFAULT (instant start, NO warmup):**
+  Startup has **zero hold-ups by default**. Because training here is **CPU-bound**
+  (the adversarial audit measured `env.step` ~66% of wall time, model forward
+  ~34%), `torch.compile`'s steady-state speedup is **marginal**, while its lazy
+  first-step compile would **block ~10–15 min on an A100** — the single biggest
+  startup hold-up. So `USE_TORCH_COMPILE` defaults to **`False`** in
+  `core/settings.py` and the Cell 7 ⚡ GPU panel (zero drift). The first forward
+  runs **eagerly**: no compile, no announcement, no watchdog — `DAY …` lines stream
+  within seconds.
+- **If you DO enable compile** (check **`USE_TORCH_COMPILE`** in the Cell 7 ⚡ GPU
+  panel, or set `USE_TORCH_COMPILE: true` in `core/settings.py`) to claim the
+  steady-state speedup, the **warmup is provably alive (not a freeze)**. The first
+  rollout step compiles the model and **blocks ~10–15 min on an A100**; the startup
+  output then appears **in this exact order**:
   1. `[train] === PHASE phase1_cci_align ===`
   2. `[train] 🛠  torch.compile warming up (mode=default) — first step compiles…`
      (the announcement; only when compile is ON)
@@ -108,11 +118,8 @@ look for, and the most common failure + its one-line fix.
      (the compile-done marker, with how long it took)
   6. Then the normal `DAY …` / `Episode …` lines stream as usual.
   If you see steps 2–4 with no further output yet, that is **warmup, not a
-  crash.** **To skip warmup entirely** (faster startup, slightly slower
-  steady-state), uncheck **`USE_TORCH_COMPILE` / COMPILE_MODEL** in the Cell 7
-  ⚡ GPU panel (or set `USE_TORCH_COMPILE: false` in `core/settings.py`). The
-  heartbeat cadence and watchdog ticker are also configurable there
-  (`HEARTBEAT_SECS`, `COMPILE_WATCHDOG_ENABLED`).
+  crash.** The heartbeat cadence and watchdog ticker are configurable in the same
+  panel (`HEARTBEAT_SECS`, `COMPILE_WATCHDOG_ENABLED`).
 
 ### 8–10. (optional) Dashboard / Crash recovery / GPU profiling
 - **8 Dashboard:** Streamlit UI over localtunnel (ngrok fallback in the cell).

@@ -209,7 +209,20 @@ CFG = {
     # torch.compile / AMP toggles (auto-disabled on CPU).
     # compile uses mode="default" — NOT "reduce-overhead" which uses CUDA Graphs
     # and overwrites rollout buffer tensors, crashing torch.stack() in update().
-    "USE_TORCH_COMPILE": True,
+    #
+    # ── DEFAULT OFF for ZERO startup hold-ups (no_holdups_default.md) ─────────
+    # The adversarial audit found training here is CPU-BOUND (env.step ~66% of
+    # wall time, model forward ~34%), so torch.compile's steady-state speedup is
+    # MARGINAL — it only accelerates the forward, which is the minority cost. Its
+    # downside is large and front-loaded: the LAZY first-step compile BLOCKS the
+    # main thread for ~10-15 min on an A100 (the single biggest startup hold-up).
+    # Net: default OFF buys an INSTANT start (first forward runs eagerly, no
+    # warmup, no watchdog) at negligible steady-state cost. The user can re-enable
+    # it from the dashboard ⚡ GPU panel (the USE_TORCH_COMPILE checkbox) to claim
+    # the steady-state speedup; the full compile-warmup visibility path
+    # (announcement + immediate heartbeat + watchdog, see training/train.py
+    # _first_forward_warmup) stays intact and only engages when this is True.
+    "USE_TORCH_COMPILE": False,
     "USE_AMP":           True,
     # ── COMPILE WARMUP VISIBILITY (compile_warmup_visibility fix) ────────────
     # torch.compile(mode="default") compiles LAZILY on the FIRST forward pass —
