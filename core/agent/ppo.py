@@ -281,6 +281,17 @@ class PPOAgent:
                         out["value"].detach(),
                         dir_mask.detach() if dir_mask is not None else None)
 
+    # ── truncation bootstrap value ────────────────────────────────────────────
+    @torch.no_grad()
+    def bootstrap_value(self, state: torch.Tensor,
+                        mask: Optional[torch.Tensor] = None) -> torch.Tensor:
+        """V(s_T) for the state at the END of a rollout, used to bootstrap GAE on a
+        TRUNCATED (time-limit) boundary. The mask is irrelevant to the value head
+        (it only gates the direction logits) but is accepted for call-site symmetry.
+        Returns a (B,) tensor on self.device. Detached/no-grad — it is a target."""
+        _dl, _el, _lm, value = self._fwd(state)
+        return value.detach()
+
     # ── PPO update ─────────────────────────────────────────────────────────────
     def update(self, last_value: Optional[torch.Tensor] = None) -> Optional[float]:
         """Run a PPO update over the collected rollout, then clear the buffer.

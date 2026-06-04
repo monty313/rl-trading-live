@@ -450,6 +450,15 @@ def train(args) -> int:
     def run_phase(phase: dict, infinite: bool):
         nonlocal global_ep, last_hb, best_phi, pass_streak
         env.phase = phase
+        # ── TRAIN/VAL SEPARATION (audit P1) ──────────────────────────────────
+        # Confine TRAINING episode starts to the leading [0, EVAL_SPLIT_FRAC)
+        # slice so run_eval's held-out tail [EVAL_SPLIT_FRAC, 1.0) is genuinely
+        # out-of-sample. Disable (full-range training) by setting EVAL_SPLIT_FRAC
+        # >= 1.0 or USE_EVAL_SPLIT=False. The split is config-driven, not hardcoded.
+        if bool(cfg.get("USE_EVAL_SPLIT", True)):
+            split = float(cfg.get("EVAL_SPLIT_FRAC", 0.8))
+            if 0.0 < split < 1.0:
+                env.set_start_window(0.0, split)
         max_eps = phase.get("max_episodes", cfg["MAX_EPISODES_PER_PHASE"])
         ep_in_phase = 0
         # ── HEARTBEAT (learning_loop_fix.md FIX 2): WALL-CLOCK time-based, default
@@ -594,8 +603,23 @@ def train(args) -> int:
                         break
 
                 if len(agent.buffer) >= rollout:
-                    agent.update()        # PPO update, then buffer clears
-            loss = agent.update()          # flush remaining rollout at episode end
+                    # TRUNCATION BOOTSTRAP (PPO correctness): this env only ever sets
+                    # done=True on a TIME-LIMIT/trade-cap (truncation) — never on a
+                    # terminal "account blown" state — so cutting the rollout here
+                    # mid-episode is itself a truncation. GAE must bootstrap the tail
+                    # with V(s_T) of the NEXT state (now in `state`), NOT 0. Passing
+                    # None made update() bootstrap 0, which biases every advantage at
+                    # the rollout boundary toward "the world ends here" and is a silent
+                    # value-function bug. We compute V(s_T) under no_grad.
+                    last_value = agent.bootstrap_value(state, mask=mask)
+                    agent.update(last_value=last_value)   # PPO update, then buffer clears
+            # End-of-episode flush. If the loop exited because done.all() (the normal
+            # time-limit), the final stored transition already carries done=True so
+            # next_nonterminal=0 masks the bootstrap regardless of last_value. If it
+            # exited on max_steps/phase-advance WITHOUT done, the tail is a truncation
+            # and must bootstrap V(s_T); supplying it is correct in both cases.
+            last_value = agent.bootstrap_value(state, mask=env.current_direction_mask())
+            loss = agent.update(last_value=last_value)   # flush remaining rollout
 
             global_ep += 1
             ep_in_phase += 1

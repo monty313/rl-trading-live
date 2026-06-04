@@ -1,9 +1,18 @@
 """
 training/eval_loop.py
 ────────────────────────────────────────────────────────────────────────────
-Runs simulated trading days on the validation window (last 20% of the data,
-never used for training) and returns aggregate metrics. Uses the SAME env +
-indicators + fills + guard as training (no divergence).
+Runs simulated trading days on the VALIDATION window and returns aggregate
+metrics. Uses the SAME env + indicators + fills + guard as training (no
+divergence). The validation window is the chronological TAIL of the dataset
+(fraction [EVAL_SPLIT_FRAC, 1.0), default last 20%); the trainer confines its
+own episode starts to the leading [0, EVAL_SPLIT_FRAC) slice, so this eval is
+genuinely OUT-OF-SAMPLE — it never overlaps training start bars.
+
+Note: an episode can be up to EPISODE_BARS long, so with a long EPISODE_BARS a
+tail-started episode may still roll forward over earlier bars. The split bounds
+the START distribution (where evaluation begins), which is what removes the
+"eval on the exact same starts as training" leak; it is not a hard wall against
+any bar overlap when episodes are long.
 
 run_eval(env, agent, cfg, n_days=10) -> {
     pass_rate, phi, avg_daily_return, avg_daily_dd
@@ -23,7 +32,20 @@ def run_eval(env, agent, cfg: dict, n_days: int = 10) -> dict:
     """
     device = env.device
     bars_per_day = int(cfg.get("BARS_PER_DAY", 1440))
-    env.reset()
+    # OUT-OF-SAMPLE: evaluate from the held-out chronological TAIL. Default split
+    # 0.8 => validation starts sample from the last 20% of the series, disjoint
+    # from the trainer's [0, split) window. Restored to full range after eval so
+    # we never leave the env in a constrained state for any subsequent caller.
+    split = float(cfg.get("EVAL_SPLIT_FRAC", 0.8))
+    env.set_start_window(split, 1.0)
+    try:
+        env.reset()
+        return _run_eval_body(env, agent, cfg, n_days, bars_per_day)
+    finally:
+        env.set_start_window(0.0, 1.0)
+
+
+def _run_eval_body(env, agent, cfg: dict, n_days: int, bars_per_day: int) -> dict:
     daily_returns, daily_dds, daily_pass = [], [], []
     day_start_eq = float(env._equity[0].item())
     day_high = day_start_eq

@@ -4,21 +4,39 @@ core/env/environment.py
 BatchedFTMOEnv — B parallel trading episodes stepped in lockstep on GPU tensors.
 Ported from gpu_rl_trading/env/environment.py (REPO1) with these changes:
 
-  (a) Wires core/env/intrabar_fills.compute_fill for entry/SL/TP on each trade.
+  (a) ENTRY/EXIT FILLS: the training hot path fills entries and mark-to-market
+      at the bar CLOSE (self._entry_px = close on open; MTM at next_close). It
+      does NOT call core/env/intrabar_fills.compute_fill — that parity function
+      (spread*0.5 + slippage on the entry, SL/TP from OHLC) is used by the
+      backtest and the live MT5 runner. Per-trade COST in training is modeled via
+      _commission_for_lots (round-trip commission) only. An OPTIONAL entry-price
+      spread+slippage adjustment is available behind cfg["ENTRY_FRICTION_ENABLED"]
+      (default False) to close the train-vs-live entry-cost gap (applied inline at
+      the entry-fill step, see self._friction_px). AUDIT NOTE (P1): with friction
+      OFF, training entries are frictionless and thus more optimistic than live
+      fills.
   (b) Adds a (B, DIRECTION_DIM) direction mask applied to PPO logits before
       argmax. The mask is produced by conditions_engine from the active phase.
   (c) Multi-symbol: load EURUSD / GBPUSD / XAUUSD / US30 (or aligned baskets).
-  (d) PASS/FAIL rule — STRICTLY BINARY (ftmo_rules_fix.md RULES 1-3):
+  (d) CLASSIFICATION — 5-TIER FAIL/OK/PASS/EXCEED + stacked SURVIVAL (commit
+      2166ec8). The binary passed/failed flags are retained for compatibility and
+      derived from the tiers (passed = PASS or EXCEED). The FIXED-$ daily target
+      is unchanged (ftmo_rules_fix.md RULE 1):
         daily_increment = initial_equity * target_pct   (FIXED $, once at open)
         daily_target    = day_start_equity + daily_increment
         passed          = (final_or_halt_equity >= daily_target)
-        FAIL            = everything else (incl. zero-trade days and DD-breach
-                          days that end under target). A DD breach does NOT
-                          auto-fail: halt_equity >= daily_target still PASSES.
-        There is NO "OK" tier and NO "SKIP" tier — every day is PASS or FAIL.
+        FAIL            = everything under target (incl. zero-trade days and
+                          DD-breach days that end under target). A DD breach does
+                          NOT auto-fail: halt_equity >= daily_target still PASSES,
+                          but a breached day can never earn SURVIVAL/EXCEED.
+        OK is an intermediate tier below PASS; EXCEED is a superset of PASS;
+        SURVIVAL stacks additively and only on non-breached days.
   (e) Entire feature tensor preloaded to device at __init__; episodes index slices.
   (f) All tensors live on cfg["device"]; day-boundary logic is vectorized
       (no Python per-batch loop in the hot path — fixes bottleneck #1).
+  (g) reset() samples each episode's start bar inside an optional chronological
+      window [_start_lo_frac, _start_hi_frac) (set_start_window) so training and
+      out-of-sample eval use DISJOINT slices (default = full range).
 
 State layout: a normalized lookback window of the feature matrix, then 6 v1 FTMO
 position/account features (position, unrealised, equity change, gap-to-target,
@@ -324,6 +342,22 @@ class BatchedFTMOEnv:
             self._commission_class, {"kind": "zero", "value": 0.0})
         self._comm_kind = comm_spec.get("kind", "zero")
         self._comm_value = float(comm_spec.get("value", 0.0))
+        # ── OPTIONAL ENTRY FRICTION (audit P1: train-vs-live entry-cost gap) ──
+        # When enabled, the entry price is worsened by half the spread plus full
+        # slippage, in the trade's direction — matching the entry leg of
+        # intrabar_fills.compute_fill (BUY pays up, SELL is filled down). DEFAULT
+        # OFF so existing trade economics and the hand-calc PnL tests are
+        # unchanged; flip cfg["ENTRY_FRICTION_ENABLED"]=True to train against the
+        # realistic, more-pessimistic entry. pip/spread/slippage come from the
+        # instrument's trading_policy.yaml entry (same source compute_fill uses),
+        # so nothing is hardcoded.
+        self._entry_friction_enabled = bool(cfg.get("ENTRY_FRICTION_ENABLED", False))
+        _instr = {**{"pip_value": 0.0001, "spread_pips": 1.0, "slippage_pips": 0.5},
+                  **((self.policy.get("instrument_settings", {}) or {})
+                     .get(self.instrument, {}))}
+        self._friction_px = float(
+            _instr["pip_value"]
+            * (0.5 * float(_instr["spread_pips"]) + float(_instr["slippage_pips"])))
         # Section 6 sessions (synthetic CEST clock) + filter.
         self._sessions = list(cfg.get("TRADING_SESSIONS", []))
         self._n_sessions = float(cfg.get("N_SESSIONS", 4))
@@ -370,6 +404,16 @@ class BatchedFTMOEnv:
         # episode length: bounded by data; default ~ a few days for dev/CPU
         self.ep_bars = min(int(cfg.get("EPISODE_BARS", 43_200)),
                            max(self.bars_per_day, self.T - self.lkbk - 2))
+
+        # ── CHRONOLOGICAL START-WINDOW (train/val separation) ────────────────
+        # reset() samples each episode's start bar uniformly inside this fraction
+        # [lo, hi) of the dataset. DEFAULT (0.0, 1.0) = the whole series, which is
+        # the historical behaviour. The trainer / run_eval set DISJOINT windows
+        # (e.g. train=[0,0.8), val=[0.8,1.0)) so the validation pass-rate is
+        # genuinely OUT-OF-SAMPLE and never overlaps training starts. The split is
+        # config-driven (EVAL_SPLIT_FRAC) and never hardcoded into reset().
+        self._start_lo_frac = 0.0
+        self._start_hi_frac = 1.0
 
         # state_dim = lookback window (lkbk*F) + v1 position/account features
         # (N_POSITION_FEATS) + v2 target/risk-aware features (N_FTMO_FEATS, item 1)
@@ -462,6 +506,11 @@ class BatchedFTMOEnv:
         d, B = self.device, self.B
         self._start = torch.zeros(B, dtype=torch.long, device=d)
         self._step_i = torch.zeros(B, dtype=torch.long, device=d)
+        # REALIZED balance (cash). Only changes on close/reverse/commission — NEVER
+        # carries unrealized mark-to-market. self._equity is the MARKED equity
+        # (balance + open-position MTM) recomputed fresh each bar from this balance;
+        # folding MTM back into the balance would double-count it every held bar.
+        self._balance = torch.full((B,), self.initial_equity, device=d)
         self._equity = torch.full((B,), self.initial_equity, device=d)
         self._day_start_eq = torch.full((B,), self.initial_equity, device=d)
         self._day_high_eq = torch.full((B,), self.initial_equity, device=d)
@@ -605,13 +654,33 @@ class BatchedFTMOEnv:
         batch = self._rows_by_tf_batch(self._abs_idx())
         return {tf: rows[0] for tf, rows in batch.items()}
 
+    # ── train/val start-window control ──────────────────────────────────────────
+    def set_start_window(self, lo_frac: float = 0.0, hi_frac: float = 1.0) -> None:
+        """Restrict reset()'s episode-start sampling to the dataset fraction
+        [lo_frac, hi_frac). Used to keep training and evaluation on DISJOINT,
+        chronological slices so the eval pass-rate is out-of-sample. Clamped to
+        [0, 1] with lo < hi enforced. (0.0, 1.0) restores full-range sampling."""
+        lo = min(max(float(lo_frac), 0.0), 1.0)
+        hi = min(max(float(hi_frac), 0.0), 1.0)
+        if hi <= lo:                       # guard against an empty/inverted window
+            lo, hi = 0.0, 1.0
+        self._start_lo_frac, self._start_hi_frac = lo, hi
+
     # ── reset ──────────────────────────────────────────────────────────────────
     def reset(self) -> torch.Tensor:
         warmup = self.lkbk + 25
+        # Full admissible start range [warmup, max_start). The active start-window
+        # fraction then carves a chronological sub-range out of it (default = all).
         max_start = max(warmup + 1, self.T - self.ep_bars - 1)
-        self._start = torch.randint(warmup, max(warmup + 2, max_start),
+        span = max_start - warmup
+        lo = warmup + int(self._start_lo_frac * span)
+        hi = warmup + int(self._start_hi_frac * span)
+        lo = min(max(lo, warmup), max_start)
+        hi = min(max(hi, lo + 1), max(warmup + 1, max_start))
+        self._start = torch.randint(lo, max(lo + 1, hi),
                                     (self.B,), device=self.device)
         self._step_i.zero_()
+        self._balance.fill_(self.initial_equity)
         self._equity.fill_(self.initial_equity)
         self._day_start_eq.fill_(self.initial_equity)
         self._day_high_eq.fill_(self.initial_equity)
@@ -663,6 +732,7 @@ class BatchedFTMOEnv:
                     device=d, dtype=torch.float32)
                 pick = choices[torch.randint(len(choices), (B,), device=d)]
                 self._initial_equity_t = pick
+                self._balance = pick.clone()
                 self._equity = pick.clone()
                 self._day_start_eq = pick.clone()
                 self._day_high_eq = pick.clone()
@@ -997,7 +1067,7 @@ class BatchedFTMOEnv:
         # realize PnL on the closed (100%) and reduced (50%) fractions
         exit_realized = (do_close.float() * pnl_per_unit
                          + do_reduce.float() * pnl_per_unit * 0.5)
-        self._equity = self._equity + exit_realized
+        self._balance = self._balance + exit_realized
         # ── Section 5 commission at trade CLOSE (charged on the lots being closed) ──
         # The CLOSE side of the round-trip cost is deducted here, scaled by the lots
         # actually closed (full for EXIT_CLOSE, half for EXIT_REDUCE). Agent feels
@@ -1005,7 +1075,7 @@ class BatchedFTMOEnv:
         closed_lots = (do_close.float() * self._position.abs()
                        + do_reduce.float() * self._position.abs() * 0.5)
         close_comm = self._commission_for_lots(closed_lots, close, side="close")
-        self._equity = self._equity - close_comm
+        self._balance = self._balance - close_comm
         # ── Section 7 speed bonus: confirm/revoke on CLOSE ──
         # A position that armed the speed bonus (showed green within the window)
         # KEEPS its pending bonus only if it CLOSES in profit (price_move0>0); a
@@ -1034,7 +1104,7 @@ class BatchedFTMOEnv:
         # open new position where a non-hold action is taken
         opening = dirs != 0
         self._trades_today = self._trades_today + opening.long()
-        self._equity = self._equity + torch.where(opening, realized,
+        self._balance = self._balance + torch.where(opening, realized,
                                                   torch.zeros_like(realized))
         self._position = torch.where(opening, dirs * lots, self._position)
 
@@ -1057,7 +1127,15 @@ class BatchedFTMOEnv:
             self._position = torch.where(need_entry, forced_dir * forced_lot,
                                          self._position)
             opening = opening | need_entry
-        self._entry_px = torch.where(opening, close, self._entry_px)
+        # Entry fills at the bar CLOSE, optionally worsened by entry friction
+        # (half-spread + slippage in the trade direction). BUY pays UP (+), SELL is
+        # filled DOWN (-); friction is 0 when ENTRY_FRICTION_ENABLED is off, so the
+        # default path is the unchanged `close` fill. _position sign carries the
+        # side (already set above for both agent entries and force-entries).
+        entry_fill = close
+        if self._entry_friction_enabled and self._friction_px != 0.0:
+            entry_fill = close + torch.sign(self._position) * self._friction_px
+        self._entry_px = torch.where(opening, entry_fill, self._entry_px)
 
         # ── Section 5 commission at trade OPEN + Section 7 entry-bar stamp ──
         # The OPEN side of the round-trip cost is deducted on any bar a NEW position
@@ -1066,7 +1144,7 @@ class BatchedFTMOEnv:
         opened_lots = torch.where(opening, self._position.abs(),
                                   torch.zeros_like(self._position))
         open_comm = self._commission_for_lots(opened_lots, close, side="open")
-        self._equity = self._equity - open_comm
+        self._balance = self._balance - open_comm
         self._entry_bar = torch.where(opening, self._step_i, self._entry_bar)
         self._speed_armed = torch.where(opening, torch.zeros_like(self._speed_armed),
                                         self._speed_armed)
@@ -1079,7 +1157,13 @@ class BatchedFTMOEnv:
         # Leverage 1:100 affects margin requirement only, not PnL per lot.
         mtm = (next_close - self._entry_px) * torch.sign(self._position) * \
             self._position.abs() * 100_000.0
-        equity_now = self._equity + torch.where(self._position != 0, mtm,
+        # MARKED equity = REALIZED balance + open-position unrealized PnL, recomputed
+        # fresh each bar from self._balance (which holds NO unrealized component). The
+        # earlier code added mtm to self._equity and then wrote equity_now back into
+        # self._equity, so the next bar's self._equity already contained this bar's
+        # unrealized PnL and re-added it — compounding a held winner's equity every
+        # bar (P0 double-count). Sourcing mtm from the realized balance fixes it.
+        equity_now = self._balance + torch.where(self._position != 0, mtm,
                                                 torch.zeros_like(mtm))
         self._day_high_eq = torch.maximum(self._day_high_eq, equity_now)
         # intra-day equity HIGH (Section 3.2 give-back-from-high) + multi-day PEAK
@@ -1188,6 +1272,14 @@ class BatchedFTMOEnv:
         halt_breach = breach_now & (~new_day)
         newly_halted = halt_breach & (~self._day_halted)
         self._day_halted = self._day_halted | halt_breach
+        # When the DD-halt flattens an OPEN position, its unrealized mark-to-market
+        # must be REALIZED into the balance (a forced close), not silently dropped.
+        # mtm is this bar's open-position PnL (0 when flat); fold it into _balance for
+        # the episodes flattened THIS bar, then zero the position. Without this the
+        # breach loss would vanish from the balance and the day would read flat.
+        flatten = self._day_halted & (self._position != 0)
+        self._balance = self._balance + torch.where(flatten, mtm,
+                                                    torch.zeros_like(mtm))
         self._position = torch.where(self._day_halted, torch.zeros_like(self._position),
                                      self._position)
 

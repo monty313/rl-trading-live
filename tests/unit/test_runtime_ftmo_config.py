@@ -71,7 +71,12 @@ def test_increment_fixed_off_initial_not_opening_balance():
 # 2. PASS iff end/halt equity >= target: +$20 FAILs, +$250 PASSes
 # ════════════════════════════════════════════════════════════════════════════
 def _drive_day(env, day_start_eq, final_eq):
+    # Drive a FLAT account's equity trajectory by hand. Marked equity is recomputed
+    # each bar as balance + open-position MTM; with no position MTM==0, so we inject
+    # the level into the REALIZED balance (the persistent source of truth) — setting
+    # only _equity would be overwritten by the balance+MTM recompute inside step().
     env.reset()
+    env._balance[:] = day_start_eq
     env._equity[:] = day_start_eq
     env._day_start_eq[:] = day_start_eq
     env._day_high_eq[:] = day_start_eq
@@ -80,12 +85,14 @@ def _drive_day(env, day_start_eq, final_eq):
     info = None
     for step in range(bpd):
         target = final_eq if step == bpd - 1 else day_start_eq
+        env._balance[:] = target
         env._equity[:] = target
         env._day_high_eq[:] = torch.maximum(env._day_high_eq, env._equity)
         _s, _r, _d, info = env.step(
             {"direction": torch.full((env.B,), FLAT, dtype=torch.long),
              "lot_raw": torch.zeros(env.B),
              "exit": torch.zeros(env.B, dtype=torch.long)})
+        env._balance[:] = target
         env._equity[:] = target
     return info
 

@@ -107,6 +107,13 @@ def _run_day(env: BatchedFTMOEnv, force_equity_fn):
         total += r
         eq = force_equity_fn(s)
         if eq is not None:
+            # Marked equity is recomputed each bar as balance + open-position MTM. To
+            # script a deterministic equity PATH we flatten the position and pin the
+            # REALIZED balance to the scripted level (with no position MTM==0, so
+            # marked equity == balance); pinning only _equity would be overwritten by
+            # the balance+MTM recompute inside the next step().
+            env._position.zero_()
+            env._balance[:] = eq
             env._equity[:] = eq
             env._day_high_eq = torch.maximum(env._day_high_eq, env._equity)
     return float(total[0].item()), info

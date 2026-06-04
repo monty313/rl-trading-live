@@ -98,7 +98,10 @@ def test_halt_flag_resets_next_day_for_all_episodes():
     # Force a hard DD breach on EVERY episode partway through day 0 by slamming
     # equity well below the day's peak, then step one bar so the breach is detected.
     env._day_high_eq.fill_(env.initial_equity)
-    env._equity.fill_(env.initial_equity * 0.90)        # -10% << 1% DD limit
+    # Marked equity is recomputed each bar as balance + MTM; with no open position
+    # marked equity == balance, so slam the REALIZED balance to drive the breach.
+    env._balance.fill_(env.initial_equity * 0.90)       # -10% << 1% DD limit
+    env._equity.fill_(env.initial_equity * 0.90)
     flat = {"direction": torch.full((B,), FLAT, dtype=torch.long),
             "lot_raw": torch.zeros(B), "exit": torch.full((B,), EXIT_HOLD,
                                                           dtype=torch.long)}

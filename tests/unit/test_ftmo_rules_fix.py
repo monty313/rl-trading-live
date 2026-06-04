@@ -62,6 +62,11 @@ def _classify(env, day_start_eq, final_eq):
     We bypass the trading PnL by directly setting the equity tensors each bar —
     this isolates the CLASSIFICATION rule under test from fill mechanics."""
     env.reset()
+    # Marked equity is recomputed each bar as balance + open-position MTM; with the
+    # agent flat (MTM==0) marked equity == balance, so we script the REALIZED balance
+    # (the persistent source of truth). Pinning only _equity would be overwritten by
+    # the balance+MTM recompute inside step().
+    env._balance[:] = day_start_eq
     env._equity[:] = day_start_eq
     env._day_start_eq[:] = day_start_eq
     env._day_high_eq[:] = day_start_eq
@@ -72,11 +77,13 @@ def _classify(env, day_start_eq, final_eq):
         # Hold equity flat until the final bar, then jump to final_eq so the
         # day's closing equity is exactly final_eq.
         target = final_eq if step == bpd - 1 else day_start_eq
+        env._balance[:] = target
         env._equity[:] = target
         env._day_high_eq[:] = torch.maximum(env._day_high_eq, env._equity)
         _s, _r, _d, last_info = env.step(_flat_action(env))
-        # step() recomputes equity from positions; with no position equity is
-        # unchanged, so re-pin it to our script for the next iteration.
+        # step() recomputes equity from balance (flat => unchanged); re-pin both to
+        # our script for the next iteration.
+        env._balance[:] = target
         env._equity[:] = target
     return last_info
 
@@ -157,7 +164,8 @@ def test_dd_breach_halts_and_blocks_new_trades():
     env.reset()
     # Drive a breach on episode 0 by collapsing its equity below peak*(1-1%).
     env._day_high_eq[:] = 10_000.0
-    env._equity[:] = 9_800.0          # 2% below peak -> breach
+    env._balance[:] = 9_800.0         # 2% below peak -> breach (realized balance)
+    env._equity[:] = 9_800.0
     buy = {"direction": torch.full((env.B,), BUY, dtype=torch.long),
            "lot_raw": torch.full((env.B,), 0.5),
            "exit": torch.zeros(env.B, dtype=torch.long)}
@@ -181,9 +189,11 @@ def test_balance_at_halt_decides_pass_even_after_breach():
     # >1% off that peak BUT still above the target, so the halt equity passes.
     env._day_start_eq[:] = 10_000.0
     env._day_high_eq[:] = 10_400.0     # peak this day
+    env._balance[:] = 10_400.0
     env._equity[:] = 10_400.0
     env._equity_prev[:] = 10_400.0
     # 10,280 is 1.15% below the 10,400 peak (breach) but >= 10,250 target.
+    env._balance[:] = 10_280.0
     env._equity[:] = 10_280.0
     _s, _r, _d, info = env.step(_flat_action(env))
     assert bool(info["day_halted"].all())          # breached + halted
@@ -197,9 +207,11 @@ def test_balance_at_halt_fails_when_under_target():
     env.reset()
     env._day_start_eq[:] = 10_000.0
     env._day_high_eq[:] = 10_100.0
+    env._balance[:] = 10_100.0
     env._equity[:] = 10_100.0
     env._equity_prev[:] = 10_100.0
-    env._equity[:] = 9_980.0           # >1% below peak (breach), under target
+    env._balance[:] = 9_980.0          # >1% below peak (breach), under target
+    env._equity[:] = 9_980.0
     _s, _r, _d, info = env.step(_flat_action(env))
     assert bool(info["day_halted"].all())
     assert bool(info["failed"].all())
@@ -212,18 +224,22 @@ def test_trailing_peak_updates_per_bar_and_resets_per_day():
     env = _free_env(account=10_000.0, bars_per_day=10)
     env.reset()
     env._day_high_eq[:] = 10_000.0
+    env._balance[:] = 10_500.0
     env._equity[:] = 10_500.0
     env.step(_flat_action(env))
     assert bool((env._day_high_eq >= 10_500.0).all())   # peak tracked the new high
     # March to the calendar day boundary; on the new day peak resets to day open.
     env.reset()
+    env._balance[:] = 10_000.0
     env._equity[:] = 10_000.0
     info = None
     for step in range(env.bars_per_day):
         if step == 2:
-            env._equity[:] = 10_700.0          # spike a peak mid-day
+            env._balance[:] = 10_700.0         # spike a peak mid-day
+            env._equity[:] = 10_700.0
         _s, _r, _d, info = env.step(_flat_action(env))
         if not info["day_closed"].any():
+            env._balance[:] = 10_000.0
             env._equity[:] = 10_000.0
     # After the boundary the live peak has been reset to the new day's opening eq,
     # not the prior day's 10,700 high.
@@ -238,6 +254,7 @@ def test_dd_peak_is_per_episode():
     env._day_high_eq[:] = 10_000.0
     eq = env._equity.clone()
     eq[0] = 10_900.0                    # only episode 0 spikes
+    env._balance[:] = eq
     env._equity[:] = eq
     env.step(_flat_action(env))
     assert env._day_high_eq[0].item() >= 10_900.0
@@ -319,12 +336,14 @@ def test_max_dd_pct_changes_breach_threshold():
     dip, two thresholds, two outcomes -> the 1% is not hardcoded."""
     dip_to = 9_850.0                     # 1.5% below a 10,000 peak
     tight = _free_env(account=10_000.0, max_dd_pct=0.01, bars_per_day=60)
-    tight.reset(); tight._day_high_eq[:] = 10_000.0; tight._equity[:] = dip_to
+    tight.reset(); tight._day_high_eq[:] = 10_000.0
+    tight._balance[:] = dip_to; tight._equity[:] = dip_to
     tight.step(_flat_action(tight))
     assert bool(tight._day_halted.all())             # 1.5% > 1% -> breach
 
     wide = _free_env(account=10_000.0, max_dd_pct=0.02, bars_per_day=60)
-    wide.reset(); wide._day_high_eq[:] = 10_000.0; wide._equity[:] = dip_to
+    wide.reset(); wide._day_high_eq[:] = 10_000.0
+    wide._balance[:] = dip_to; wide._equity[:] = dip_to
     wide.step(_flat_action(wide))
     assert not bool(wide._day_halted.any())          # 1.5% < 2% -> no breach
 
