@@ -570,6 +570,13 @@ class BatchedFTMOEnv:
         self._entry_px = torch.zeros(B, device=d)
         self._dd_breached = torch.zeros(B, dtype=torch.bool, device=d)
         self._trades_today = torch.zeros(B, dtype=torch.long, device=d)
+        # Per-day WIN / LOSS trade counters. A trade is counted the moment its PnL
+        # is REALIZED (an exit-close, an exit-reduce, or a flip that closes the old
+        # position): realized > 0 -> win, realized < 0 -> loss (exactly-flat skipped).
+        # Snapshotted on day-close like _trades_today and reported per day so the
+        # logs show won vs lost trades, not just pass/fail DAYS.
+        self._wins_today = torch.zeros(B, dtype=torch.long, device=d)
+        self._losses_today = torch.zeros(B, dtype=torch.long, device=d)
         self._done = torch.zeros(B, dtype=torch.bool, device=d)
         # PPO/day-reward state
         self._day_halted = torch.zeros(B, dtype=torch.bool, device=d)  # DD-ended day
@@ -740,6 +747,8 @@ class BatchedFTMOEnv:
         self._entry_px.zero_()
         self._dd_breached.zero_()
         self._trades_today.zero_()
+        self._wins_today.zero_()
+        self._losses_today.zero_()
         self._done.zero_()
         self._day_halted.zero_()
         self._day_passed.zero_()
@@ -1141,6 +1150,10 @@ class BatchedFTMOEnv:
         exit_realized = (do_close.float() * pnl_per_unit
                          + do_reduce.float() * pnl_per_unit * 0.5)
         self._balance = self._balance + exit_realized
+        # ── WIN / LOSS tally on this exit (close or reduce realizes PnL) ──
+        exited = do_close | do_reduce
+        self._wins_today = self._wins_today + (exited & (exit_realized > 0)).long()
+        self._losses_today = self._losses_today + (exited & (exit_realized < 0)).long()
         # ── Section 5 commission at trade CLOSE (charged on the lots being closed) ──
         # The CLOSE side of the round-trip cost is deducted here, scaled by the lots
         # actually closed (full for EXIT_CLOSE, half for EXIT_REDUCE). Agent feels
@@ -1177,6 +1190,10 @@ class BatchedFTMOEnv:
         # open new position where a non-hold action is taken
         opening = dirs != 0
         self._trades_today = self._trades_today + opening.long()
+        # ── WIN / LOSS tally when a flip closes the OLD position (realizes PnL) ──
+        flip_closed = opening & had_pos
+        self._wins_today = self._wins_today + (flip_closed & (realized > 0)).long()
+        self._losses_today = self._losses_today + (flip_closed & (realized < 0)).long()
         self._balance = self._balance + torch.where(opening, realized,
                                                   torch.zeros_like(realized))
         self._position = torch.where(opening, dirs * lots, self._position)
@@ -1281,6 +1298,8 @@ class BatchedFTMOEnv:
         new_day = (self._step_i % self.bars_per_day) == 0
         # Save trades_today BEFORE resetting — info must report the closing day's count
         trades_today_closing = self._trades_today.clone()
+        wins_today_closing = self._wins_today.clone()
+        losses_today_closing = self._losses_today.clone()
         # Snapshot the CLOSING day's gate-bar count BEFORE the new_day reset so
         # classification/reporting see the whole day's total (see root-cause note).
         gate_bars_closing = self._gate_bars_today.clone()
@@ -1303,6 +1322,10 @@ class BatchedFTMOEnv:
         self._trades_today = torch.where(new_day,
                                          torch.zeros_like(self._trades_today),
                                          self._trades_today)
+        self._wins_today = torch.where(new_day, torch.zeros_like(self._wins_today),
+                                       self._wins_today)
+        self._losses_today = torch.where(new_day, torch.zeros_like(self._losses_today),
+                                         self._losses_today)
         # new day clears the intraday DD halt (fresh trading day, FTMO CEST)
         self._day_halted = torch.where(new_day, torch.zeros_like(self._day_halted),
                                        self._day_halted)
@@ -1661,6 +1684,9 @@ class BatchedFTMOEnv:
             "survival":    survival.detach(),
             "dd_breached": self._dd_breached.detach(),
             "trades_today": trades_today_closing.detach(),
+            # WON / LOST trades for the CLOSING day (realized-PnL count, not days).
+            "wins_today": wins_today_closing.detach(),
+            "losses_today": losses_today_closing.detach(),
             "pass_no_breach": pass_no_breach.detach(),
             "day_closed": day_closed.detach(),
             "day_halted": self._day_halted.detach(),

@@ -266,10 +266,15 @@ def _aggregate_day(info: dict, closed: "torch.Tensor") -> dict:
     # so the invariant holds even if a caller omits it.
     failed = info["failed"][idx].bool() if "failed" in info else (~passed)
     trades = info["trades_today"][idx].long()
+    # WON / LOST trades summed across the batch's closing day (realized-PnL count).
+    wins = info["wins_today"][idx].long() if "wins_today" in info else None
+    losses = info["losses_today"][idx].long() if "losses_today" in info else None
 
     n = int(idx.numel())
     n_pass = int(passed.sum().item())
     n_fail = int(failed.sum().item())
+    total_wins = int(wins.sum().item()) if wins is not None else 0
+    total_losses = int(losses.sum().item()) if losses is not None else 0
 
     eq = info["equity"][idx].float()
     day_start = info.get("day_start_eq", info["equity"])[idx].float() \
@@ -281,6 +286,11 @@ def _aggregate_day(info: dict, closed: "torch.Tensor") -> dict:
         "median_pnl": float(day_pnl.median().item()) if n else 0.0,
         "mean_eq": float(eq.mean().item()) if n else 0.0,
         "mean_tr": float(trades.float().mean().item()) if n else 0.0,
+        # Total WON / LOST trades across the batch this day + the batch win rate.
+        "wins": total_wins,
+        "losses": total_losses,
+        "win_rate": (total_wins / (total_wins + total_losses))
+        if (total_wins + total_losses) > 0 else 0.0,
         # Headline bubble: 🟢 only when the batch PASSED on balance (more passes
         # than fails AND at least one pass), else 🔴 — a glanceable left-edge
         # pass progression. (Per-episode is already strictly binary.)
@@ -308,6 +318,8 @@ def _print_daily_results(phase: dict, day_num: int, agg: dict, streak: int):
         f"   equity {agg['mean_eq']:>12,.2f}"
         f"   streak {streak:>3}"
         f"   trades {agg['mean_tr']:>5.1f}"
+        f"   W:{agg.get('wins', 0):>4} L:{agg.get('losses', 0):>4}"
+        f" ({agg.get('win_rate', 0.0)*100:>4.1f}% win)"
         f"   (P:{agg['pass']:>2} F:{agg['fail']:>2})"
         f"   phase {phase['name']}",
         flush=True,
