@@ -1611,6 +1611,22 @@ class BatchedFTMOEnv:
         day_reward = tier_reward + streak_reward + giveback
         reward = reward + day_closed.float() * day_reward
 
+        # ════════════════════════════════════════════════════════════════════
+        # REWARD SAFETY NET (self-healing) — sanitize + clamp the final reward.
+        # Every term above is designed to be O(1) percent-of-equity, but if the
+        # net ever emits a bad action / equity goes non-finite (e.g. after a
+        # transient numerical hiccup), an unbounded reward would feed straight
+        # into PPO and blow up the value loss. We:
+        #   (1) replace any NaN/Inf reward with 0.0 (a neutral step), and
+        #   (2) hard-clamp the per-step reward into [-REWARD_CLIP, +REWARD_CLIP].
+        # REWARD_CLIP defaults to 10.0 (a whole well-played day is only a few
+        # units, so this never touches legitimate rewards) and is config-driven.
+        # This makes a single bad bar a no-op instead of a training-killer.
+        # ════════════════════════════════════════════════════════════════════
+        reward = torch.nan_to_num(reward, nan=0.0, posinf=0.0, neginf=0.0)
+        reward_clip = float(self.cfg.get("REWARD_CLIP", 10.0))
+        reward = reward.clamp(min=-reward_clip, max=reward_clip)
+
         # Advance the GLOBAL day index on the calendar new-day boundary only
         # (every bars_per_day bars, synchronized across all episodes). A DD-halt
         # closes an episode's day early for classification but does NOT advance

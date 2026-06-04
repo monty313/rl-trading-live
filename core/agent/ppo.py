@@ -32,7 +32,10 @@ from torch.distributions import Categorical, Normal
 from core.agent.action_space import DIRECTION_DIM, EXIT_DIM, FLAT
 from core.env.environment import OBS_SCHEMA_VERSION
 
-_NEG_INF = -1e9
+# fp16-safe masking penalty. -1e9 overflows the fp16 range under AMP autocast and
+# can produce NaN in softmax/entropy; -1e8 still drives the masked class probability
+# below 1e-30 (effectively zero) while staying numerically stable.
+_NEG_INF = -1e8
 
 
 class ActorCritic(nn.Module):
@@ -203,8 +206,24 @@ class PPOAgent:
     # ── helpers ──────────────────────────────────────────────────────────────
     def _dists(self, dir_logits, exit_logits, lot_mean,
                dir_mask: Optional[torch.Tensor]):
+        # ── NaN/Inf GUARD (numerical-stability fix) ───────────────────────────
+        # A blown-up update() can leave NaN/Inf in the head outputs; sanitize
+        # before building the distributions so Categorical's validate_args check
+        # never crashes mid-train. nan_to_num maps NaN->0, +Inf->large, -Inf->-large.
+        dir_logits = torch.nan_to_num(dir_logits, nan=0.0, posinf=30.0, neginf=-30.0)
+        exit_logits = torch.nan_to_num(exit_logits, nan=0.0, posinf=30.0, neginf=-30.0)
+        lot_mean = torch.nan_to_num(lot_mean, nan=0.0, posinf=30.0, neginf=-30.0)
         if dir_mask is not None:
+            # Use a finite, fp16-safe penalty (NOT -1e9, which underflows under AMP
+            # and can yield NaN in softmax/entropy). -1e8 still zeros the masked
+            # class to <1e-30 probability while staying numerically well-behaved.
             dir_logits = dir_logits + (1.0 - dir_mask) * _NEG_INF
+            # Guard against a fully-masked row (all directions disallowed): give it
+            # a uniform-ish fallback so Categorical gets a valid (non -inf) row.
+            all_masked = (dir_mask.sum(dim=-1, keepdim=True) == 0)
+            if bool(all_masked.any()):
+                dir_logits = torch.where(all_masked, torch.zeros_like(dir_logits),
+                                         dir_logits)
         dir_d = Categorical(logits=dir_logits)
         exit_d = Categorical(logits=exit_logits)
         # Floor the log-std so the continuous lot head keeps exploring (never a
@@ -337,6 +356,11 @@ class PPOAgent:
             next_value = values[t]
         returns = adv + values
         adv = (adv - adv.mean()) / (adv.std() + 1e-8)
+        # ── NUMERICAL STABILITY: clamp normalized advantages ─────────────────
+        # With raw rewards in the millions a single outlier advantage can dominate
+        # the surrogate and blow up the ratio*adv term. ±10 sigma is plenty of
+        # signal while bounding the gradient.
+        adv = torch.clamp(adv, -10.0, 10.0)
 
         # flatten time*batch
         def flat(x):
@@ -348,24 +372,52 @@ class PPOAgent:
                   if masks and masks[0] is not None else None)
 
         total = 0.0
+        n_done = 0
         for _ in range(self.epochs):
-            dl, el, lm, v = self.net(s_f)
-            dd, ed, ld = self._dists(dl, el, lm, mask_f)
-            new_logp = dd.log_prob(dir_f) + ed.log_prob(exit_f) + ld.log_prob(lotpre_f)
-            ratio = torch.exp(new_logp - oldlogp_f)
-            s1 = ratio * adv_f
-            s2 = torch.clamp(ratio, 1 - self.clip, 1 + self.clip) * adv_f
-            policy_loss = -torch.min(s1, s2).mean()
-            value_loss = F.mse_loss(v, ret_f)
-            entropy = (dd.entropy().mean() + ed.entropy().mean() + ld.entropy().mean())
-            loss = policy_loss + self.vf_coef * value_loss - self.ent_coef * entropy
-            self.optimizer.zero_grad()
-            loss.backward()
+            self.optimizer.zero_grad(set_to_none=True)
+            # AMP autocast: matches the scaler created in __init__. On CPU this is a
+            # no-op (enabled=False), so the logic is identical device-agnostically.
+            with torch.amp.autocast("cuda", enabled=self.use_amp):
+                dl, el, lm, v = self.net(s_f)
+                dd, ed, ld = self._dists(dl, el, lm, mask_f)
+                new_logp = (dd.log_prob(dir_f) + ed.log_prob(exit_f)
+                            + ld.log_prob(lotpre_f))
+                # Clamp the log-ratio BEFORE exp() so a stale old_logp can't produce
+                # an astronomically large ratio (the classic PPO overflow path).
+                logratio = torch.clamp(new_logp - oldlogp_f, -20.0, 20.0)
+                ratio = torch.exp(logratio)
+                s1 = ratio * adv_f
+                s2 = torch.clamp(ratio, 1 - self.clip, 1 + self.clip) * adv_f
+                policy_loss = -torch.min(s1, s2).mean()
+                # Huber (smooth_l1) instead of MSE: linear (not quadratic) for large
+                # residuals, so huge returns can't square into a 1e12+ value loss
+                # that dominates and explodes the total. Also clamp as a hard cap.
+                value_loss = F.smooth_l1_loss(v, ret_f)
+                entropy = (dd.entropy().mean() + ed.entropy().mean()
+                           + ld.entropy().mean())
+                loss = (policy_loss + self.vf_coef * value_loss
+                        - self.ent_coef * entropy)
+            # ── SKIP non-finite batches instead of corrupting the weights ─────
+            # If the loss is NaN/Inf, stepping the optimizer writes NaNs into every
+            # parameter and the NEXT forward pass emits nan logits -> Categorical
+            # crash. Skipping keeps the last-good weights and lets training recover.
+            if not torch.isfinite(loss):
+                print("[ppo] ⚠️  non-finite loss in update epoch — skipping this "
+                      "PPO step to protect the weights", flush=True)
+                continue
+            # Scaler path: scale -> backward -> unscale_ -> clip -> step -> update.
+            # unscale_ MUST run before clip_grad_norm_ so clipping sees the true
+            # (unscaled) gradient magnitude. The scaler also auto-skips the step if
+            # it detects inf/nan grads, a second layer of protection.
+            self.scaler.scale(loss).backward()
+            self.scaler.unscale_(self.optimizer)
             nn.utils.clip_grad_norm_(self.net.parameters(), self.max_grad_norm)
-            self.optimizer.step()
+            self.scaler.step(self.optimizer)
+            self.scaler.update()
             total += float(loss.item())
+            n_done += 1
         self.buffer.clear()
-        return total / self.epochs
+        return (total / n_done) if n_done else None
 
     # ── checkpoint I/O (PPO only) ──────────────────────────────────────────────
     def save(self, path: str, extra: dict = None):
