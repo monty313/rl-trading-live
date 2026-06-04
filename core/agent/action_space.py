@@ -59,6 +59,32 @@ def map_lot(raw: float, max_lot: float, min_lot: float = MIN_LOT) -> float:
     return round(lot, 2)
 
 
+def map_lot_curriculum(raw: float, lot_lo: float, lot_hi: float,
+                       lot_scale: float = 1.0) -> float:
+    """Map a raw policy scalar in [0,1] onto the Section-8 CURRICULUM window
+    [lot_lo, lot_hi], then apply the item-6 proportional `lot_scale`.
+
+    SINGLE SOURCE OF TRUTH for lot sizing (S6 zero-drift): the training env's
+    BatchedFTMOEnv._map_lot_curriculum and the live LiveRunner.step_bar BOTH route
+    through this identical formula so the same (raw, window) produces the same lot
+    bit-for-bit in training and live. Previously live used the full-head map_lot()
+    while training used the curriculum window — a silent size drift where the same
+    policy output meant a different live lot than what it was trained to size.
+
+      curriculum lot = lot_lo + raw*(lot_hi - lot_lo)        (env hot path)
+      then scaled    = round(clamp(curriculum * lot_scale, lot_lo*scale?..), 2)
+
+    The proportional scaler resizes EXPOSURE only (never direction/exit); it is
+    1.0 at the trained baseline. Result is clamped to [MIN_LOT, lot_hi*scale ceiling
+    is NOT imposed here] then rounded to MT5's 0.01 step. lot_lo<=lot_hi assumed
+    (env guarantees it via _refresh_lot_window)."""
+    raw = max(0.0, min(1.0, float(raw)))
+    lot = float(lot_lo) + raw * (float(lot_hi) - float(lot_lo))
+    lot = lot * float(lot_scale)
+    lot = max(MIN_LOT, lot)
+    return round(lot, 2)
+
+
 def describe(direction: int, lot_raw: float, exit_act: int, max_lot: float = 2.0
              ) -> dict:
     """Human-readable expansion of a structured PPO action (dashboard/Jordan)."""

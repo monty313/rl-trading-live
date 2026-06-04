@@ -207,6 +207,16 @@ class CheckpointManager:
         # sort by phi ascending; delete the lowest-Φ ones beyond `keep`
         phase_files.sort(key=lambda kv: kv[1].get("phi", 0.0))
         to_delete = phase_files[:len(phase_files) - keep]
+        # SAFETY (HARD RULE 8): never let pruning delete the LAST non-corrupt file
+        # for this phase. Count the good files that would SURVIVE pruning (kept
+        # phase files + any protected/other-phase good file); if deleting `to_delete`
+        # would leave zero good checkpoints anywhere, refuse the riskiest delete.
+        good_total = sum(
+            1 for n, m in cks.items()
+            if not m.get("corrupt") and (self.checkpoint_dir / n).exists())
+        if good_total - len(to_delete) < 1:
+            # keep at least the single highest-Φ file we were about to remove
+            to_delete = to_delete[:max(0, good_total - 1)]
         for name, meta in to_delete:
             path = self.checkpoint_dir / name
             try:

@@ -56,8 +56,8 @@ import torch
 
 import pandas as pd
 
-from core.agent.action_space import (DIRECTION_DIM, FLAT, BUY, SELL, HOLD,
-                                     EXIT_REDUCE, EXIT_CLOSE, map_lot)
+from core.agent.action_space import (DIRECTION_DIM, EXIT_DIM, FLAT, BUY, SELL,
+                                     HOLD, EXIT_REDUCE, EXIT_CLOSE, map_lot)
 from core.env.indicators import (build_feature_matrix, NUM_FEATURES, COL,
                                  feature_row_dict, compute_indicators,
                                  resample_ohlcv)
@@ -1030,6 +1030,25 @@ class BatchedFTMOEnv:
         exit_a = actions.get("exit")
         exit_a = (exit_a.to(self.device).long() if exit_a is not None
                   else torch.zeros(self.B, dtype=torch.long, device=self.device))
+
+        # ── S6 LOUD ACTION VALIDATION (reject, never silently zero-lot) ──────────
+        # The old code mapped only {BUY,SELL} to a side and left ANY other direction
+        # code as 0 (flat) — a silent zero-trade for a corrupted/out-of-range action.
+        # The action contract is direction∈{FLAT,BUY,SELL}, exit∈{HOLD,REDUCE,CLOSE},
+        # lot_raw∈[0,1] finite. A violation is a programming error upstream, so we
+        # FAIL FAST with a clear message instead of masking it as a no-op day.
+        if not bool(((direction >= 0) & (direction < DIRECTION_DIM)).all().item()):
+            bad = direction[(direction < 0) | (direction >= DIRECTION_DIM)]
+            raise ValueError(
+                f"invalid direction code(s) {bad.tolist()} — must be in "
+                f"[0,{DIRECTION_DIM}) {{FLAT,BUY,SELL}} (silent zero-lot rejected)")
+        if not bool(((exit_a >= 0) & (exit_a < EXIT_DIM)).all().item()):
+            bad = exit_a[(exit_a < 0) | (exit_a >= EXIT_DIM)]
+            raise ValueError(
+                f"invalid exit code(s) {bad.tolist()} — must be in "
+                f"[0,{EXIT_DIM}) {{HOLD,REDUCE,CLOSE}}")
+        if not bool(torch.isfinite(lot_raw).all().item()):
+            raise ValueError("lot_raw contains non-finite values (NaN/Inf)")
 
         abs_idx = self._abs_idx()
         close = self.features[abs_idx, COL["close"]]

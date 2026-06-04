@@ -113,6 +113,21 @@ def _load_phases(repo_root: str) -> list:
     return sorted(phases, key=lambda p: p.get("order", 0))
 
 
+def _append_metrics(metrics_dir: str, row: dict):
+    """S7 CONTINUOUS METRICS: append one JSON line per episode to
+    {metrics_dir}/metrics.jsonl. Append-only so a crash never loses prior rows
+    and the full learning curve is reconstructable post-hoc (the console one-liner
+    is ephemeral). Best-effort: a metrics-write failure must never kill training."""
+    try:
+        os.makedirs(metrics_dir, exist_ok=True)
+        row = dict(row)
+        row.setdefault("timestamp", time.strftime("%Y-%m-%dT%H:%M:%S"))
+        with open(os.path.join(metrics_dir, "metrics.jsonl"), "a") as f:
+            f.write(json.dumps(row) + "\n")
+    except Exception:                                      # pragma: no cover
+        pass
+
+
 def _write_heartbeat(metrics_dir: str, episode: int, phase: str, status="running"):
     os.makedirs(metrics_dir, exist_ok=True)
     payload = {"timestamp": time.strftime("%Y-%m-%dT%H:%M:%S"),
@@ -321,11 +336,34 @@ def _phi_metric(pass_rate: float, avg_ret: float, avg_dd: float,
 
 def train(args) -> int:
     repo_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    # ── S7 SEED REPRODUCIBILITY ──────────────────────────────────────────────
+    # Seed BEFORE any model/env construction so weight init + rollout sampling are
+    # reproducible under a fixed --seed. No-op when --seed is omitted (free run).
+    if getattr(args, "seed", None) is not None:
+        from core.seeding import set_global_seed
+        set_global_seed(int(args.seed))
+        print(f"[seed] global RNG seeded to {int(args.seed)} (reproducible run)",
+              flush=True)
     device = get_device()
     cfg = auto_tune_batch(dict(CFG), device)
     cfg["DATA_CSV_EURUSD"] = args.csv
     cfg["TRADE_LOG"] = os.path.join(args.metrics_dir or "logs", "daily_trade_log.csv")
     cfg["CHECKPOINT_DIR"] = args.checkpoint_dir   # default feature-cache location
+    # ── SECTION 11 — AUTO-LOAD tuned hyperparameters (Optuna) ────────────────
+    # If a prior `python -m training.hyperopt` sweep wrote best_hyperparams.json
+    # into the checkpoint dir, apply it BEFORE the pipeline is built so training
+    # uses the tuned PPO knobs. Opt out with --no-autoload-hyperparams. Guarded so
+    # a missing optuna install never blocks training.
+    if not getattr(args, "no_autoload_hyperparams", False):
+        try:
+            from training.hyperopt import load_best_params, apply_params_to_cfg
+            _best = load_best_params(args.checkpoint_dir)
+            if _best:
+                cfg = apply_params_to_cfg(cfg, _best)
+                print(f"[hyperopt] auto-loaded best_hyperparams.json: {_best}",
+                      flush=True)
+        except Exception as _e:                       # pragma: no cover
+            print(f"[hyperopt] skipped auto-load ({_e})", flush=True)
     # ── ACCOUNT SIZE (learning_loop_fix.md FIX 3): --account-size overrides the
     # default $10,000. Targets/limits stay percent-based; reward is normalized.
     if getattr(args, "account_size", None):
@@ -684,6 +722,18 @@ def train(args) -> int:
                 flush=True,
             )
 
+            # S7: append the per-episode metrics row (append-only, crash-safe).
+            _append_metrics(args.metrics_dir or "logs", {
+                "episode": global_ep, "phase": phase["name"],
+                "pass_rate": float(pass_rate), "pass_streak": int(pass_streak),
+                "equity": float(eq_now), "ep_return_pct": float(ep_ret),
+                "reward": float(ep_total_reward),
+                "gate_pct": float(gate_pct),
+                "loss": (float(loss) if loss is not None else None),
+                "phi": float(run_phi), "best_phi": float(best_phi),
+                "new_best": bool(new_best),
+            })
+
             if global_ep % cfg["CHECKPOINT_EVERY"] == 0:
                 ckpt_mgr.save(agent, phase["name"], global_ep, phi=best_phi,
                               pass_rate=pass_rate)
@@ -906,6 +956,13 @@ def main() -> int:
                     help="Directory of params_snapshot_*.json files to match this "
                          "run against (PART 1 results writer). Defaults to "
                          "CFG['SNAPSHOT_DIR'] when omitted.")
+    ap.add_argument("--seed", type=int, default=None,
+                    help="Global RNG seed (random/numpy/torch). Fixing it makes a "
+                         "run reproducible for identical data+config. Omit for a "
+                         "non-seeded run.")
+    ap.add_argument("--no-autoload-hyperparams", action="store_true",
+                    help="Do NOT auto-apply best_hyperparams.json (Optuna sweep "
+                         "output) from the checkpoint dir. Default: auto-load it.")
     try:
         return train(ap.parse_args())
     except Exception as exc:

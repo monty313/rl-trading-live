@@ -130,6 +130,11 @@ class PPOAgent:
         self._ent_anneal_on = bool(cfg.get("ENTROPY_ANNEAL_ENABLED", True))
         self._ent_start = float(cfg.get("ENTROPY_START_COEF", self.ent_coef))
         self._ent_anneal_eps = max(1, int(cfg.get("ENTROPY_ANNEAL_EPISODES", 20)))
+        # Section 9 (S11): the anneal SHAPE. SMOOTH by default — "cosine" (half-cosine
+        # ease, slow at both ends) or "exp" (geometric decay). "linear" is kept for
+        # back-compat. A step schedule is deliberately NOT offered: a discontinuous
+        # entropy jump destabilizes the policy gradient. Config-driven, nothing hardcoded.
+        self._ent_shape = str(cfg.get("ENTROPY_ANNEAL_SHAPE", "cosine")).lower()
         if self._ent_anneal_on:
             self.ent_coef = self._ent_start          # begin high at episode 0
         self.vf_coef = float(ppo.get("vf_coef", 0.5))
@@ -170,17 +175,29 @@ class PPOAgent:
                 self._fwd = self.net
 
     def anneal_entropy(self, episode: int) -> float:
-        """Section 9: linearly anneal the LIVE entropy coefficient from
+        """Section 9 (S11): SMOOTHLY anneal the LIVE entropy coefficient from
         ENTROPY_START_COEF (episode 0) down to the stable PPO ent_coef by episode
         ENTROPY_ANNEAL_EPISODES, then hold it EXACTLY at the stable value (no
-        residual perturbation). No-op (returns the stable coef) when annealing is
-        disabled. Call once per episode before/after the rollout. Returns the
-        coefficient now in force."""
+        residual perturbation). The schedule shape is ENTROPY_ANNEAL_SHAPE:
+          • "cosine" (default) — half-cosine ease: c = stable + (start-stable)*0.5*
+            (1+cos(pi*frac)); slow near both endpoints, smooth everywhere.
+          • "exp" — geometric decay: c = start*(stable/start)**frac (start,stable>0).
+          • "linear" — straight interpolation (legacy).
+        No step schedule (a discontinuous jump destabilizes the gradient). No-op
+        (returns the stable coef) when annealing is disabled. Call once per episode.
+        Returns the coefficient now in force."""
         if not self._ent_anneal_on:
             self.ent_coef = self.ent_coef_stable
             return self.ent_coef
         frac = min(1.0, max(0.0, episode / self._ent_anneal_eps))
-        self.ent_coef = self._ent_start + frac * (self.ent_coef_stable - self._ent_start)
+        start, stable = self._ent_start, self.ent_coef_stable
+        if self._ent_shape == "cosine":
+            import math
+            self.ent_coef = stable + (start - stable) * 0.5 * (1.0 + math.cos(math.pi * frac))
+        elif self._ent_shape == "exp" and start > 0 and stable > 0:
+            self.ent_coef = start * (stable / start) ** frac
+        else:                                   # "linear" / fallback
+            self.ent_coef = start + frac * (stable - start)
         return self.ent_coef
 
     # ── helpers ──────────────────────────────────────────────────────────────
@@ -376,7 +393,32 @@ class PPOAgent:
                    "trained_max_dd_pct": trained_dd}
         if extra:
             payload.update(extra)
-        torch.save(payload, path)
+        # ── S7 ATOMIC WRITE (crash-safe checkpoint) ──────────────────────────────
+        # Write to a unique temp file in the SAME directory, flush+fsync to disk,
+        # then os.replace() — an atomic rename on POSIX and Windows. A crash (or an
+        # out-of-disk) mid-write leaves the temp file, never a half-written/corrupt
+        # `path`, so the resume path always finds either the old good file or the
+        # complete new one. Previously torch.save wrote `path` in place: a crash
+        # during the write truncated the live checkpoint and the next resume loaded
+        # a corrupt file (caught only after the fact by CheckpointManager.verify_all).
+        import os as _os, tempfile as _tempfile
+        path = str(path)
+        d = _os.path.dirname(path) or "."
+        _os.makedirs(d, exist_ok=True)
+        fd, tmp = _tempfile.mkstemp(prefix=".ckpt_", suffix=".tmp", dir=d)
+        _os.close(fd)
+        try:
+            with open(tmp, "wb") as f:
+                torch.save(payload, f)
+                f.flush()
+                _os.fsync(f.fileno())
+            _os.replace(tmp, path)        # atomic swap into place
+        finally:
+            if _os.path.exists(tmp):
+                try:
+                    _os.remove(tmp)
+                except OSError:            # pragma: no cover
+                    pass
 
     def load(self, path: str, partial: bool = False) -> dict:
         """Load a checkpoint. Detects an OBSERVATION-SCHEMA mismatch (the input
