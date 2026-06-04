@@ -59,6 +59,13 @@ faiss-cpu>=1.9.0
 # Colab. <0.7 guards against an unvetted future major.
 TA-Lib>=0.6.7,<0.7
 
+# Interpretability — SHAP is OPTIONAL and post-hoc only (NEVER imported by the
+# training loop). core/interpret/shap_explain.py import-guards it via
+# shap_available(), so training/CI without this wheel keeps working. Uncomment
+# (or `pip install shap`) only to run the SHAP cell in the interpretability
+# notebook; saliency/action-dist/policy-report all run WITHOUT it.
+# shap>=0.44,<0.50
+
 # Test + lint
 pytest>=8.0,<9.0
 pytest-cov>=5.0,<6.0

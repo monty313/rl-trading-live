@@ -446,4 +446,34 @@ CFG = {
     "SHAPE_WARMUP":  0,      # Section 4.1: phi active from episode 1 (was 150)
     "WEEKLY_BONUS":  0.02,    # weekly_consistency_bonus when 7-day pass rate improves
     "PASS_NO_BREACH_BONUS": 0.01,   # bonus when target hit AND no DD breach
+
+    # ══════════════════════════════════════════════════════════════════════════
+    # INTERPRETABILITY + DASHBOARD I/O (post-hoc only — ZERO training-loop cost
+    # except the cheap action-distribution logger below, which is toggleable).
+    # ──────────────────────────────────────────────────────────────────────────
+    # Where the Colab "💾 Save Snapshot" cell writes params snapshots + the master
+    # snapshot_log.json, and where the training results writer (PART 1) looks them
+    # up by params_hash to append a results block. Config-driven (never hardcoded
+    # downstream) so a non-Colab run can point it at a local dir. The default mirrors
+    # the spec's Drive path; tests override it with a tmp dir.
+    "SNAPSHOT_DIR":  "/content/drive/MyDrive/snapshots/params",
+
+    # ── ACTION-DISTRIBUTION LOGGER (PART 3) ──────────────────────────────────
+    # Lightweight, NO SHAP: every LOG_ACTION_DIST_EVERY rollout steps the train
+    # loop appends the current batch's mean action-prob distribution + market state
+    # to {metrics_dir}/action_distributions.csv. Toggleable + interval-configurable
+    # so it has negligible overhead and can be turned off entirely. The optional
+    # per-N-episode "shift" print is gated by LOG_ACTION_DIST_EPISODE_SUMMARY.
+    "LOG_ACTION_DIST":            True,   # master toggle for the CSV logger
+    "LOG_ACTION_DIST_EVERY":      100,    # rollout steps between CSV rows
+    "LOG_ACTION_DIST_EPISODE_SUMMARY": True,   # print the per-episode shift line
+
+    # ── SHAP (PART 2/6) — post-hoc, OPTIONAL, import-guarded ─────────────────
+    # RUN_SHAP gates the (slow, ~60-120s) SHAP pass in the interpretability cell;
+    # default OFF so Run-All stays fast. SHAP background/explain sample sizes are
+    # config-driven (200-500 bg, <=500 explained) per the spec. The always-on fast
+    # path (saliency -> action-dist -> report) never reads these.
+    "RUN_SHAP":               False,
+    "SHAP_BACKGROUND_SAMPLES": 256,   # background obs for GradientExplainer (200-500)
+    "SHAP_EXPLAIN_SAMPLES":    200,   # obs explained per head (<=500)
 }

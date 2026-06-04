@@ -80,6 +80,30 @@ from core.pipeline import (build_pipeline, load_ohlcv_csv,  # noqa: E402
 from core.reward.shaper import EpisodeRewardShaper  # noqa: E402
 from training.checkpoint_manager import CheckpointManager  # noqa: E402
 from training.eval_loop import run_eval  # noqa: E402
+# Post-hoc interpretability + provenance helpers. The action-distribution logger
+# is the ONLY one used inside the rollout (lightweight, no SHAP, toggleable); the
+# results writer runs once at end-of-training / interrupt. SHAP is never imported
+# here — it lives only in core/interpret/shap_explain.py for the post-hoc cell.
+from core.interpret import action_logger  # noqa: E402
+from core.interpret.results_writer import record_training_results  # noqa: E402
+
+
+def _run_params_from_cfg(cfg: dict) -> dict:
+    """Reconstruct the dashboard PARAMS dict from the EFFECTIVE training cfg so the
+    results writer (PART 1) can match this run to its saved params snapshot by the
+    SAME md5[:8] hash. Uses the dashboard's widget spec defaults and overlays the
+    cfg values the run actually used (FTMO target/DD/account, reward weights, etc.).
+    Kept here (not in the hot loop) so it costs nothing during training."""
+    from core.interpret.dashboard_utils import build_params, widget_specs
+    rw = cfg.get("REWARD", {}) or {}
+    values = {}
+    for key, spec in widget_specs().items():
+        if spec.get("reward"):
+            if key in rw:
+                values[key] = rw[key]
+        elif key in cfg:
+            values[key] = cfg[key]
+    return build_params(values)
 
 
 def _load_phases(repo_root: str) -> list:
@@ -281,6 +305,25 @@ def train(args) -> int:
     pass_streak = 0
     target_pct = float(cfg.get("DAILY_TARGET_PCT", 0.025))
     max_dd_pct = float(cfg.get("DAILY_MAX_DD_PCT", 0.010))
+
+    # ── PART 1 RESULTS TRACKING (cheap scalars updated as we go) ─────────────
+    # These feed record_training_results() at end-of-training AND on a graceful
+    # interrupt (KeyboardInterrupt). They are plain Python numbers updated in the
+    # loop so the writer always has the LATEST values — even a partial run yields
+    # honest metrics. `run_metrics` is read by main()'s finally/except path.
+    run_metrics = {"pass_rate": 0.0, "best_phi": best_phi, "episodes_trained": 0,
+                   "final_equity": float(resolve_initial_equity(cfg)),
+                   "best_streak": 0, "dd_efficiency_avg": 0.0,
+                   "phase_reached": (phases[start_idx]["name"] if phases else "n/a"),
+                   "_dd_eff_sum": 0.0, "_dd_eff_n": 0}
+    cfg["_RUN_METRICS"] = run_metrics            # so main() can read partial state
+    # ── PART 3 ACTION-DISTRIBUTION LOGGER (lightweight, toggleable) ──────────
+    log_action_dist = bool(cfg.get("LOG_ACTION_DIST", True))
+    action_dist_every = int(cfg.get("LOG_ACTION_DIST_EVERY", 100))
+    action_dist_csv = os.path.join(args.metrics_dir or "logs",
+                                   "action_distributions.csv")
+    episode_summary = bool(cfg.get("LOG_ACTION_DIST_EPISODE_SUMMARY", True))
+    _first_dist = {"d": None}                    # first logged dist (for shift line)
     # Section 11 — strategy-phase gate: advance to the next phase once an episode
     # reaches this many consecutive passing DAYS (config-driven; CLI override).
     phase_advance_streak = int(
@@ -330,6 +373,31 @@ def train(args) -> int:
                 out = agent.select_actions(state, mask=mask)
                 next_state, reward, done, info = env.step(out)
                 agent.store(state, out, reward, done, mask)
+
+                # ── PART 3: action-distribution logging (no extra forward pass —
+                # we re-read the head logits from the SAME state under no_grad, then
+                # write a compact CSV row every action_dist_every steps. Guarded so
+                # any failure can't disturb training; toggle via LOG_ACTION_DIST). ──
+                if log_action_dist and (steps % action_dist_every == 0):
+                    try:
+                        with torch.no_grad():
+                            dl, el, lm, _v = agent._fwd(state)
+                        dist = action_logger.action_distribution(
+                            dl, el, torch.sigmoid(lm.squeeze(-1)))
+                        if _first_dist["d"] is None:
+                            _first_dist["d"] = dist
+                        # market-state columns (batch means) the row correlates with
+                        eq_mean = float(env._equity.mean().item())
+                        dd_budget = float(info["daily_dd"].mean().item()) \
+                            if "daily_dd" in info else 0.0
+                        cest = time.strftime("%H:%M:%S")
+                        action_logger.append_row(
+                            action_dist_csv, dist, bar_index=steps, cest_time=cest,
+                            equity=eq_mean, streak=pass_streak,
+                            dd_budget_remaining=max(0.0, max_dd_pct - dd_budget))
+                    except Exception:
+                        pass
+
                 state = next_state
                 steps += 1
                 ep_total_reward += float(reward.mean().item())
@@ -415,6 +483,33 @@ def train(args) -> int:
 
             eq_now = float(env._equity.mean().item())
             ep_ret = (eq_now - env.initial_equity) / (env.initial_equity + 1e-9) * 100
+
+            # ── PART 1: refresh the live results metrics after each episode so a
+            # graceful interrupt always has the latest honest numbers. ──
+            run_metrics["episodes_trained"] = global_ep
+            run_metrics["pass_rate"] = float(pass_rate)
+            run_metrics["best_phi"] = float(best_phi)
+            run_metrics["final_equity"] = float(eq_now)
+            run_metrics["best_streak"] = max(int(run_metrics["best_streak"]),
+                                             int(ep_best_streak), int(pass_streak))
+            run_metrics["phase_reached"] = phase["name"]
+            if ep_dd_eff_n:
+                run_metrics["_dd_eff_sum"] += ep_dd_eff_sum
+                run_metrics["_dd_eff_n"] += ep_dd_eff_n
+                run_metrics["dd_efficiency_avg"] = (
+                    run_metrics["_dd_eff_sum"] / max(run_metrics["_dd_eff_n"], 1))
+            # ── PART 3: optional per-episode action-mix SHIFT line ──
+            if (episode_summary and log_action_dist and _first_dist["d"] is not None):
+                try:
+                    with torch.no_grad():
+                        dl, el, lm, _v = agent._fwd(state)
+                    latest = action_logger.action_distribution(
+                        dl, el, torch.sigmoid(lm.squeeze(-1)))
+                    print(f"  📊 action mix  {action_logger.format_shift(_first_dist['d'], latest)}",
+                          flush=True)
+                except Exception:
+                    pass
+
             loss_str = f"  loss {loss:.4f}" if loss is not None else ""
             gate_pct = ep_gate_bars / max(steps, 1) * 100
             print(
@@ -464,17 +559,45 @@ def train(args) -> int:
                               pass_rate=pass_rate)
                 break
 
-    # Numbered phases (order < 999), then the infinite live_improve phase.
-    for phase in phases:
-        if phase.get("order", 0) >= 999 or phase.get("max_episodes") == -1:
-            continue
-        print(f"[train] === PHASE {phase['name']} ===", flush=True)
-        run_phase(phase, infinite=False)
+    # ── PART 1: write the training results block to the matching params snapshot
+    # at end-of-training AND on a graceful interrupt (KeyboardInterrupt/SIGTERM).
+    # The metrics dict is the live `run_metrics` (latest honest values, partial on
+    # interrupt). Matching is by params_hash over the run's effective config so the
+    # Compare panel can attach these results to the saved snapshot. Crash-safe. ──
+    def _finalize_results(interrupted: bool):
+        metrics = {
+            "pass_rate": run_metrics["pass_rate"],
+            "best_phi": run_metrics["best_phi"],
+            "episodes_trained": run_metrics["episodes_trained"],
+            "final_equity": run_metrics["final_equity"],
+            "best_streak": run_metrics["best_streak"],
+            "dd_efficiency_avg": run_metrics["dd_efficiency_avg"],
+            "phase_reached": run_metrics["phase_reached"],
+            "timestamp_completed": time.strftime("%Y-%m-%dT%H:%M:%S"),
+            "interrupted": interrupted,
+        }
+        snap_dir = getattr(args, "snapshot_dir", None) or cfg.get("SNAPSHOT_DIR")
+        record_training_results(cfg, _run_params_from_cfg(cfg), metrics,
+                                snapshot_dir=snap_dir)
 
-    live = next((p for p in phases if p.get("max_episodes") == -1), None)
-    if live is not None:
-        print("[train] === LIVE_IMPROVE (infinite) ===", flush=True)
-        run_phase(live, infinite=True)
+    try:
+        # Numbered phases (order < 999), then the infinite live_improve phase.
+        for phase in phases:
+            if phase.get("order", 0) >= 999 or phase.get("max_episodes") == -1:
+                continue
+            print(f"[train] === PHASE {phase['name']} ===", flush=True)
+            run_phase(phase, infinite=False)
+
+        live = next((p for p in phases if p.get("max_episodes") == -1), None)
+        if live is not None:
+            print("[train] === LIVE_IMPROVE (infinite) ===", flush=True)
+            run_phase(live, infinite=True)
+    except KeyboardInterrupt:
+        print("\n[train] ⏹  graceful interrupt — writing partial results.",
+              flush=True)
+        _finalize_results(interrupted=True)
+        return 0
+    _finalize_results(interrupted=False)
     return 0
 
 
@@ -619,6 +742,10 @@ def main() -> int:
     ap.add_argument("--randomize-ftmo-account", action="store_true",
                     help="With --randomize-ftmo, ALSO sample account_size per "
                          "episode from ACCOUNT_SIZE_CHOICES (10k/25k/50k/100k).")
+    ap.add_argument("--snapshot-dir", type=str, default=None,
+                    help="Directory of params_snapshot_*.json files to match this "
+                         "run against (PART 1 results writer). Defaults to "
+                         "CFG['SNAPSHOT_DIR'] when omitted.")
     try:
         return train(ap.parse_args())
     except Exception as exc:
