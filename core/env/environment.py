@@ -218,18 +218,44 @@ def proportional_lot_scale(current_target_pct: float, current_max_dd_pct: float,
 # ║       a day OPENING at 10,300  ->  target = 10,300 + 250 = 10,550         ║
 # ║       (NOT 10,300 * 1.025 = 10,557.50 — it is +$250 flat, not +2.5%).     ║
 # ║                                                                            ║
-# ║  ── 2. TRAILING DRAWDOWN (per-bar peak, resets daily) ─────────────────── ║
-# ║    peak_equity updates EVERY bar:   peak = max(peak, equity)              ║
-# ║    peak RESETS to day_start_equity at each new-day boundary.              ║
-# ║    BREACH when:   equity < peak * (1 - max_dd_pct)                        ║
-# ║    On breach -> HALT the day: flatten the position, suppress force-entry, ║
-# ║      open no new trades until the next day. A breach does NOT auto-fail:  ║
-# ║      the balance AT THE HALT is what decides PASS/FAIL against the target  ║
-# ║      (halt_equity >= daily_target still PASSES).                          ║
+# ║  ── 2. TRAILING 1% DRAWDOWN (ratcheting floor, resets daily) ──────────── ║
+# ║    At each new day (00:00 CEST intent; the sim boundary is the 1440-bar    ║
+# ║    rollover, snapshot-before-rollforward):                                 ║
+# ║      start_balance     = day-open balance                                  ║
+# ║      max_equity_today  = start_balance                                     ║
+# ║      daily_dd_floor     = start_balance * (1 - max_dd_pct)   [default *0.99]║
+# ║    Every bar:  equity = balance + open-position MTM  (commissions are      ║
+# ║      already in balance, per the 569aeca equity fix). On a NEW equity HIGH ║
+# ║      the floor RATCHETS UP and NEVER down within the day:                  ║
+# ║         if equity > max_equity_today:                                      ║
+# ║             max_equity_today = equity                                      ║
+# ║             daily_dd_floor    = max_equity_today * (1 - max_dd_pct)        ║
+# ║      (Implemented as peak == _day_high_eq, breach == equity < peak*(1-dd). ║
+# ║       _day_high_eq starts at day_start_eq, so the floor opens at *0.99 and ║
+# ║       only ever ratchets up — the two formulations are identical.)         ║
+# ║    BREACH when:   equity < daily_dd_floor.                                 ║
+# ║    On breach -> HALT the day: flatten the position (realizing its MTM into ║
+# ║      balance), suppress force-entry, open no new trades until next day.    ║
+# ║    A BREACH IS NOT AN AUTO-FAIL: the balance AT THE HALT is classified by   ║
+# ║      the SAME 5-tier logic below (halt_balance >= full target still PASSES).║
 # ║                                                                            ║
-# ║  ── 3. BINARY CLASSIFICATION ──────────────────────────────────────────── ║
-# ║    Every day is exactly PASS or FAIL. There is NO "OK" tier and NO "SKIP"  ║
-# ║    tier. A zero-trade day ends under target, so it is a FAIL.             ║
+# ║  ── 3. FIVE-TIER CLASSIFICATION (dd_classification_refine.md) ──────────── ║
+# ║    Applied to the END-OF-DAY balance, or the HALT balance if breached      ║
+# ║    (identical calc). Thresholds are off INITIAL equity (fixed $: +$250 /   ║
+# ║    +$125 on $10k), NOT the day's open. prior_day == today's start_balance. ║
+# ║    Precedence (FIRST match wins):                                          ║
+# ║      1. final < prior_day_balance            -> FAIL_CAPITAL_LOSS  [NEW]   ║
+# ║      2. elif final >= initial*(1+target_pct) -> PASS  (>= +2.5%)           ║
+# ║      3. elif final >= initial*(1+half_pct)   -> OK    (>= +1.25%, >=50% tgt)║
+# ║      4. else                                 -> FAIL_UNDER_TARGET          ║
+# ║    EXCEED = PASS AND strictly above the full target AND never breached.     ║
+# ║    SURVIVAL bonus = traded AND never breached (a breached day, even one     ║
+# ║    classifying PASS/OK at its halt balance, earns NEITHER EXCEED NOR        ║
+# ║    SURVIVAL). A zero-trade day ends flat (final==start==prior) -> not below ║
+# ║    prior, below half -> FAIL_UNDER_TARGET. Streak: PASS/EXCEED advance the  ║
+# ║    pass-streak; OK does NOT; all FAIL_* break it per the mulligan rules.   ║
+# ║    Reward ordering holds: PASS/EXCEED > OK > FAIL, and a breach or a        ║
+# ║    capital-loss day never out-rewards an OK day.                          ║
 # ║                                                                            ║
 # ║  ── 4. RUNTIME CONFIG INPUTS ──────────────────────────────────────────── ║
 # ║    Both target_pct (CFG["DAILY_TARGET_PCT"]) and max_dd_pct               ║
@@ -286,6 +312,12 @@ class BatchedFTMOEnv:
         # these for live accounts, so NOTHING below may bake in 0.025 / 0.01.
         self.target_pct = float(cfg.get("DAILY_TARGET_PCT", 0.025))
         self.max_dd_pct = float(cfg.get("DAILY_MAX_DD_PCT", 0.010))
+        # ── OK-tier HALF target (dd_classification_refine.md) ────────────────────
+        # OK fires when the final/halt balance reaches >= INITIAL*(1+half_target_pct)
+        # but is still under the full target. Config-driven: DAILY_HALF_TARGET_PCT,
+        # or DERIVED as target_pct/2 when it is None. Nothing hardcodes 0.0125.
+        from core.reward.shaper import resolve_half_target_pct
+        self.half_target_pct = resolve_half_target_pct(cfg)
         # ── RANDOMIZED-TARGET/DD TRAINING MODE (target_aware_policy.md item 2) ───
         # When RANDOMIZE_FTMO_INPUTS is ON, reset() samples target_pct / max_dd_pct
         # (and optionally account_size) PER EPISODE from the ranges below; the env
@@ -313,14 +345,18 @@ class BatchedFTMOEnv:
         self.initial_equity = float(
             cfg.get("ACCOUNT_SIZE", cfg.get("INITIAL_EQUITY", 10_000.0)))
         # ── FIXED DAILY PROFIT INCREMENT (ftmo_rules_fix.md RULE 1) ──────────────
-        # The FTMO daily target is a FIXED DOLLAR amount computed ONCE at account
+        # The FTMO daily increment is a FIXED DOLLAR amount computed ONCE at account
         # open: initial_equity * target_pct. On a $10,000 account @ 2.5% that is a
-        # flat $250 EVERY day — always 2.5% of the ORIGINAL initial equity, never
-        # 2.5% of the current/opening balance. A day passes when the day's profit
-        # (relative to that day's OPENING equity) reaches at least this increment:
-        #     daily_target = day_start_equity + daily_increment
-        #     passed       = (final_or_halt_equity >= daily_target)
-        # So a day opening at 10,300 needs to reach 10,550; a +$20 day FAILS.
+        # flat $250 — always a fraction of the ORIGINAL initial equity. It is the
+        # unit for the EXCEED progressive bonus and the diagnostic `daily_target`
+        # (day_start + increment) still reported in info.
+        #
+        # REFINED CLASSIFICATION (dd_classification_refine.md): the PASS/OK tier
+        # DECISION is measured against INITIAL equity, NOT the day's open:
+        #     PASS iff final_or_halt >= initial*(1+target_pct)   (>= +2.5%)
+        #     OK   iff final_or_halt >= initial*(1+half_target_pct) (>= +1.25%)
+        #     FAIL_CAPITAL_LOSS iff final_or_halt < prior_day close (checked FIRST)
+        # See the SINGLE-SOURCE-OF-TRUTH principles block below and step().
         self.daily_increment = self.initial_equity * self.target_pct
         self.bars_per_day = int(cfg.get("BARS_PER_DAY", 1440))
         self.max_lot = float(cfg.get("MAX_LOT", 2.0))
@@ -525,6 +561,11 @@ class BatchedFTMOEnv:
         self._target_pct_t = torch.full((B,), self.target_pct, device=d)
         self._max_dd_pct_t = torch.full((B,), self.max_dd_pct, device=d)
         self._daily_increment_t = self._initial_equity_t * self._target_pct_t
+        # OK-tier half-target fraction per episode (dd_classification_refine.md).
+        # _half_target_explicit pins it; otherwise it DERIVES as target/2 even when
+        # the per-episode target is randomized (so OK stays at exactly 50%).
+        self._half_target_explicit = self.cfg.get("DAILY_HALF_TARGET_PCT", None)
+        self._half_target_pct_t = self._derive_half_target_t(self._target_pct_t)
         self._position = torch.zeros(B, device=d)       # +lots buy / -lots sell / 0
         self._entry_px = torch.zeros(B, device=d)
         self._dd_breached = torch.zeros(B, dtype=torch.bool, device=d)
@@ -666,6 +707,17 @@ class BatchedFTMOEnv:
             lo, hi = 0.0, 1.0
         self._start_lo_frac, self._start_hi_frac = lo, hi
 
+    def _derive_half_target_t(self, target_pct_t: torch.Tensor) -> torch.Tensor:
+        """Per-episode OK-tier half-target fraction (dd_classification_refine.md).
+
+        When DAILY_HALF_TARGET_PCT is pinned, use that constant; when it is None,
+        DERIVE it as half of THIS episode's (possibly randomized) target_pct so the
+        OK threshold always sits at exactly 50% of the full target. Config-driven —
+        nothing hardcodes 0.0125."""
+        if self._half_target_explicit is None:
+            return target_pct_t * 0.5
+        return torch.full_like(target_pct_t, float(self._half_target_explicit))
+
     # ── reset ──────────────────────────────────────────────────────────────────
     def reset(self) -> torch.Tensor:
         warmup = self.lkbk + 25
@@ -747,6 +799,8 @@ class BatchedFTMOEnv:
             self._initial_equity_t.fill_(self.initial_equity)
         # Fixed daily increment = initial_equity * target_pct, per episode (RULE 1).
         self._daily_increment_t = self._initial_equity_t * self._target_pct_t
+        # OK-tier half target tracks the (possibly resampled) target per episode.
+        self._half_target_pct_t = self._derive_half_target_t(self._target_pct_t)
         return self._get_state()
 
     # ── state ──────────────────────────────────────────────────────────────────
@@ -1370,37 +1424,61 @@ class BatchedFTMOEnv:
         reward = reward + speed_realized
 
         # ════════════════════════════════════════════════════════════════════
-        # DAY CLASSIFICATION — FIVE TIERS (reward_redesign_plan.md Section 1 +
-        # RESOLVED DECISIONS 1 & 2). This is the vectorized mirror of the pure
-        # reference functions in core/reward/shaper.py (classify_day / day_reward /
-        # StreakTracker / give-back). Classification is PURELY by where the ending
-        # /halt balance lands vs the daily target:
-        #   progress = (equity_now - day_start) / daily_increment
-        #     progress >= 1.0   -> PASS  (EXCEED if >1.0 AND never breached)
-        #     0.5 <= progress<1 -> OK    (linear partial credit)
-        #     progress < 0.5    -> FAIL  (scaled by how negative; red-day on top)
-        # RESOLVED DECISION 2: the halt balance still decides PASS/OK/FAIL (a breach
-        # does NOT auto-fail), but a BREACHED day can never earn SURVIVAL or EXCEED.
-        # A zero-trade day ends under target -> FAIL (RULE 2 preserved). Binary
-        # `passed`/`failed` are still exported (passed == PASS|EXCEED) so the FTMO
-        # guard, eval loop, and existing aggregation keep working unchanged.
-        # The day closes on a calendar boundary (new_day) OR the moment a DD breach
-        # halts trading (newly_halted); equity_now is the closing/halt equity.
+        # DAY CLASSIFICATION — FIVE TIERS (dd_classification_refine.md; vectorized
+        # mirror of core/reward/shaper.classify_day). Thresholds are measured
+        # against INITIAL equity (FIXED-$ increments), with a NEW capital-loss guard
+        # checked FIRST. final = equity_now (the closing OR DD-halt balance);
+        # prior_day_balance == day_start_closing (yesterday's close == today's open).
+        # Precedence (FIRST match wins — identical whether or not a DD breach
+        # occurred; a breach merely ends the day early, it is NOT an auto-fail):
+        #   1. final < prior_day_balance            -> FAIL_CAPITAL_LOSS  [NEW]
+        #   2. elif final >= initial*(1+target_pct) -> PASS  (>= +2.5% of INITIAL)
+        #   3. elif final >= initial*(1+half_pct)   -> OK    (>= +1.25%, >=50% tgt)
+        #   4. else                                 -> FAIL  (< half, not < prior)
+        # THEN: EXCEED = PASS AND strictly above the full target AND never breached;
+        # SURVIVAL bonus only on a traded day that NEVER breached. A breached day,
+        # even one whose halt balance is PASS/OK, can earn NEITHER EXCEED NOR
+        # SURVIVAL (RESOLVED DECISION 2). A zero-trade day ends flat (final == start
+        # == prior) -> not < prior, < half -> FAIL_UNDER_TARGET. The reward MAGNITUDE
+        # math below still keys off `progress` (day-start-relative) for severity /
+        # OK partial-credit / EXCEED-progressive — only the TIER DECISION moved to
+        # absolute INITIAL-relative thresholds. Binary `passed`/`failed` are still
+        # exported (passed == PASS|EXCEED; failed == every FAIL_*/OK) so the FTMO
+        # guard, eval loop, and aggregation keep working unchanged. The day closes on
+        # a calendar boundary (new_day) OR the moment a DD breach halts trading
+        # (newly_halted).
         # ════════════════════════════════════════════════════════════════════
         day_closed = new_day | newly_halted
         traded_today = trades_today_closing > 0          # day actually traded
-        # RULE 1: fixed-increment target measured off the CLOSING day's opening eq.
+        # RULE 1: fixed-increment target measured off the CLOSING day's opening eq
+        # (kept for the obs/info `daily_target`); the TIER decision uses absolute
+        # INITIAL-relative thresholds below.
         daily_target = day_start_closing + self._daily_increment_t
         inc = self._daily_increment_t.clamp(min=1e-9)
         progress = (equity_now - day_start_closing) / inc
         breached = self._dd_breached                      # breached this day (any bar)
 
-        # ── TIER MASKS ──
-        is_pass = progress >= 1.0
-        is_exceed = is_pass & (progress > 1.0) & (~breached)   # PASS upgraded
-        is_ok = (progress >= 0.5) & (progress < 1.0)
-        is_fail = progress < 0.5
-        # binary compatibility: PASS or EXCEED counts as a "passed" day.
+        # ── ABSOLUTE INITIAL-RELATIVE THRESHOLDS (dd_classification_refine.md) ──
+        # Fixed-$ off INITIAL equity: full target == initial*(1+target_pct),
+        # half == initial*(1+half_target_pct). prior_day == day_start_closing.
+        full_target_eq = self._initial_equity_t * (1.0 + self._target_pct_t)
+        half_target_eq = self._initial_equity_t * (1.0 + self._half_target_pct_t)
+        prior_day_balance = day_start_closing
+
+        # ── TIER MASKS (precedence: capital-loss FIRST, then PASS, then OK) ──
+        is_capital_loss = equity_now < prior_day_balance               # 1. NEW guard
+        at_or_above_full = equity_now >= full_target_eq
+        at_or_above_half = equity_now >= half_target_eq
+        is_pass = (~is_capital_loss) & at_or_above_full                 # 2. PASS
+        # EXCEED: PASS, strictly above the full target, and DD never breached.
+        is_exceed = is_pass & (equity_now > full_target_eq) & (~breached)
+        is_ok = (~is_capital_loss) & (~is_pass) & at_or_above_half      # 3. OK
+        # 4. FAIL_UNDER_TARGET: not capital-loss, below half target.
+        is_fail_under = (~is_capital_loss) & (~is_pass) & (~is_ok)
+        # `is_fail` keeps its old meaning for the reward MAGNITUDE path (any FAIL_*).
+        is_fail = is_capital_loss | is_fail_under
+        # binary compatibility: PASS or EXCEED counts as a "passed" day; OK and all
+        # FAIL_* are non-passing (OK does NOT advance the pass-streak — RULE 3).
         passed = is_pass
         failed = ~passed
         self._day_passed = torch.where(day_closed & passed,
@@ -1553,10 +1631,14 @@ class BatchedFTMOEnv:
             "equity": self._equity.detach(),
             "passed": passed.detach(),       # PASS or EXCEED (binary-compatible)
             "failed": failed.detach(),       # complement of passed
-            # ── 5-tier flags (Section 1). Exactly one of fail/ok/pass is true on a
-            # closed day; exceed is a subset of pass; survival stacks (never on a
-            # breached day). All scoped to closed days so non-closing bars read 0.
-            "tier_fail":   (is_fail & day_closed).detach(),
+            # ── 5-tier flags (Section 1 + dd_classification_refine). Exactly one of
+            # fail_under/capital_loss/ok/pass is true on a closed day; tier_fail is
+            # the union of both FAIL_* tiers (binary-compat); exceed is a subset of
+            # pass; survival stacks (never on a breached day). All scoped to closed
+            # days so non-closing bars read 0.
+            "tier_fail":   (is_fail & day_closed).detach(),          # any FAIL_*
+            "tier_fail_under":   (is_fail_under & day_closed).detach(),
+            "tier_capital_loss": (is_capital_loss & day_closed).detach(),
             "tier_ok":     (is_ok & day_closed).detach(),
             "tier_pass":   (is_pass & day_closed).detach(),
             "tier_exceed": (is_exceed & day_closed).detach(),

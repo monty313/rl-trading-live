@@ -106,11 +106,18 @@ CFG = {
     #  --daily-target-usd override these at runtime; YAML/CLI win.)
     #
     # daily_increment = INITIAL_EQUITY * DAILY_TARGET_PCT  (a FIXED dollar amount
-    # computed once at account open — e.g. $250 on $10k @ 2.5%). The day's target
-    # is day_start_equity + daily_increment; PASS iff final-or-halt equity >= that.
-    # NOT "start * 1.025" — the increment is a flat dollar amount off the ORIGINAL
-    # initial equity, not a percent of the day's opening balance. See the single-
-    # source-of-truth principles block in core/env/environment.py.
+    # computed once at account open — e.g. $250 on $10k @ 2.5%). It is the unit for
+    # the EXCEED progressive bonus and the diagnostic daily_target.
+    #
+    # REFINED CLASSIFICATION (dd_classification_refine.md): the PASS/OK tier
+    # thresholds are measured against INITIAL equity (fixed-$ off the original
+    # account), NOT the day's opening balance:
+    #     PASS iff final-or-halt >= INITIAL_EQUITY * (1 + DAILY_TARGET_PCT)
+    #     OK   iff final-or-halt >= INITIAL_EQUITY * (1 + DAILY_HALF_TARGET_PCT)
+    #     FAIL_CAPITAL_LOSS iff final-or-halt < prior-day close (checked FIRST)
+    # A DD breach HALTS the day but is NOT an auto-fail (the halt balance is
+    # classified the same way). See the single-source-of-truth principles block in
+    # core/env/environment.py and core/reward/shaper.classify_day.
     #
     # HONESTY NOTE (rules vs policy): changing these at RUNTIME correctly changes
     # RULE ENFORCEMENT (PASS/FAIL + the DD halt) immediately, everywhere they are
@@ -120,6 +127,13 @@ CFG = {
     # until retrained. "Rules are config-driven (instant); policy is learned
     # (needs retraining for big changes)."
     "DAILY_TARGET_PCT":   0.025,  # daily profit target as a fraction of INITIAL equity
+    # ── HALF-TARGET ("OK" tier) THRESHOLD (dd_classification_refine.md) ────────
+    # The OK tier fires when the day's FINAL/halt balance reaches >= 50% of the
+    # full target measured AGAINST INITIAL equity. Default 0.0125 == target/2.
+    # Set to None to DERIVE it as DAILY_TARGET_PCT/2 automatically (so an override
+    # of the target keeps OK at exactly half unless this is pinned). Either way the
+    # OK and PASS thresholds are config-driven — NOTHING hardcodes 0.0125 / 250 / 125.
+    "DAILY_HALF_TARGET_PCT": 0.0125,  # OK tier: final >= INITIAL*(1+this); None -> target/2
     "DAILY_MAX_DD_PCT":   0.010,  # 1% trailing intraday DD (breach halts the day)
     # ── ACCOUNT SIZE (learning_loop_fix.md FIX 3) ────────────────────────────
     # Default $10,000 so numbers are comprehensible. Override via the CLI flag

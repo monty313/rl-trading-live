@@ -21,20 +21,29 @@ THE FIVE TIERS (Section 1, RESOLVED DECISION 1 & 2) — classified purely by whe
 the ENDING (or DD-HALT) balance lands vs the daily target
 (daily_target = day_start_equity + initial_equity*target_pct):
 
-    FAIL     ending < 50% of the target's progress  -> full fail_day_penalty,
-             scaled LINEARLY by how negative the day was (lose $80 == 8x $10).
-    OK       50% <= ending < 100% of target          -> linear partial credit
-             from ok_partial_lo..ok_partial_hi of pass_day_bonus.
-    PASS     ending >= 100% of target (even after a DD halt, since the halt
-             balance can still clear target) -> full pass_day_bonus.
-    EXCEED   ending > 100% of target AND DD NEVER breached -> pass_day_bonus +
-             a progressive bonus per % above target, with NO cap.
+Thresholds are measured AGAINST INITIAL equity (fixed-$ increments: +$250 full /
++$125 half on a $10k account, per dd_classification_refine.md), with a NEW
+capital-loss guard checked FIRST. Precedence (first match wins):
+
+    FAIL_CAPITAL_LOSS  final < prior_day_balance (yesterday's close == today's
+             start) -> FAIL. Gave back capital vs yesterday. CHECKED FIRST.
+    PASS     final >= initial*(1+target_pct)  (>= +2.5% of INITIAL) -> full
+             pass_day_bonus.
+    OK       final >= initial*(1+half_target_pct) (>= +1.25%, i.e. >=50% of the
+             target) but not yet PASS -> linear partial credit.
+    FAIL     below half target but NOT below prior-day close -> full
+             fail_day_penalty, scaled LINEARLY by how negative the day was.
+    EXCEED   PASS AND final strictly above the full target AND DD NEVER breached
+             -> pass_day_bonus + a progressive bonus per % above target, NO cap.
     SURVIVAL traded all day and NEVER breached the trailing DD -> a big bonus
              STACKED on top of whatever tier was earned.
 
-A day that BREACHED the trailing DD can NEVER earn SURVIVAL or EXCEED (RESOLVED
-DECISION 2): the halt balance still decides PASS/OK/FAIL, but survival requires
-"never breached" and exceed requires "never breached".
+A DD BREACH IS NOT AN AUTO-FAIL (dd_classification_refine.md): the HALT balance is
+classified by the SAME logic above (halt balance >= full target still PASSES). But
+a day that BREACHED can NEVER earn SURVIVAL or EXCEED (RESOLVED DECISION 2). A
+zero-trade day ends flat (final == start == prior), so it is not below prior and is
+below half -> FAIL. OK does NOT advance the pass-streak; PASS/EXCEED do; all FAIL_*
+break it per the mulligan rules.
 """
 from __future__ import annotations
 
@@ -44,11 +53,14 @@ from typing import Dict, List, Tuple
 import numpy as np
 
 # ── Tier name constants (single source of truth; never hardcode the strings) ──
-FAIL = "FAIL"
+FAIL = "FAIL"                       # under target AND not below prior-day close
+FAIL_CAPITAL_LOSS = "FAIL_CAPITAL_LOSS"   # gave back capital vs yesterday's close
 OK = "OK"
 PASS = "PASS"
 EXCEED = "EXCEED"
-TIERS = (FAIL, OK, PASS, EXCEED)
+# All FAIL_* variants are non-passing; OK is non-passing too (see classify_day).
+TIERS = (FAIL, FAIL_CAPITAL_LOSS, OK, PASS, EXCEED)
+FAIL_TIERS = (FAIL, FAIL_CAPITAL_LOSS)
 
 
 # ╔══════════════════════════════════════════════════════════════════════════╗
@@ -126,30 +138,108 @@ def streak_reward(streak: int, a: float, b: float, base: float,
 # ╔══════════════════════════════════════════════════════════════════════════╗
 # ║  SECTION 1 — FIVE-TIER DAY CLASSIFICATION + REWARD                         ║
 # ╚══════════════════════════════════════════════════════════════════════════╝
+def resolve_half_target_pct(cfg: dict) -> float:
+    """Resolve the OK-tier half-target fraction from CFG (dd_classification_refine).
+
+    DAILY_HALF_TARGET_PCT pins it explicitly; None DERIVES it as half of
+    DAILY_TARGET_PCT. NOTHING downstream hardcodes 0.0125 — change the target and
+    OK tracks at exactly half unless half is pinned."""
+    half = cfg.get("DAILY_HALF_TARGET_PCT", None)
+    if half is None:
+        return float(cfg.get("DAILY_TARGET_PCT", 0.025)) / 2.0
+    return float(half)
+
+
+# ╔══════════════════════════════════════════════════════════════════════════╗
+# ║  COMPUTER-SIMPLE RULES — SINGLE SOURCE OF TRUTH (dd_classification_refine) ║
+# ╠══════════════════════════════════════════════════════════════════════════╣
+# ║  TRAILING 1% DAILY DD (ratcheting floor) — see BatchedFTMOEnv.step:        ║
+# ║    new day:  start_balance = day-open balance                             ║
+# ║              max_equity_today = start_balance                             ║
+# ║              daily_dd_floor   = start_balance * (1 - max_dd_pct)  [*0.99]  ║
+# ║    each bar: equity = balance + open-position MTM  (commissions already    ║
+# ║              in balance, per the 569aeca equity fix)                       ║
+# ║              if equity > max_equity_today:                                 ║
+# ║                  max_equity_today = equity                                 ║
+# ║                  daily_dd_floor   = max_equity_today * (1 - max_dd_pct)    ║
+# ║              # floor RATCHETS UP on new highs, NEVER down within a day      ║
+# ║              breach when equity < daily_dd_floor  ->  HALT the day         ║
+# ║              (flatten realizing MTM, suppress force-entry until next day)  ║
+# ║    A BREACH IS NOT AN AUTOMATIC FAIL: after the halt, classify the HALT     ║
+# ║    balance with the SAME tier logic below.                                 ║
+# ║                                                                            ║
+# ║  CLASSIFICATION (5-tier; applied to END-OF-DAY balance, or HALT balance if  ║
+# ║  breached — identical calc). Let initial = account INITIAL equity,         ║
+# ║  prior_day = yesterday's close (== today's start_balance), final = end/halt ║
+# ║  balance. Thresholds are off INITIAL (fixed $ on a 10k acct: $250 / $125),  ║
+# ║  NOT the day's opening balance. Precedence (FIRST match wins):             ║
+# ║    1. final < prior_day                     -> FAIL_CAPITAL_LOSS  [NEW]    ║
+# ║    2. elif final >= initial*(1+target_pct)  -> PASS  (>= +2.5%)            ║
+# ║    3. elif final >= initial*(1+half_pct)    -> OK    (>= +1.25%, >=50% tgt)║
+# ║    4. else                                  -> FAIL  (< half, not < prior) ║
+# ║  THEN (no-breach gates, kept from the 5-tier system):                      ║
+# ║    • EXCEED: PASS AND final > initial*(1+target_pct) AND never breached.   ║
+# ║    • SURVIVAL bonus: traded AND never breached (a breached day, even one    ║
+# ║      whose halt balance is PASS/OK, can earn NEITHER EXCEED NOR SURVIVAL). ║
+# ║  Zero-trade day: final == start == prior -> not < prior, < half -> FAIL.   ║
+# ║  Streak: PASS/EXCEED advance the pass-streak; OK does NOT; all FAIL_* break ║
+# ║  per the mulligan rules. Reward ordering holds: PASS/EXCEED > OK > FAIL,    ║
+# ║  and a breach/capital-loss day never out-rewards an OK day.                ║
+# ╚══════════════════════════════════════════════════════════════════════════╝
 def classify_day(end_equity: float, day_start_equity: float,
                  daily_increment: float, dd_breached: bool,
-                 traded: bool) -> str:
-    """Return the day's TIER (FAIL/OK/PASS/EXCEED) from the ending/halt balance.
+                 traded: bool, *, initial_equity: float | None = None,
+                 target_pct: float | None = None,
+                 half_target_pct: float | None = None,
+                 prior_day_balance: float | None = None) -> str:
+    """Return the day's TIER from the ending/halt balance (dd_classification_refine).
 
-    progress = (end - day_start) / daily_increment   (fraction of target reached;
-               1.0 == exactly hit the +increment target, can be negative on a loss).
-      progress >= 1.0                  -> PASS, upgraded to EXCEED if progress>1.0
-                                          AND the DD was never breached (RESOLVED
-                                          DECISION 2: a breach forbids EXCEED).
-      0.5 <= progress < 1.0            -> OK.
-      progress < 0.5                   -> FAIL.
+    Precedence (FIRST match wins; identical whether or not a DD breach occurred —
+    a breach merely makes `end_equity` the HALT balance, it is NOT an auto-fail):
+      1. end < prior_day_balance              -> FAIL_CAPITAL_LOSS  (gave back
+                                                 capital vs yesterday's close).
+      2. end >= initial*(1 + target_pct)      -> PASS   (>= +2.5% of INITIAL).
+                                                 upgraded to EXCEED iff strictly
+                                                 above AND never breached.
+      3. end >= initial*(1 + half_target_pct) -> OK     (>= +1.25% of INITIAL,
+                                                 i.e. >= 50% of the target).
+      4. else                                 -> FAIL   (< half, not < prior).
 
-    `traded` and `dd_breached` do NOT change the FAIL/OK/PASS split (classification
-    is purely by balance); they gate the SURVIVAL/EXCEED bonuses elsewhere. SURVIVAL
-    (handled in day_reward) requires traded AND not breached."""
+    Thresholds are measured against INITIAL equity (fixed-$ increments), NOT the
+    day's opening balance — consistent with daily_increment = initial*target_pct.
+
+    Back-compat: when initial_equity/target_pct are not supplied we DERIVE them
+    from day_start_equity + daily_increment (so legacy callers that only pass the
+    day-start frame still classify by the +increment target off day-start, with
+    prior_day defaulting to day_start so a flat/zero-trade day is FAIL not
+    capital-loss). `traded`/`dd_breached` never change the FAIL/OK/PASS split;
+    they gate SURVIVAL/EXCEED (handled here for EXCEED, in day_reward for SURVIVAL)."""
     inc = daily_increment if daily_increment != 0 else 1e-9
-    progress = (end_equity - day_start_equity) / inc
-    if progress >= 1.0:
-        if progress > 1.0 and not dd_breached:
+    # Resolve the absolute INITIAL-relative thresholds. Legacy callers (no
+    # initial_equity) fall back to the day-start frame: target == day_start+inc,
+    # half == day_start + inc/2 — preserving their original semantics exactly.
+    if initial_equity is not None and target_pct is not None:
+        full_target_eq = initial_equity * (1.0 + target_pct)
+        half_pct = (half_target_pct if half_target_pct is not None
+                    else target_pct / 2.0)
+        half_target_eq = initial_equity * (1.0 + half_pct)
+    else:
+        full_target_eq = day_start_equity + inc
+        half_target_eq = day_start_equity + 0.5 * inc
+    prior = prior_day_balance if prior_day_balance is not None else day_start_equity
+
+    # 1. CAPITAL LOSS vs yesterday's close — checked FIRST (highest precedence).
+    if end_equity < prior:
+        return FAIL_CAPITAL_LOSS
+    # 2. PASS (>= full target off INITIAL); EXCEED only if strictly above & clean.
+    if end_equity >= full_target_eq:
+        if end_equity > full_target_eq and not dd_breached:
             return EXCEED
         return PASS
-    if progress >= 0.5:
+    # 3. OK (>= half target off INITIAL == >= 50% of the target).
+    if end_equity >= half_target_eq:
         return OK
+    # 4. FAIL (below half, but not below prior-day close).
     return FAIL
 
 
@@ -182,11 +272,15 @@ def day_reward(tier: str, end_equity: float, day_start_equity: float,
     progress = (end_equity - day_start_equity) / inc
 
     reward = 0.0
-    if tier == FAIL:
+    if tier in FAIL_TIERS:
         # Full FAIL penalty, scaled LINEARLY by how negative the day was. A day at
         # 0..50% of target takes the base penalty; a day deep in the red takes a
         # multiple (the red-day term below adds the loss-proportional part). We use
         # max(1, -progress*..) so a flat 0%-progress fail still gets the base.
+        # FAIL_CAPITAL_LOSS shares this path (it is a FAIL by precedence); because
+        # final < prior_day the red-day term below ALSO fires, so a capital-loss day
+        # is penalized at least as hard as a same-magnitude FAIL — it can never
+        # out-reward an OK day (reward ordering: PASS/EXCEED > OK > FAIL/_LOSS).
         severity = max(1.0, 1.0 - min(progress, 0.0))   # 0% -> 1x, -100% -> 2x, ...
         reward += fail_b * severity
     elif tier == OK:

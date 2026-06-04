@@ -32,7 +32,7 @@ import numpy as np
 import torch
 
 from core.agent.action_space import DIRECTION_NAMES, EXIT_NAMES
-from core.reward.shaper import classify_day, FAIL, OK, PASS, EXCEED
+from core.reward.shaper import classify_day, FAIL, FAIL_CAPITAL_LOSS, OK, PASS, EXCEED
 from core.interpret.saliency import compute_saliency
 from core.interpret.dashboard_utils import obs_feature_names
 
@@ -92,7 +92,7 @@ def _consistency_from_days(daily_log: Optional[List[dict]], cfg: dict) -> dict:
     return tier RATES + streak stats. daily_log entries are
     {end_equity, day_start_equity, daily_increment, dd_breached, traded}. When no
     daily_log is supplied we return zeros (the report still renders)."""
-    tiers = {FAIL: 0, OK: 0, PASS: 0, EXCEED: 0, "SURVIVAL": 0}
+    tiers = {FAIL: 0, FAIL_CAPITAL_LOSS: 0, OK: 0, PASS: 0, EXCEED: 0, "SURVIVAL": 0}
     best_streak = worst_streak = cur = 0
     dd_usages: List[float] = []
     if daily_log:
@@ -100,7 +100,11 @@ def _consistency_from_days(daily_log: Optional[List[dict]], cfg: dict) -> dict:
             tier = classify_day(
                 float(d["end_equity"]), float(d["day_start_equity"]),
                 float(d["daily_increment"]), bool(d.get("dd_breached", False)),
-                bool(d.get("traded", True)))
+                bool(d.get("traded", True)),
+                initial_equity=d.get("initial_equity"),
+                target_pct=d.get("target_pct"),
+                half_target_pct=d.get("half_target_pct"),
+                prior_day_balance=d.get("prior_day_balance"))
             tiers[tier] += 1
             if d.get("traded", True) and not d.get("dd_breached", False):
                 tiers["SURVIVAL"] += 1
@@ -113,8 +117,8 @@ def _consistency_from_days(daily_log: Optional[List[dict]], cfg: dict) -> dict:
             worst_streak = min(worst_streak, cur)
             if "dd_used_pct" in d:
                 dd_usages.append(float(d["dd_used_pct"]))
-    n = max(1, sum(tiers[t] for t in (FAIL, OK, PASS, EXCEED)))
-    rates = {t: tiers[t] / n for t in (FAIL, OK, PASS, EXCEED)}
+    n = max(1, sum(tiers[t] for t in (FAIL, FAIL_CAPITAL_LOSS, OK, PASS, EXCEED)))
+    rates = {t: tiers[t] / n for t in (FAIL, FAIL_CAPITAL_LOSS, OK, PASS, EXCEED)}
     rates["SURVIVAL"] = tiers["SURVIVAL"] / n
     return {
         "tier_rates": rates,

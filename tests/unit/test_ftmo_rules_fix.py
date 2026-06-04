@@ -97,18 +97,32 @@ def test_daily_increment_is_fixed_off_initial_equity():
     assert env.daily_increment == 250.0
 
 
-def test_day_opening_at_10300_needs_10550():
-    """Spec anchor: a day opening at 10,300 has target 10,550 (10,300 + $250).
-    end 10,600 -> PASS; end 10,500 -> FAIL."""
+def test_day_opening_at_10300_passes_on_initial_relative_target():
+    """UPDATED for dd_classification_refine.md: the PASS/OK thresholds are now
+    measured against INITIAL equity (fixed-$ off the original account), NOT the
+    day's opening balance. PASS iff final >= initial*(1+target_pct) == 10,250 on a
+    $10k @ 2.5% account, regardless of where the day OPENED.
+
+    (Old semantics — kept here only as the explanation of WHY this test changed —
+    classified by `final >= day_start + $250`, so a day opening at 10,300 needed
+    10,550 and an end of 10,500 was a FAIL. The user's refined rule moves the
+    target to the fixed INITIAL-relative line, so the SAME end of 10,500 is now a
+    PASS: 10,500 >= 10,250 and 10,500 >= prior_day 10,300 (no capital loss).)
+
+    The `daily_target` reported in info is still the day-start fixed increment
+    (10,300 + 250 = 10,550) — kept for the observation/diagnostics — but it no
+    longer gates the tier decision."""
     env = _free_env(account=10_000.0, target_pct=0.025, bars_per_day=40)
     info = _classify(env, day_start_eq=10_300.0, final_eq=10_600.0)
-    assert bool(info["passed"].all())          # 10,600 >= 10,550 -> PASS
+    assert bool(info["passed"].all())          # 10,600 >= 10,250 -> PASS
+    # info's daily_target is still the day-start fixed increment (diagnostic only).
     assert info["daily_target"][0].item() == 10_550.0
 
     env2 = _free_env(account=10_000.0, target_pct=0.025, bars_per_day=40)
     info2 = _classify(env2, day_start_eq=10_300.0, final_eq=10_500.0)
-    assert not bool(info2["passed"].any())     # 10,500 < 10,550 -> FAIL
-    assert bool(info2["failed"].all())
+    # 10,500 >= initial*1.025 (10,250) AND >= prior_day (10,300) -> PASS now.
+    assert bool(info2["passed"].all())
+    assert bool(info2["tier_pass"][info2["day_closed"]].all())
 
 
 def test_plus_20_dollar_day_fails_regression():
