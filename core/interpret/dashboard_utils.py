@@ -39,8 +39,11 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import re
-from typing import Any, Dict, List, Tuple
+import subprocess
+import sys
+from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
 
 # ╔══════════════════════════════════════════════════════════════════════════╗
@@ -465,3 +468,98 @@ def obs_feature_names(lookback: int, n_indicator_features: int,
     names += list(_FTMO_FEAT_NAMES)
     names += list(_SESSION_FEAT_NAMES)
     return names
+
+
+# ╔══════════════════════════════════════════════════════════════════════════╗
+# ║  LIVE SUBPROCESS STREAMING (Colab "frozen launch" fix)                     ║
+# ╚══════════════════════════════════════════════════════════════════════════╝
+# WHY THIS EXISTS — read before "simplifying" it back to subprocess.run():
+#
+#   The RUN-TRAINING notebook cell (CELL 7b) launches training as a CHILD process
+#   so it can consume the dashboard PARAMS dict. The naive `subprocess.run(argv)`
+#   has a nasty failure mode IN COLAB specifically:
+#
+#     • CPython block-buffers stdout when it is NOT a TTY. Under Colab the child's
+#       stdout is a PIPE/redirected stream, not a terminal, so the child fills an
+#       internal ~8 KB buffer before ANY bytes are flushed to the notebook.
+#     • Training's startup (CSV load, feature build, torch.compile warmup) emits
+#       only a few hundred bytes before it blocks for many minutes, so the buffer
+#       never fills and the cell shows ONLY the parent's "Launching: …" line.
+#     • Result: 20+ minutes of apparent FREEZE (GPU RAM idle) even though training
+#       is running fine — indistinguishable, on screen, from a real crash.
+#
+#   The robust cure is belt-and-suspenders:
+#     (a) UNBUFFER THE CHILD: run it with `python -u` AND PYTHONUNBUFFERED=1 in its
+#         env, so every print reaches the pipe immediately (covers the C-level and
+#         the Python-level buffering paths; either alone can be defeated).
+#     (b) STREAM THE PIPE: read the child's merged stdout/stderr line-by-line and
+#         re-emit each line through the parent immediately (flush=True), so the
+#         notebook shows [train] startup lines within SECONDS of launch.
+#
+#   `build_train_argv()` enforces (a) by injecting "-u"; `stream_subprocess()`
+#   enforces both (a, via env) and (b, via Popen + line iteration). They are unit
+#   tested in tests/unit/test_notebook_s10.py so a future edit can't silently
+#   regress the streaming behaviour.
+
+def build_train_argv(python_exe: str, module: str = "training.train") -> List[str]:
+    """Return the leading argv for launching a training module UNBUFFERED.
+
+    Always inserts the ``-u`` flag (force-unbuffered stdio in the child) right
+    after the interpreter, so the very first [train] prints reach the notebook
+    immediately instead of sitting in a block buffer. The caller appends the
+    PATH/RESUME/dashboard flags after this prefix."""
+    return [python_exe, "-u", "-m", module]
+
+
+def unbuffered_env(base: Optional[Dict[str, str]] = None) -> Dict[str, str]:
+    """Return a copy of ``base`` (defaults to os.environ) with PYTHONUNBUFFERED=1.
+
+    Second half of the belt-and-suspenders unbuffering: even if a child somehow
+    re-enables buffering, the env var forces line/stream flushing. Returned as a
+    fresh dict so callers never mutate os.environ in place."""
+    env = dict(os.environ if base is None else base)
+    env["PYTHONUNBUFFERED"] = "1"
+    return env
+
+
+def stream_subprocess(
+    argv: Sequence[str],
+    cwd: Optional[str] = None,
+    env: Optional[Dict[str, str]] = None,
+    echo: Callable[[str], None] = None,
+) -> int:
+    """Launch ``argv`` and FORWARD its output line-by-line as it arrives.
+
+    Merges the child's stderr into stdout (stderr=STDOUT) and iterates the pipe
+    so each line is re-emitted the instant the child flushes it — giving live
+    output in Colab where ``subprocess.run`` would buffer for minutes. Forces
+    PYTHONUNBUFFERED=1 in the child env (via :func:`unbuffered_env`) as the second
+    unbuffering guard. Returns the child's exit code (the caller decides how to
+    surface a nonzero result).
+
+    ``echo`` defaults to ``print(line, end="", flush=True)`` — kept injectable so
+    the unit test can capture forwarded lines and assert they arrive incrementally
+    rather than all at once at the end."""
+    if echo is None:
+        def echo(line: str) -> None:           # default: forward to the cell live
+            print(line, end="", flush=True)
+
+    child_env = unbuffered_env(env)
+    # bufsize=1 + text=True => line-buffered text pipe on the PARENT side; combined
+    # with the child's -u/PYTHONUNBUFFERED this yields true line-at-a-time relay.
+    proc = subprocess.Popen(
+        list(argv),
+        cwd=cwd,
+        env=child_env,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        bufsize=1,
+        text=True,
+    )
+    # Iterating proc.stdout yields each line as the child flushes it. We keep the
+    # trailing newline (echo uses end="") so output is byte-faithful to the child.
+    assert proc.stdout is not None
+    for line in proc.stdout:
+        echo(line)
+    proc.stdout.close()
+    return proc.wait()

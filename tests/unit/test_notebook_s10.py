@@ -73,3 +73,92 @@ def test_dashboard_defaults_zero_drift():
 def test_clone_dir_and_manifest_paths_consistent():
     srcs = "\n".join(s for s, _ in _cells())
     assert "/content/rl-trading-live" in srcs, "clone dir path missing/inconsistent"
+
+
+# ── RUN-TRAINING CELL: unbuffered + live-streamed launch (Colab "freeze" fix) ──
+def _run_training_cell() -> str:
+    """The CELL 7b source (the one that launches training as a child process)."""
+    return next(s for s, _ in _code_cells() if "# CELL 7b" in s)
+
+
+def test_run_training_cell_launches_unbuffered_and_streams():
+    """CELL 7b MUST launch the child unbuffered and stream its stdout live, or the
+    Colab cell looks frozen for 20+ min while training is actually running.
+
+    We assert the cell wires in the dashboard_utils helpers (build_train_argv adds
+    `-u`, unbuffered_env adds PYTHONUNBUFFERED=1, stream_subprocess forwards lines)
+    and that it no longer uses the buffering subprocess.run() path."""
+    cell = _run_training_cell()
+    assert "build_train_argv" in cell, "launch must use build_train_argv (adds -u)"
+    assert "stream_subprocess" in cell, "launch must stream child output live"
+    assert "unbuffered_env" in cell, "child env must set PYTHONUNBUFFERED=1"
+    assert "subprocess.run(" not in cell, \
+        "subprocess.run buffers child stdout in Colab — use stream_subprocess"
+    assert "returncode" in cell and "exited with code" in cell, \
+        "a nonzero exit must be surfaced with a clear banner"
+
+
+def test_build_train_argv_includes_dash_u():
+    """build_train_argv must inject `-u` right after the interpreter so the child's
+    stdout is unbuffered (first half of the Colab-freeze fix)."""
+    from core.interpret.dashboard_utils import build_train_argv
+    argv = build_train_argv("/usr/bin/python3")
+    assert argv[0] == "/usr/bin/python3"
+    assert argv[1] == "-u", "`-u` (unbuffered) must immediately follow the exe"
+    assert argv[2:] == ["-m", "training.train"]
+
+
+def test_unbuffered_env_sets_pythonunbuffered():
+    """unbuffered_env returns a FRESH dict with PYTHONUNBUFFERED=1 (never mutates
+    the passed-in base / os.environ)."""
+    from core.interpret.dashboard_utils import unbuffered_env
+    base = {"FOO": "bar"}
+    env = unbuffered_env(base)
+    assert env["PYTHONUNBUFFERED"] == "1"
+    assert env["FOO"] == "bar"
+    assert "PYTHONUNBUFFERED" not in base, "must not mutate the caller's dict"
+
+
+def test_stream_subprocess_forwards_lines_incrementally():
+    """stream_subprocess must forward the child's stdout LINE-BY-LINE as it is
+    produced, not buffer it all until exit. We launch a tiny child that prints two
+    lines with a delay between them and capture the (line, wall-clock) of each
+    forwarded line; the second line must arrive measurably AFTER the first, proving
+    incremental relay rather than a single end-of-process flush."""
+    import sys
+    import time
+    from core.interpret.dashboard_utils import stream_subprocess
+
+    child = (
+        "import sys, time\n"
+        "print('FIRST', flush=True)\n"
+        "time.sleep(0.6)\n"
+        "print('SECOND', flush=True)\n"
+    )
+    received = []                       # (text, monotonic timestamp) per line
+    t0 = time.monotonic()
+    rc = stream_subprocess(
+        [sys.executable, "-c", child],
+        echo=lambda line: received.append((line, time.monotonic() - t0)),
+    )
+    assert rc == 0
+    texts = [t.strip() for t, _ in received]
+    assert texts == ["FIRST", "SECOND"], f"lines not forwarded in order: {texts}"
+    # Incremental proof: FIRST arrives well before the child's 0.6s sleep elapses,
+    # and SECOND arrives only after it — so they were NOT delivered in one batch.
+    first_ts = received[0][1]
+    second_ts = received[1][1]
+    assert first_ts < 0.4, f"first line was delayed ({first_ts:.2f}s) — buffered?"
+    assert second_ts - first_ts > 0.3, \
+        f"lines arrived together ({second_ts - first_ts:.2f}s apart) — not streamed"
+
+
+def test_stream_subprocess_returns_child_exit_code():
+    """A nonzero child exit must propagate so the cell can show the error banner."""
+    import sys
+    from core.interpret.dashboard_utils import stream_subprocess
+    rc = stream_subprocess(
+        [sys.executable, "-c", "import sys; sys.exit(7)"],
+        echo=lambda line: None,
+    )
+    assert rc == 7
