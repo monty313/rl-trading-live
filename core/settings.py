@@ -197,6 +197,22 @@ CFG = {
     # and overwrites rollout buffer tensors, crashing torch.stack() in update().
     "USE_TORCH_COMPILE": True,
     "USE_AMP":           True,
+    # ── COMPILE WARMUP VISIBILITY (compile_warmup_visibility fix) ────────────
+    # torch.compile(mode="default") compiles LAZILY on the FIRST forward pass —
+    # which happens INSIDE the rollout step loop, AFTER the PHASE banner. That
+    # first compile BLOCKS the main thread for ~10-15 min on an A100, during
+    # which the wall-clock heartbeat (it lives further down the same loop) never
+    # gets a chance to fire. The result was a Colab cell frozen with NO output,
+    # indistinguishable from a crash. To make warmup PROVABLY ALIVE we (a) print
+    # an explicit announcement right before the first forward, (b) emit an
+    # immediate step-0 heartbeat (printed + on disk) before the block, (c) print
+    # a "compile finished in Ns" marker right after the first forward returns,
+    # and (d) run a stdlib-ONLY watchdog thread (NO torch/CUDA calls — pure
+    # time.sleep + print) that prints "still compiling… Ns" every
+    # COMPILE_WATCHDOG_SECS until the first forward returns. The watchdog is a
+    # daemon, never raises, and is cleanly joined after the first forward.
+    "COMPILE_WATCHDOG_ENABLED": True,   # the still-compiling… ticker (default ON)
+    "COMPILE_WATCHDOG_SECS":    30,     # ticker cadence during the compile block
 
     # Curriculum
     "PHASE":                  0,

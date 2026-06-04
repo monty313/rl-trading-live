@@ -197,7 +197,16 @@ _WIDGET_SPECS: Dict[str, Dict[str, Any]] = {
     "USE_AMP":          {"kind": "checkbox", "default": True, "group": "gpu",
                          "label": "Mixed precision (AMP, CUDA only)"},
     "USE_TORCH_COMPILE": {"kind": "checkbox", "default": True, "group": "gpu",
-                          "label": "torch.compile model (CUDA only)"},
+                          "label": "torch.compile model (CUDA only) — "
+                                   "first step warms up ~10-15 min on A100; "
+                                   "uncheck to skip warmup (slower steady-state)"},
+    "COMPILE_WATCHDOG_ENABLED": {"kind": "checkbox", "default": True, "group": "gpu",
+                                 "label": "Compile watchdog (prints 'still "
+                                          "compiling…' during torch.compile warmup)"},
+    "HEARTBEAT_SECS":   {"kind": "int", "default": 300, "min": 10, "max": 1800,
+                         "step": 10, "group": "gpu",
+                         "label": "Heartbeat interval (s) — wall-clock liveness "
+                                  "one-liner in the rollout loop"},
     "GPU_UTIL_TARGET":  {"kind": "float", "default": 0.80, "min": 0.5, "max": 1.0,
                          "step": 0.05, "group": "gpu",
                          "label": "Target GPU utilization fraction"},

@@ -92,8 +92,27 @@ look for, and the most common failure + its one-line fix.
   - `no checkpoint found — fresh start` → normal on a brand-new run.
 - **Note:** The `--manifest` path **must live in the `gpu/` dir** (next to the
   `--checkpoint-dir` checkpoints) so `find_best_resume()` can locate them.
-- **Note:** The first ~10–15 min is `torch.compile` warmup and is slow — this is
-  normal, not a crash.
+- **Note — `torch.compile` warmup is NOW VISIBLE (not a freeze):** The first
+  rollout step compiles the model and **blocks ~10–15 min on an A100**. You used
+  to see ZERO output during this and it looked frozen. It is now provably alive —
+  the startup output appears **in this exact order**:
+  1. `[train] === PHASE phase1_cci_align ===`
+  2. `[train] 🛠  torch.compile warming up (mode=default) — first step compiles…`
+     (the announcement; only when compile is ON)
+  3. `  ⏱  heartbeat  step      0/…  0.0 steps/s  elapsed      0s  phase …  (loop entry)`
+     (an **immediate** heartbeat, printed **and** written to
+     `heartbeat_training.txt` on disk, BEFORE the blocking compile)
+  4. `  ⏳ still compiling… 30s elapsed (torch.compile warmup, phase …) — NORMAL, not a crash`
+     repeating every 30s **throughout** the block (the compile watchdog)
+  5. `[train] ✅ torch.compile finished in 612s — training is now running fast.`
+     (the compile-done marker, with how long it took)
+  6. Then the normal `DAY …` / `Episode …` lines stream as usual.
+  If you see steps 2–4 with no further output yet, that is **warmup, not a
+  crash.** **To skip warmup entirely** (faster startup, slightly slower
+  steady-state), uncheck **`USE_TORCH_COMPILE` / COMPILE_MODEL** in the Cell 7
+  ⚡ GPU panel (or set `USE_TORCH_COMPILE: false` in `core/settings.py`). The
+  heartbeat cadence and watchdog ticker are also configurable there
+  (`HEARTBEAT_SECS`, `COMPILE_WATCHDOG_ENABLED`).
 
 ### 8–10. (optional) Dashboard / Crash recovery / GPU profiling
 - **8 Dashboard:** Streamlit UI over localtunnel (ngrok fallback in the cell).

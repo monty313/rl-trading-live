@@ -121,6 +121,113 @@ def _write_heartbeat(metrics_dir: str, episode: int, phase: str, status="running
         json.dump(payload, f)
 
 
+class _CompileWatchdog:
+    """Stdlib-ONLY liveness ticker for the torch.compile warmup block
+    (compile_warmup_visibility fix, item 4).
+
+    WHY: torch.compile(mode="default") compiles LAZILY on the FIRST forward pass,
+    which runs INSIDE the rollout step loop and BLOCKS the main thread for
+    ~10-15 min on an A100. The wall-clock heartbeat lives further down that same
+    loop and therefore can NEVER fire during the block — the Colab cell looks
+    frozen. This thread updates the screen WHILE the main thread is blocked.
+
+    HARD CONSTRAINTS (so it is bulletproof and zero training-loop perf cost):
+      • Pure stdlib only — time.sleep + print. It NEVER touches torch / CUDA
+        (a second thread calling into CUDA during compile could deadlock).
+      • daemon thread (won't keep the process alive) and the run loop is wrapped
+        so it can NEVER raise into the interpreter.
+      • Cleanly stopped + joined right after the first forward returns.
+    Guarded by CFG['COMPILE_WATCHDOG_ENABLED'] (default ON); cadence
+    CFG['COMPILE_WATCHDOG_SECS'] (default 30s)."""
+
+    def __init__(self, interval_s: float, phase_name: str):
+        import threading
+        self._interval = max(0.01, float(interval_s))   # tiny floor: no busy-loop
+        self._phase = phase_name
+        self._stop = threading.Event()
+        self._t0 = time.time()
+        self._thread = threading.Thread(target=self._run, daemon=True,
+                                        name="compile-watchdog")
+
+    def _run(self):
+        # Sleep in small slices so stop() is responsive without busy-waiting,
+        # printing one "still compiling…" line every self._interval seconds.
+        try:
+            next_tick = self._interval
+            # Wake in slices no longer than the cadence so stop() stays responsive
+            # for both the default 30s and the tiny intervals used in tests.
+            slice_s = min(0.25, self._interval)
+            while not self._stop.is_set():
+                self._stop.wait(slice_s)
+                if self._stop.is_set():
+                    break
+                elapsed = time.time() - self._t0
+                if elapsed >= next_tick:
+                    print(f"  ⏳ still compiling… {elapsed:4.0f}s elapsed "
+                          f"(torch.compile warmup, phase {self._phase}) — "
+                          f"NORMAL, not a crash", flush=True)
+                    next_tick += self._interval
+        except Exception:                                  # pragma: no cover
+            pass        # a watchdog must NEVER take training down
+
+    def start(self):
+        self._thread.start()
+
+    def stop(self):
+        self._stop.set()
+        try:
+            self._thread.join(timeout=2.0)
+        except Exception:                                  # pragma: no cover
+            pass
+
+
+def _first_forward_warmup(forward_fn, *, compile_on: bool, watchdog_on: bool,
+                          watchdog_secs: float, phase_name: str, steps: int,
+                          max_steps: int, global_ep: int, metrics_dir: str):
+    """Run the VERY FIRST forward pass of the run with full warmup visibility
+    (compile_warmup_visibility fix items 1-3, plus the item-4 watchdog).
+
+    `forward_fn` is a zero-arg callable that performs the first forward (this is
+    where torch.compile actually compiles and BLOCKS for ~10-15 min on an A100).
+    We, in order:
+      1. ANNOUNCE the compile (only when compile_on) — flushed, before the block.
+      2. Emit an IMMEDIATE step-0 heartbeat: printed AND written to
+         heartbeat_training.txt on disk, BEFORE the (blocking) forward, so there
+         is a provable liveness signal the instant the rollout loop starts.
+      3. Start a stdlib-ONLY watchdog ticker (item 4) when compile_on+watchdog_on,
+         run the timed forward, stop+join the watchdog, then print the
+         "compile finished in Ns" marker.
+    Returns the forward's output. Extracted from the rollout loop so the whole
+    startup path is unit-testable with a mock slow forward (no GPU needed)."""
+    if compile_on:
+        print(
+            "[train] 🛠  torch.compile warming up (mode=default) — first step "
+            "compiles the model; expect ~10-15 min on A100 with NO further DAY "
+            "output. This is NORMAL, not a crash. Disable via the dashboard "
+            "COMPILE_MODEL / USE_TORCH_COMPILE toggle to skip warmup.",
+            flush=True)
+    # IMMEDIATE step-0 heartbeat (item 2): printed + on disk BEFORE the block.
+    print(f"  ⏱  heartbeat  step {steps:>6}/{max_steps}"
+          f"     0.0 steps/s  elapsed      0s"
+          f"  phase {phase_name}  (loop entry)", flush=True)
+    _write_heartbeat(metrics_dir, global_ep, phase_name)
+    watchdog = (_CompileWatchdog(watchdog_secs, phase_name)
+                if (compile_on and watchdog_on) else None)
+    if watchdog is not None:
+        watchdog.start()
+    t0 = time.time()
+    try:
+        out = forward_fn()                       # ← torch.compile compiles HERE
+    finally:
+        if watchdog is not None:
+            watchdog.stop()                      # always join, even on error
+    elapsed = time.time() - t0
+    if compile_on:
+        print(f"[train] ✅ torch.compile finished in {elapsed:.0f}s — "
+              f"training is now running fast.", flush=True)
+    return out
+
+
 def _aggregate_day(info: dict, closed: "torch.Tensor") -> dict:
     """
     Aggregate the FULL BATCH of episodes that closed the same calendar day on
@@ -300,6 +407,16 @@ def train(args) -> int:
     global_ep = 0
     last_hb = 0.0
     best_phi = -1e9
+    # ── COMPILE-WARMUP VISIBILITY (compile_warmup_visibility fix) ────────────
+    # torch.compile compiles LAZILY on the FIRST forward pass (inside the rollout
+    # loop), blocking the main thread ~10-15 min on an A100. `_warmup` tracks the
+    # one-time announce/heartbeat/watchdog/finished-marker sequence so it fires
+    # exactly once for the whole run (compile happens once, not per-episode).
+    # compile_on: torch.compile is actually engaged (config ON *and* CUDA).
+    compile_on = bool(cfg.get("USE_TORCH_COMPILE", True)) and device.type == "cuda"
+    watchdog_on = bool(cfg.get("COMPILE_WATCHDOG_ENABLED", True))
+    watchdog_secs = float(cfg.get("COMPILE_WATCHDOG_SECS", 30))
+    _warmup = {"done": False}                    # flips True after first forward
     # STREAK = consecutive passing DAYS across the batch (resets on a failed day).
     # Persists across episodes within a run — the user wants a running streak.
     pass_streak = 0
@@ -342,7 +459,11 @@ def train(args) -> int:
         heartbeat_secs = float(cfg.get("HEARTBEAT_SECS", 300))
         bars_per_day = int(cfg.get("BARS_PER_DAY", 1440))
         global_day = 0                     # calendar day counter across the run
-        last_heartbeat_t = time.time()
+        # IMMEDIATE FIRST HEARTBEAT (item 2): back-date the wall-clock anchor by a
+        # full interval so the very first loop iteration is already "due" — the
+        # first heartbeat fires at step 0 instead of 300s in. After that the
+        # normal cadence resumes (we reset last_heartbeat_t = now once it fires).
+        last_heartbeat_t = time.time() - heartbeat_secs
         while True:
             if not infinite and max_eps != -1 and ep_in_phase >= max_eps:
                 break
@@ -370,7 +491,22 @@ def train(args) -> int:
                 mask = env.current_direction_mask()
                 if mask[0, 0].item() == 0.0:          # gate on for ep 0 this bar
                     ep_gate_bars += 1
-                out = agent.select_actions(state, mask=mask)
+                # ── COMPILE-WARMUP VISIBILITY (items 1-4) — runs ONCE, around the
+                # very first forward pass of the whole run, where torch.compile
+                # actually compiles and BLOCKS the main thread. Delegated to
+                # _first_forward_warmup (announce + immediate heartbeat + watchdog
+                # + finished marker). Subsequent forwards take the fast path.
+                if not _warmup["done"]:
+                    out = _first_forward_warmup(
+                        lambda: agent.select_actions(state, mask=mask),
+                        compile_on=compile_on, watchdog_on=watchdog_on,
+                        watchdog_secs=watchdog_secs, phase_name=phase["name"],
+                        steps=steps, max_steps=max_steps, global_ep=global_ep,
+                        metrics_dir=args.metrics_dir or "logs")
+                    last_heartbeat_t = time.time()       # resume normal cadence
+                    _warmup["done"] = True
+                else:
+                    out = agent.select_actions(state, mask=mask)
                 next_state, reward, done, info = env.step(out)
                 agent.store(state, out, reward, done, mask)
 
