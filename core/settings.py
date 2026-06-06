@@ -519,4 +519,53 @@ CFG = {
     "RUN_SHAP":               False,
     "SHAP_BACKGROUND_SAMPLES": 256,   # background obs for GradientExplainer (200-500)
     "SHAP_EXPLAIN_SAMPLES":    200,   # obs explained per head (<=500)
+
+    # [DIST PRE-PHASE START — REMOVE AT GRADUATION]
+    # ──────────────────────────────────────────────────────────────────────────
+    # DIST PRE-PHASE config (TEMPORARY — DQN→PPO direction distillation).
+    # Master kill switch: dist_prephase_enabled=False makes the entire system
+    # a no-op (byte-for-byte identical to base repo). See core/dist_teacher/
+    # and core/dist_phase/ for implementation. Remove this block at graduation
+    # per Section 9 of the spec — grep for "DIST PRE-PHASE" to find all
+    # touched lines.
+    # ──────────────────────────────────────────────────────────────────────────
+    "dist_prephase_enabled": False,        # MASTER kill switch — off by default
+    "dist_masking_enabled":  True,         # extend existing masking; A/B testable
+
+    "dist_teacher": {
+        "checkpoint_path": "/content/drive/MyDrive/checkpoints/eurusd_gpu_ph0_ep0120.pt",
+        "gdrive_file_id": "1s1sC0OFBnbEicgEnkhAzHcw4qiJt1Kvc",
+        # action_order MUST match the order of the DQN policy head's output dim.
+        # Confirm with checkpoint probe (Section 2 of spec) before training.
+        "action_order":   ["BUY", "SELL", "HOLD"],
+        "temperature":    1.0,             # softmax temp for Q→prob conversion
+        "confidence_threshold": 0.55,      # min DQN confidence to fire bonus
+        "initial_distillation_weight": 0.30,
+    },
+
+    "dist_phase": {
+        # ── Temporary pre-phase risk window (wider while PPO learns direction) ──
+        "prephase_max_daily_dd": 0.05,     # 5% (vs normal 1%)
+        "prephase_daily_target": 0.02,     # 2% (vs normal 2.5%)
+        # ── Normal FTMO settings resume at DIST_PHASE_1 ──
+        "phase1_max_daily_dd":   0.01,     # 1% — normal FTMO
+        "phase1_daily_target":   0.025,    # 2.5% — normal target
+        # ── Graduation proof — Signal 1 thresholds (raised above noise floor) ──
+        "required_gate_days":      10,
+        "monotonic_fade":          True,
+        "gate_win_rate":           0.55,
+        "gate_profit_factor":      1.3,
+        "gate_expectancy_pips":    0.0,
+        "gate_min_trades_per_day": 3,
+        # ── Signal 2 — agreement (baseline-normalized; 0.30 == actual 65%) ──
+        "signal2_agreement_normalized_min": 0.30,
+        "signal2_rolling_window_days":      5,
+        # ── Signal 3 — solo dry run (independence proof) ──
+        "signal3_solo_days_required": 3,
+        "signal3_cooldown_days":      3,
+        # ── Where the permanent graduation record lives ──
+        "graduation_record_path":
+            "/content/drive/MyDrive/checkpoints/dist_graduation_record.json",
+    },
+    # [DIST PRE-PHASE END]
 }
