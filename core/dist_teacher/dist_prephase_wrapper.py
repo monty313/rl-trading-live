@@ -1,6 +1,9 @@
 # ═══════════════════════════════════════════════════════
 # [DIST PRE-PHASE] TEMPORARY FILE — REMOVE AT GRADUATION
 # ═══════════════════════════════════════════════════════
+# >>> FULL LIFECYCLE + REVERT INSTRUCTIONS live at the TOP of
+# >>> core/dist_phase/dist_phase_manager.py. Read THAT file first.
+#
 # Gym-style wrapper around the BatchedFTMOEnv. Adds two things:
 #   1. Three DQN probability slots appended to every observation
 #      (constant obs dimensionality across ALL dist phases — when the

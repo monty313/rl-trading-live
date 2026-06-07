@@ -1,6 +1,9 @@
 # ═══════════════════════════════════════════════════════
 # [DIST PRE-PHASE] TEMPORARY FILE — REMOVE AT GRADUATION
 # ═══════════════════════════════════════════════════════
+# >>> FULL LIFECYCLE + REVERT INSTRUCTIONS live at the TOP of
+# >>> core/dist_phase/dist_phase_manager.py. Read THAT file first.
+#
 # Frozen DQN teacher used for DIRECTION-ONLY distillation.
 #   - Loads a DQN checkpoint in eval mode with requires_grad=False.
 #   - Vectorized batch inference on GPU (matches BatchedFTMOEnv tensors).

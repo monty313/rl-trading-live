@@ -1,24 +1,155 @@
-# ═══════════════════════════════════════════════════════
-# [DIST PRE-PHASE] TEMPORARY FILE — REMOVE AT GRADUATION
-# ═══════════════════════════════════════════════════════
-# DistPhaseManager — single source of truth for distillation state.
-#   - DIST_PRE_PHASE : wider DD / lower target, full DQN signal (weight 0.30).
-#   - DIST_PHASE_1   : normal FTMO DD / target, DQN fading by gate progress.
-#   - DIST_RETIRED   : DQN out, manager freezes weight at 0.0 forever.
+# ═══════════════════════════════════════════════════════════════════════
+# [DIST PRE-PHASE] FULL LIFECYCLE — READ THIS HEADER BEFORE TOUCHING
+# ═══════════════════════════════════════════════════════════════════════
+# This file is the single source of truth for the distillation lifecycle.
+# Every other dist_* file points back to this header. If an LLM reads only
+# this comment it should know exactly what to do at every stage.
 #
-# Graduation gate (THREE signals — see Section 6 of the spec):
-#   1) PERFORMANCE  : 10 consecutive days meeting raised thresholds.
-#   2) AGREEMENT    : 5-day rolling normalized agreement >= 0.30
-#                      (i.e. raw agreement ≥ 65%; baseline = 50%).
-#   3) SOLO DRY RUN : 3 consecutive days with DQN silent, all pass S1 thresholds.
-#                      Solo days COUNT toward Signal 1's 10-day streak.
+# WHAT THIS SYSTEM DOES (in one sentence)
+# A frozen pre-trained DQN (eurusd_gpu_ph0_ep0120.pt) teaches the PPO
+# agent ONE thing — which direction to take on entry (BUY vs SELL) —
+# then retires itself once PPO proves it has learned the strategy.
 #
-# This manager runs INDEPENDENTLY of the existing strategy phase system in
-# config/phases.yaml + training/train.py. A day can pass one and fail the
-# other — that is by design (and explicitly noted in the spec).
+# THE FOUR LIFECYCLE STAGES, IN ORDER
+# ===================================
 #
-# REVERT: delete with the rest of core/dist_phase/.
-# ═══════════════════════════════════════════════════════
+# ┌── STAGE 1: SETUP ─────────────────────────────────────────────────────┐
+# │ Action:   Open dist_prephase_run_all.ipynb in Colab → Runtime →       │
+# │           Run all. No paste-in needed; cells communicate via vars.    │
+# │ Cells do: clone branch, download checkpoint if missing, probe         │
+# │           checkpoint, build env+teacher+wrapper through pipeline,     │
+# │           1-step sanity check, launch training/train.py.              │
+# │ Kill switch: ENABLE_DIST=False in Cell 2 → runs base repo unchanged.  │
+# └───────────────────────────────────────────────────────────────────────┘
+#                                ↓
+# ┌── STAGE 2: DIST_PRE_PHASE (DQN teaching, wide DD) ────────────────────┐
+# │ Settings: distillation_weight=0.30 (constant)                         │
+# │           max_daily_dd=5%  (wide — lets PPO explore safely)           │
+# │           daily_target=2%  (low bar)                                  │
+# │           DQN active: YES — real probs in obs slots                   │
+# │ Exit:     Automatic on first day-end → DIST_PHASE_1.                  │
+# │           You do not have to do anything.                             │
+# │ Logs:     '[DIST] DQN Teacher loaded' (once)                          │
+# │           per-day: dist_bonus > 0 on entry steps, 0 otherwise         │
+# │           per-day: agreement_rate climbing above 50% (baseline)       │
+# └───────────────────────────────────────────────────────────────────────┘
+#                                ↓
+# ┌── STAGE 3: DIST_PHASE_1 (DQN fading, full FTMO) ──────────────────────┐
+# │ Settings: distillation_weight = 0.30 * (1 - best_gate_days/10)        │
+# │           max_daily_dd=1%   (real FTMO rules from here)               │
+# │           daily_target=2.5%                                           │
+# │                                                                       │
+# │ Graduation gate — ALL THREE signals must pass:                        │
+# │                                                                       │
+# │   Signal 1 (Performance, evaluated every day):                        │
+# │     10 consecutive days where ALL hold:                               │
+# │       win_rate         > 0.55                                         │
+# │       profit_factor    > 1.3                                          │
+# │       expectancy_pips  > 0                                            │
+# │       trades_per_day   ≥ 3                                            │
+# │       max_daily_dd     not breached                                   │
+# │     A single failing day resets the streak to 0.                      │
+# │                                                                       │
+# │   Signal 2 (Convergence, 5-day rolling):                              │
+# │     normalized_agreement = (raw - 0.5) / 0.5  ≥ 0.30                  │
+# │     i.e. PPO agrees with DQN on ≥65% of confident entry steps         │
+# │     averaged across the last 5 days. Baseline is 50% (because         │
+# │     FLAT is masked under force_in_and_gate → BUY/SELL is a coin       │
+# │     flip even for a random policy).                                   │
+# │                                                                       │
+# │   Signal 3 (Independence, 3-day solo):                                │
+# │     After Signals 1 AND 2 are both passing the manager auto-triggers  │
+# │     a solo dry run: 3 consecutive days with DQN silent (weight=0,     │
+# │     obs slots frozen). All 3 days must independently pass the         │
+# │     Signal 1 criteria. ANY failure aborts the solo run AND resets     │
+# │     the Signal 1 streak to 0 — you start the 10-day count from        │
+# │     scratch. Cooldown of 3 days between solo attempts.                │
+# │                                                                       │
+# │ What YOU do during Stage 3: NOTHING.                                  │
+# │   on_dist_day_end() is called automatically from the training loop.   │
+# │   The manager handles streak counting, weight fade, solo triggering,  │
+# │   and writing dist_graduation_record.json at the moment of success.   │
+# │                                                                       │
+# │ How to tell PPO has learned the strategy → look for this banner:      │
+# │   ┌───────────────────────────────────────────────────┐               │
+# │   │ [DIST] GRADUATION PROOF COMPLETE ✅                │               │
+# │   │ Signal 1: 10/10 consecutive gate days passed     │               │
+# │   │ Signal 2: XX.X% agreement (normalized: 0.YY)     │               │
+# │   │ Signal 3: Solo dry run — 3/3 days passed         │               │
+# │   │ → DQN RETIRING. Graduation record written.       │               │
+# │   └───────────────────────────────────────────────────┘               │
+# └───────────────────────────────────────────────────────────────────────┘
+#                                ↓
+# ┌── STAGE 4: GRADUATION & REMOVAL ──────────────────────────────────────┐
+# │ When: After the graduation banner.                                    │
+# │ Now:  PPO trades independently. DQN is no longer called. Its 3 obs    │
+# │       slots are frozen to the EMPIRICAL mean of probs observed during │
+# │       training (NOT uniform 0.333) — this avoids distribution shift.  │
+# │       You can keep training in this state indefinitely; the wrapper   │
+# │       is now passive aside from the 3 frozen slots. Lot sizing and    │
+# │       higher-phase features continue to improve PPO.                  │
+# │                                                                       │
+# │ To fully REMOVE the dist system (do this within a few weeks):         │
+# │   1. Confirm /content/drive/MyDrive/checkpoints/                      │
+# │      dist_graduation_record.json exists and shows                     │
+# │      'dist_graduation_complete': true. KEEP THIS FILE FOREVER — it is │
+# │      your audit trail of WHY the teacher was removed.                 │
+# │   2. core/settings.py — delete the entire block bookended by          │
+# │      '[DIST PRE-PHASE START]' / '[DIST PRE-PHASE END]'.               │
+# │   3. core/pipeline.py — delete the wrapper block bookended by         │
+# │      '[DIST PRE-PHASE START]' / '[DIST PRE-PHASE END]'.               │
+# │   4. Delete the dist files:                                           │
+# │        rm -rf core/dist_teacher/ core/dist_phase/                     │
+# │        rm -rf tests/dist/                                             │
+# │        rm    scripts/dist_checkpoint_probe.py                         │
+# │        rm    docs/dist_prephase_colab_cells.md                        │
+# │        rm    dist_prephase_run_all.ipynb                              │
+# │   5. pytest tests/   — every original test must still pass.           │
+# │   6. Verify removal is complete:                                      │
+# │        grep -r 'DIST PRE-PHASE' .   → must return empty               │
+# │        grep -r 'dist_prephase'   .  → must return empty               │
+# │   7. Commit on chore/remove-dist-prephase branch and open PR.         │
+# │                                                                       │
+# │ IMPORTANT: PPO's actor-critic was built with state_dim = base + 3     │
+# │ during DIST_*. The FIRST training run after removal must use          │
+# │ --force-fresh OR re-initialize the actor head against the smaller    │
+# │ obs dim. Existing checkpoints from the dist era can be loaded only   │
+# │ if you re-add the 3 frozen slots (essentially the wrapper) — at that │
+# │ point you haven't really removed it. Cleanest path: --force-fresh.   │
+# └───────────────────────────────────────────────────────────────────────┘
+#
+# DECISION TABLE — 'WHAT DO I DO NOW?'
+# ====================================
+#   You see                                       → Action
+#   ----------------------------------------------------------------
+#   Just cloned branch, never trained yet         → Stage 1 (Run All)
+#   Training running, '[DIST] DIST_PRE_PHASE'     → Wait. Let it run.
+#   Banner '[DIST] DIST_PHASE_1 STARTED'          → Wait. Watch streak.
+#   Logs: consecutive_gate_days climbing 0→10     → Good. Keep waiting.
+#   Banner '[DIST] SOLO DRY RUN BEGIN'            → Wait 3 days.
+#   Banner '[DIST] SOLO DRY RUN FAILED'           → Don't panic. Streak
+#                                                   resets; PPO keeps
+#                                                   training. Next attempt
+#                                                   after 3-day cooldown.
+#   Banner '[DIST] GRADUATION PROOF COMPLETE ✅'  → PPO has learned the
+#                                                   strategy. Go to Stage 4.
+#   dist_graduation_record.json written           → Save it, then remove
+#                                                   the dist code per
+#                                                   Stage 4 instructions.
+#
+# WHERE TO FIND THINGS
+# ====================
+#   Master kill switch:        core/settings.py [DIST PRE-PHASE] block
+#   Wrapper attach site:       core/pipeline.py [DIST PRE-PHASE] block
+#   Frozen DQN loader:         core/dist_teacher/dist_dqn_teacher.py
+#   Obs adapter (slice-only):  core/dist_teacher/dist_obs_adapter.py
+#   Env wrapper (obs+bonus):   core/dist_teacher/dist_prephase_wrapper.py
+#   Gate logic (THIS FILE):    core/dist_phase/dist_phase_manager.py
+#   Run-all notebook:          dist_prephase_run_all.ipynb
+#   Tests:                     tests/dist/
+#   Graduation record (proof): /content/drive/MyDrive/checkpoints/
+#                              dist_graduation_record.json
+# ═══════════════════════════════════════════════════════════════════════
 from __future__ import annotations
 
 import json

@@ -1,6 +1,9 @@
 # ═══════════════════════════════════════════════════════
 # [DIST PRE-PHASE] TEMPORARY FILE — REMOVE AT GRADUATION
 # ═══════════════════════════════════════════════════════
+# >>> FULL LIFECYCLE + REVERT INSTRUCTIONS live at the TOP of
+# >>> core/dist_phase/dist_phase_manager.py. Read THAT file first.
+#
 # Slim observation adapter that aligns the current PPO base observation
 # to the DQN teacher's input dimension. Built only when the checkpoint
 # probe (Section 2 of spec) reports a CLOSE mismatch (≤20 features).

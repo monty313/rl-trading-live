@@ -4,6 +4,10 @@
 # This package contains the DQN→PPO direction distillation
 # pre-phase machinery. It is TEMPORARY by design.
 #
+# >>> FULL LIFECYCLE + REVERT INSTRUCTIONS live at the TOP of
+# >>> core/dist_phase/dist_phase_manager.py. Read THAT file first.
+#
+#
 # WHEN TO REMOVE:
 #   Only after dist_graduation_record.json exists AND
 #   contains "dist_graduation_complete": true AND
