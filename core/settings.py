@@ -100,6 +100,19 @@ CFG = {
     "BATCH_SIZE_ENV":  64,        # parallel episodes on GPU (auto-tuned per device)
     "LOOKBACK":        20,        # bars of history in state
     "TF_FACTORS":      [1, 15, 60, 1440],   # resample factors from 1m
+    # ── Multi-TF observation toggle (Option 1 — DQN-era 2166-dim obs) ─────────────────────
+    # When True, _get_state() returns a (B, 2166) tensor matching the DQN
+    # checkpoint's exact input schema (lkbk=20 × 27 features × 4 TFs + 6 trailing).
+    # When False (default), the env uses the legacy single-TF 620-dim obs and
+    # behaves byte-for-byte as before. Enables warm-starting PPO from the DQN.
+    "MULTI_TF_OBS":    False,
+    # Path resolution: when MULTI_TF_OBS=True the env REQUIRES raw OHLCV data
+    # (cannot reconstruct legacy features from prebuilt feature matrices).
+    # If raw OHLCV is unavailable the env will fall back to single-TF with a warning.
+    # Warm-start PPO trunk from DQN: only effective with MULTI_TF_OBS=True.
+    # Copies trunk Linear layer 1 (2166→256) verbatim from the DQN; later layers
+    # diverge in shape and are re-initialized fresh.
+    "WARM_START_FROM_DQN": False,
 
     # ── FTMO / risk — RUNTIME-CONFIGURABLE RULE INPUTS ───────────────────────
     # (mirrors config/trading_policy.yaml; CLI flags --target-pct / --max-dd-pct /

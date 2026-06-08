@@ -360,14 +360,27 @@ def train(args) -> int:
     cfg = auto_tune_batch(dict(CFG), device)
 
     # [DIST PRE-PHASE START — REMOVE AT GRADUATION]
-    # Honor the DIST_PREPHASE_ENABLED env var set by dist_prephase_run_all.ipynb
-    # so the Run-All notebook can flip the kill switch without editing settings.
-    # When unset, leaves the CFG default (False) untouched — base repo behavior.
-    _dist_env = os.environ.get("DIST_PREPHASE_ENABLED")
-    if _dist_env is not None:
-        cfg["dist_prephase_enabled"] = _dist_env.strip() in ("1", "true", "True", "yes")
-        if cfg["dist_prephase_enabled"]:
+    # Honor env vars set by dist_prephase_run_all.ipynb so the Run-All notebook
+    # can flip toggles without editing settings.py.
+    def _env_bool(name: str):
+        v = os.environ.get(name)
+        return None if v is None else v.strip() in ("1", "true", "True", "yes")
+
+    _dist = _env_bool("DIST_PREPHASE_ENABLED")
+    if _dist is not None:
+        cfg["dist_prephase_enabled"] = _dist
+        if _dist:
             print("[DIST] DIST_PREPHASE_ENABLED=1 (from env) — wrapper will attach in pipeline")
+    _multitf = _env_bool("MULTI_TF_OBS")
+    if _multitf is not None:
+        cfg["MULTI_TF_OBS"] = _multitf
+        if _multitf:
+            print("[ENV] MULTI_TF_OBS=1 (from env) — PPO will see 2166-dim multi-TF obs")
+    _warm = _env_bool("WARM_START_FROM_DQN")
+    if _warm is not None:
+        cfg["WARM_START_FROM_DQN"] = _warm
+        if _warm:
+            print("[ENV] WARM_START_FROM_DQN=1 (from env) — PPO trunk will warm-start from DQN")
     # [DIST PRE-PHASE END]
 
     cfg["DATA_CSV_EURUSD"] = args.csv

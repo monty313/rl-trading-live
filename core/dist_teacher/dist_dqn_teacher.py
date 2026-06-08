@@ -253,14 +253,22 @@ class DistDQNTeacher:
             x = x.unsqueeze(0)
 
         logits = self.model(x)
-        # Some DQNs may have more than 3 outputs (e.g. include position-management
-        # actions). action_order tells us which 3 columns are BUY/SELL/HOLD; if
-        # output dim already equals 3 we just softmax the lot directly.
-        if logits.shape[-1] != 3:
-            # Best-effort: take the first three columns and warn.
+        # The predecessor DQN has a 7-way action head:
+        #   idx 0 = HOLD, idx 1–3 = BUY (3 sizes), idx 4–6 = SELL (3 sizes).
+        # PPO consumes only direction so we softmax the 7 logits then collapse
+        # to canonical 3-way [BUY, SELL, HOLD] via legacy_multitf_state's helper.
+        # If output dim is already 3 we softmax directly.
+        if logits.shape[-1] == 7:
+            probs_full = F.softmax(logits / self.temperature, dim=-1)
+            from core.env.legacy_multitf_state import collapse_dqn_7_to_3_probs
+            probs = collapse_dqn_7_to_3_probs(probs_full)
+            self.action_order = ["BUY", "SELL", "HOLD"]   # already canonical post-collapse
+        elif logits.shape[-1] == 3:
+            probs = F.softmax(logits / self.temperature, dim=-1)
+        else:
+            # Best-effort fallback: take first 3 columns.
             logits = logits[..., :3]
-
-        probs = F.softmax(logits / self.temperature, dim=-1)
+            probs = F.softmax(logits / self.temperature, dim=-1)
 
         # Reorder columns to canonical [BUY, SELL, HOLD] if needed.
         canonical = ["BUY", "SELL", "HOLD"]

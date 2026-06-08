@@ -451,11 +451,46 @@ class BatchedFTMOEnv:
         self._start_lo_frac = 0.0
         self._start_hi_frac = 1.0
 
-        # state_dim = lookback window (lkbk*F) + v1 position/account features
-        # (N_POSITION_FEATS) + v2 target/risk-aware features (N_FTMO_FEATS, item 1)
-        # + v3 session/context features (N_SESSION_FEATS, Section 6).
-        self.state_dim = (self.lkbk * self.F + N_POSITION_FEATS + N_FTMO_FEATS
-                          + N_SESSION_FEATS)
+        # ── MULTI-TF OBSERVATION (Option 1 — DQN-era schema) ────────────────
+        # When cfg["MULTI_TF_OBS"] is True, route _get_state() through the
+        # legacy multi-TF provider so PPO sees [1m,15m,1h,1d] context. This is
+        # the schema the DQN checkpoint was trained on — enabling warm-start
+        # and native distillation. Falls back to single-TF if raw OHLCV is
+        # unavailable (logs a warning so the user knows).
+        self._multi_tf_obs = bool(cfg.get("MULTI_TF_OBS", False))
+        self._legacy_state_provider = None
+        if self._multi_tf_obs:
+            if self._raw_ohlcv is None:
+                print("[env] WARNING: MULTI_TF_OBS=True but no raw OHLCV available — "
+                      "falling back to single-TF obs. Pass raw (N,5) OHLCV to enable.",
+                      flush=True)
+                self._multi_tf_obs = False
+            else:
+                from core.env.legacy_multitf_state import (
+                    LegacyMultiTFStateProvider, LEGACY_STATE_DIM,
+                )
+                # Convert the stored raw OHLCV (DataFrame or ndarray) to ndarray.
+                raw = self._raw_ohlcv
+                if hasattr(raw, "values"):
+                    cols = ["open", "high", "low", "close", "volume"]
+                    raw = raw[cols].to_numpy() if all(c in raw.columns for c in cols) else raw.to_numpy()
+                self._legacy_state_provider = LegacyMultiTFStateProvider(
+                    raw_ohlcv=raw, device=device,
+                )
+                print(f"[env] MULTI_TF_OBS=True | legacy provider built | "
+                      f"state_dim={LEGACY_STATE_DIM} (DQN-era schema, 4 TFs)",
+                      flush=True)
+
+        if self._multi_tf_obs:
+            # 2166-dim: 20 × 27 × 4 + 6. FTMO/session blocks NOT appended in
+            # legacy mode — the DQN was trained without them.
+            self.state_dim = self._legacy_state_provider.state_dim
+        else:
+            # state_dim = lookback window (lkbk*F) + v1 position/account features
+            # (N_POSITION_FEATS) + v2 target/risk-aware features (N_FTMO_FEATS, item 1)
+            # + v3 session/context features (N_SESSION_FEATS, Section 6).
+            self.state_dim = (self.lkbk * self.F + N_POSITION_FEATS + N_FTMO_FEATS
+                              + N_SESSION_FEATS)
         self._alloc_episode_tensors()
         self._refresh_lot_window()
 
@@ -815,6 +850,23 @@ class BatchedFTMOEnv:
     # ── state ──────────────────────────────────────────────────────────────────
     def _get_state(self) -> torch.Tensor:
         abs_idx = self._abs_idx()
+
+        # ── LEGACY MULTI-TF PATH (Option 1 — DQN-era 2166-dim obs) ──────────────────
+        # Bypasses the single-TF feature matrix entirely. Falls through to the
+        # original single-TF path when self._multi_tf_obs is False.
+        if self._multi_tf_obs and self._legacy_state_provider is not None:
+            return self._legacy_state_provider.build_state(
+                abs_idx=abs_idx,
+                position=self._position,
+                entry_px=self._entry_px,
+                equity=self._equity,
+                initial_equity=self._initial_equity_t,
+                day_start_eq=self._day_start_eq,
+                day_high_eq=self._day_high_eq,
+                target_pct=self._target_pct_t,
+                max_dd_pct=self._max_dd_pct_t,
+            )
+        # ── Original single-TF path (unchanged) ─────────────────────────────────────────
         offsets = torch.arange(self.lkbk - 1, -1, -1, device=self.device)
         win_idx = (abs_idx.unsqueeze(1) - offsets.unsqueeze(0)).clamp(0, self.T - 1)
         window = self.features[win_idx]                       # (B, lkbk, F)

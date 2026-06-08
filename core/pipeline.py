@@ -257,6 +257,22 @@ def build_pipeline(cfg: dict, device: torch.device,
     cfg["STATE_DIM"] = env.state_dim
     agent = PPOAgent(env.state_dim, cfg, device)   # PURE PPO (DQN deprecated)
 
+    # ── OPTIONAL: warm-start PPO trunk from the DQN checkpoint ────────────────────
+    # Only fires when MULTI_TF_OBS=True (obs dims match the DQN's expectation)
+    # AND cfg["WARM_START_FROM_DQN"]=True. Best-effort: only layers with matching
+    # shapes are copied. Heads are always reinitialized. Logged loudly.
+    if cfg.get("WARM_START_FROM_DQN", False):
+        if not cfg.get("MULTI_TF_OBS", False):
+            print("[WARM-START] WARM_START_FROM_DQN=True ignored — requires "
+                  "MULTI_TF_OBS=True. Skipping.")
+        else:
+            from core.agent.dqn_warm_start import warm_start_ppo_from_dqn
+            warm_start_ppo_from_dqn(
+                ppo_net=agent.net,
+                dqn_checkpoint_path=cfg["dist_teacher"]["checkpoint_path"],
+                device=device,
+            )
+
     sizer = PositionSizer(cfg)
     mode = (policy or {}).get("mode", "ftmo") if policy else cfg.get("MODE", "ftmo")
     # The guard's initial_balance MUST match the env's initial_equity so its fixed
