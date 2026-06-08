@@ -358,6 +358,18 @@ def train(args) -> int:
               flush=True)
     device = get_device()
     cfg = auto_tune_batch(dict(CFG), device)
+
+    # [DIST PRE-PHASE START — REMOVE AT GRADUATION]
+    # Honor the DIST_PREPHASE_ENABLED env var set by dist_prephase_run_all.ipynb
+    # so the Run-All notebook can flip the kill switch without editing settings.
+    # When unset, leaves the CFG default (False) untouched — base repo behavior.
+    _dist_env = os.environ.get("DIST_PREPHASE_ENABLED")
+    if _dist_env is not None:
+        cfg["dist_prephase_enabled"] = _dist_env.strip() in ("1", "true", "True", "yes")
+        if cfg["dist_prephase_enabled"]:
+            print("[DIST] DIST_PREPHASE_ENABLED=1 (from env) — wrapper will attach in pipeline")
+    # [DIST PRE-PHASE END]
+
     cfg["DATA_CSV_EURUSD"] = args.csv
     cfg["TRADE_LOG"] = os.path.join(args.metrics_dir or "logs", "daily_trade_log.csv")
     cfg["CHECKPOINT_DIR"] = args.checkpoint_dir   # default feature-cache location
