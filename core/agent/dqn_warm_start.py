@@ -105,16 +105,30 @@ def warm_start_ppo_from_dqn(
     transferred: List[str] = []
     skipped: List[str] = []
 
-    # Sanity: PPO's first Linear input dim MUST match DQN's first Linear input dim,
-    # otherwise the user forgot MULTI_TF_OBS=True and would get a silently-wrong
-    # warm-start with shape mismatches all the way down.
+    # Sanity: PPO's first Linear input must be DQN's input dim OR DQN's input
+    # dim + N_DIST_SLOTS (the distillation wrapper appends 3 DQN-prob slots to
+    # every obs). Anything else means the user forgot MULTI_TF_OBS=True and
+    # would get a silently-wrong warm-start.
+    N_DIST_SLOTS = 3   # see core/dist_teacher/dist_prephase_wrapper.py
     ppo_in = ppo_trunk_linears[0][1].in_features
     dqn_in = int(dqn_pairs[0][1].shape[1])
-    assert ppo_in == dqn_in, (
-        f"[WARM-START] PPO state_dim ({ppo_in}) != DQN input_dim ({dqn_in}). "
-        f"Set MULTI_TF_OBS=True (Option 1) so PPO observes the same 2166-dim "
-        f"schema as the DQN, then retry."
-    )
+    if ppo_in == dqn_in:
+        dist_pad = 0
+    elif ppo_in == dqn_in + N_DIST_SLOTS:
+        dist_pad = N_DIST_SLOTS
+        print(
+            f"[WARM-START] Detected dist wrapper: PPO obs has {N_DIST_SLOTS} extra "
+            f"slots ({dqn_in} DQN-era + {N_DIST_SLOTS} DQN-probability slots). "
+            f"DQN weights will be copied into the first {dqn_in} input columns; "
+            f"the {N_DIST_SLOTS} dist slots will be zero-initialized so they "
+            f"contribute nothing at step 0 (PPO learns them from scratch)."
+        )
+    else:
+        raise AssertionError(
+            f"[WARM-START] PPO state_dim ({ppo_in}) != DQN input_dim ({dqn_in}) "
+            f"and != {dqn_in}+{N_DIST_SLOTS}. Set MULTI_TF_OBS=True so PPO observes "
+            f"the same 2166-dim schema as the DQN, then retry."
+        )
 
     # Pair by ordinal position. Stop at the first shape mismatch — DQN's last
     # layer is the 7-way action head; PPO's last trunk layer is hidden→hidden.
@@ -126,6 +140,27 @@ def warm_start_ppo_from_dqn(
         dqn_prefix, W, b = dqn_pairs[i]
         ppo_W = ppo_linear.weight.data
         ppo_b = ppo_linear.bias.data if ppo_linear.bias is not None else None
+        # Special case: first PPO layer may be wider by exactly N_DIST_SLOTS so
+        # PPO can also consume the 3 DQN-prob features appended by the dist
+        # wrapper. Copy DQN weights into the first dqn_in columns, zero-init
+        # the trailing dist slots.
+        if (
+            i == 0
+            and dist_pad > 0
+            and W.shape[0] == ppo_W.shape[0]
+            and ppo_W.shape[1] == W.shape[1] + dist_pad
+        ):
+            with torch.no_grad():
+                W_dev = W.to(ppo_W.device, dtype=ppo_W.dtype)
+                ppo_W[:, : W.shape[1]].copy_(W_dev)
+                ppo_W[:, W.shape[1] :].zero_()    # dist slots: neutral start
+                if b is not None and ppo_b is not None and b.shape == ppo_b.shape:
+                    ppo_b.copy_(b.to(ppo_b.device, dtype=ppo_b.dtype))
+            transferred.append(
+                f"{ppo_name} <- {dqn_prefix} shape={tuple(W.shape)} "
+                f"(+{dist_pad} dist slots zero-initialized)"
+            )
+            continue
         if W.shape != ppo_W.shape:
             skipped.append(
                 f"{ppo_name} <- {dqn_prefix} (shape mismatch: DQN {tuple(W.shape)} vs PPO {tuple(ppo_W.shape)})"

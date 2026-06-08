@@ -79,6 +79,36 @@ def test_warm_start_handles_missing_checkpoint():
         warm_start_ppo_from_dqn(ppo, "/nonexistent/path.pt", device="cpu")
 
 
+def test_warm_start_handles_dist_wrapper_pad(dqn_ckpt):
+    """When PPO is 3 wider than the DQN (dist wrapper appends 3 slots), copy
+    the DQN weights into the first dqn_in columns and zero the trailing 3."""
+    ckpt_path, dqn = dqn_ckpt
+    ppo = _TinyPPO(state_dim=2166 + 3)   # dist wrapper adds 3 obs slots
+    report = warm_start_ppo_from_dqn(ppo, ckpt_path, device="cpu")
+
+    # First 2166 columns must match DQN weights exactly
+    assert torch.equal(
+        ppo.trunk[0].weight.data[:, :2166],
+        dqn.net[0].weight.data,
+    )
+    # Trailing 3 columns must be exactly zero
+    assert torch.equal(
+        ppo.trunk[0].weight.data[:, 2166:],
+        torch.zeros_like(ppo.trunk[0].weight.data[:, 2166:]),
+    )
+    # Bias still transfers verbatim (no input-dim dependency)
+    assert torch.equal(ppo.trunk[0].bias.data, dqn.net[0].bias.data)
+    assert "dist slots zero-initialized" in report["transferred"]
+
+
+def test_warm_start_rejects_unknown_pad(dqn_ckpt):
+    """Anything other than 0 or exactly 3 extra slots is a configuration error."""
+    ckpt_path, _dqn = dqn_ckpt
+    ppo = _TinyPPO(state_dim=2166 + 5)   # 5 is not a valid pad
+    with pytest.raises(AssertionError, match="MULTI_TF_OBS=True"):
+        warm_start_ppo_from_dqn(ppo, ckpt_path, device="cpu")
+
+
 def test_warm_start_does_not_touch_dqn_action_head(dqn_ckpt):
     """The DQN's 7-way head should never bleed into PPO heads."""
     ckpt_path, _dqn = dqn_ckpt
