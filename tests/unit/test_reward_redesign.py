@@ -335,9 +335,14 @@ def test_speed_bonus_arms_on_fast_green_position():
 # SECTION 8 — LOT CURRICULUM WINDOW
 # ════════════════════════════════════════════════════════════════════════════
 def test_lot_curriculum_window_narrows_early_phase():
+    # phase1_cci_align was widened to [0.01, 1.00] so PPO has headroom to hit
+    # the $250 daily target. The intent of this test — 'early phases narrow vs
+    # the full [0.01, 2.00] head' — still holds (hi is half the full ceiling).
     env = _env(phase={"name": "phase1_cci_align",
                       "entry_conditions": {"buy": "any", "sell": "any"}})
-    assert (env._lot_lo, env._lot_hi) == (0.10, 0.50)   # early -> narrow
+    assert (env._lot_lo, env._lot_hi) == (0.01, 1.00)
+    # Still narrower than the full head: hi < env.max_lot.
+    assert env._lot_hi < env.max_lot
 
 
 def test_lot_curriculum_disabled_uses_full_head():

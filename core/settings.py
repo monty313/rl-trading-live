@@ -455,8 +455,14 @@ CFG = {
     "BEAST_MAX_LOT":      2.0,    # normal-mode cap is configurable; beast lifts narrowing
     "LOT_CURRICULUM": {
         "_default":            [0.10, 0.50],   # narrow default (learn direction first)
-        "phase1_cci_align":    [0.10, 0.50],
-        "phase0_cci_extreme":  [0.10, 0.75],
+        # Early CCI phases widened so PPO can actually hit the $250 daily target.
+        # With phase1's old [0.10, 0.50] window, the ceiling was 0.5 lot = $5/pip,
+        # requiring ~50 net pips/day to pass — structurally hard on a 50% win
+        # rate. Floor lowered to 0.01 so PPO can size DOWN on uncertain bars
+        # instead of being forced to bet at least 0.10 every entry. Ceiling
+        # raised to 1.00 (= $10/pip) so a strong setup can produce real PnL.
+        "phase1_cci_align":    [0.01, 1.00],
+        "phase0_cci_extreme":  [0.01, 1.00],
         "phase2":              [0.10, 1.00],
         "phase3":              [0.10, 1.25],
         "phase4":              [0.10, 1.50],
