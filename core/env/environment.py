@@ -57,7 +57,8 @@ import torch
 import pandas as pd
 
 from core.agent.action_space import (DIRECTION_DIM, EXIT_DIM, FLAT, BUY, SELL,
-                                     HOLD, EXIT_REDUCE, EXIT_CLOSE, map_lot)
+                                     HOLD, EXIT_HOLD, EXIT_REDUCE, EXIT_CLOSE,
+                                     map_lot)
 from core.env.indicators import (build_feature_matrix, NUM_FEATURES, COL,
                                  feature_row_dict, compute_indicators,
                                  resample_ohlcv)
@@ -650,6 +651,17 @@ class BatchedFTMOEnv:
         self._entry_bar = torch.zeros(B, dtype=torch.long, device=d)
         self._speed_pending = torch.zeros(B, device=d)
         self._speed_armed = torch.zeros(B, dtype=torch.bool, device=d)
+
+        # ── Per-episode diagnostic accumulators (visibility, not enforcement) ──────
+        # PPO is fully free over the exit head; we just count how it's using it so
+        # the training loop can print one line per episode (exit-action mix, avg
+        # bars in position) and we can see if the policy is converging on a useful
+        # holding pattern or still flickering.
+        self._diag_bars_in_pos = torch.zeros(B, dtype=torch.long, device=d)
+        self._diag_exit_close_fired = torch.zeros(B, dtype=torch.long, device=d)
+        self._diag_exit_reduce_fired = torch.zeros(B, dtype=torch.long, device=d)
+        self._diag_exit_hold_fired = torch.zeros(B, dtype=torch.long, device=d)
+        self._diag_total_steps = 0
         # GLOBAL day index — the calendar-day counter shared by ALL B episodes.
         # Because reset() zeroes _step_i for every episode and step() increments
         # it in lockstep, `new_day = (_step_i % bars_per_day) == 0` fires on the
@@ -1070,14 +1082,21 @@ class BatchedFTMOEnv:
             gate ON  + flat      -> {BUY, SELL}        must_enter=True
             gate ON  + in-trade  -> {FLAT, BUY, SELL}  must_enter=False
             gate OFF + flat      -> {FLAT}             must_enter=False
-            gate OFF + in-trade  -> {FLAT, BUY, SELL}  must_enter=False
+            gate OFF + in-trade  -> {FLAT}             must_enter=False
+
+        Note on the last row: gate-off + in-trade restricts the direction head
+        to FLAT only (HOLD or EXIT). PPO still closes via the exit head
+        (EXIT_CLOSE) or holds (EXIT_HOLD); only direction-flip BUY/SELL is
+        blocked so no new direction can be opened while the strategy is off.
+        (User rule: gate-off + in-trade restricts to {HOLD, EXIT}.)
         """
         B, dev = self.B, self.device
         # Column-wise allow flags (B,) for FLAT / BUY / SELL.
         on, off = gate_on, ~gate_on
         flat, intrade = is_flat, ~is_flat
         allow_flat = (on & intrade) | (off & flat) | (off & intrade)   # not (on&flat)
-        allow_buy = (on) | (off & intrade)
+        # Direction BUY/SELL only allowed when gate is ON.
+        allow_buy = on
         allow_sell = allow_buy
         mask = torch.zeros(B, DIRECTION_DIM, dtype=torch.float32, device=dev)
         mask[:, FLAT] = allow_flat.float()
@@ -1196,7 +1215,19 @@ class BatchedFTMOEnv:
         had_pos0 = self._position != 0
         price_move0 = (close - self._entry_px) * torch.sign(self._position)
         pnl_per_unit = price_move0 * self._position.abs() * 100000.0
-        do_close = had_pos0 & (exit_a == EXIT_CLOSE)
+
+        # ── DIAGNOSTICS (no enforcement) ────────────────────────────────────────────
+        # We track exit-action mix and bars-in-position purely for visibility so the
+        # training loop can print one line per episode showing how PPO is actually
+        # using the exit head. No cooldown / no suppression: PPO can exit anytime.
+        wanted_close = had_pos0 & (exit_a == EXIT_CLOSE)
+        self._diag_exit_close_fired += wanted_close.long()
+        self._diag_exit_reduce_fired += (had_pos0 & (exit_a == EXIT_REDUCE)).long()
+        self._diag_exit_hold_fired += (had_pos0 & (exit_a == EXIT_HOLD)).long()
+        self._diag_bars_in_pos += had_pos0.long()
+        self._diag_total_steps += 1
+
+        do_close = wanted_close
         do_reduce = had_pos0 & (exit_a == EXIT_REDUCE)
         # realize PnL on the closed (100%) and reduced (50%) fractions
         exit_realized = (do_close.float() * pnl_per_unit

@@ -553,7 +553,11 @@ CFG = {
         "action_order":   ["BUY", "SELL", "HOLD"],
         "temperature":    1.0,             # softmax temp for Q→prob conversion
         "confidence_threshold": 0.55,      # min DQN confidence to fire bonus
-        "initial_distillation_weight": 0.30,
+        # Higher initial weight — the first overnight run showed PPO essentially
+        # ignoring the DQN's hints (gate agreement ~50%, no learning). Bigger
+        # bonus pulls PPO toward agreement early; gate-based fade still kicks
+        # in once PPO starts passing Signal 1 days.
+        "initial_distillation_weight": 0.60,
     },
 
     "dist_phase": {

@@ -81,6 +81,7 @@ class DistPrePhaseWrapper:
         self.daily_dist_bonus = 0.0
         self.daily_entry_steps = 0
         self.daily_agreement_hits = 0
+        self.daily_hold_agreement_hits = 0
         self.daily_confidence_sum = 0.0
         self.daily_confidence_count = 0
 
@@ -126,6 +127,7 @@ class DistPrePhaseWrapper:
             self.daily_agreement_hits += int(dist_info["agreement_count"])
             self.daily_confidence_sum += float(dist_info["confidence_sum"])
             self.daily_confidence_count += int(dist_info["confidence_count"])
+        self.daily_hold_agreement_hits += int(dist_info.get("hold_agreement_count", 0))
         self.daily_dist_bonus += float(bonus.sum().item())
 
         total_reward = base_reward + bonus
@@ -196,12 +198,28 @@ class DistPrePhaseWrapper:
         prev_pos: torch.Tensor,
         pre_mask: Optional[torch.Tensor],
     ):
-        """Return (bonus_tensor, dist_diagnostics_dict)."""
+        """Return (bonus_tensor, dist_diagnostics_dict).
+
+        Bonus fires in two cases:
+
+        1) ENTRY STEP — PPO just opened or flipped to a direction that matches
+           DQN's top action. Full weight (dist_weight * top_conf).
+
+        2) HOLD STEP — PPO is currently in a position whose SIGN matches DQN's
+           top action (long while DQN says BUY, or short while DQN says SELL).
+           Scaled by HOLD_BONUS_FRACTION (default 0.25) so a long hold is still
+           cheaper per-bar than an entry, but consistent agreement compounds.
+
+        These do not double-count: each row is either an entry or a hold for
+        bonus purposes (entry takes precedence).
+        """
+        HOLD_BONUS_FRACTION = 0.25   # per-bar hold bonus vs full entry bonus
         B = base_state.shape[0]
         zero = torch.zeros(B, device=base_state.device, dtype=base_state.dtype)
         diag = {
             "entry_step_count": 0,
-            "agreement_count": 0,
+            "hold_agreement_count": 0,
+            "agreement_count": 0,           # legacy: entry-step agreement only
             "confidence_sum": 0.0,
             "confidence_count": 0,
             "entry_step_mask": torch.zeros(B, dtype=torch.bool, device=base_state.device),
@@ -214,10 +232,17 @@ class DistPrePhaseWrapper:
             return zero, diag
 
         direction = actions["direction"].to(base_state.device).long()
-        entry_mask = self._is_entry_step(direction, prev_pos.to(direction.device))
+        # Current position direction (after this bar's action would resolve in
+        # the env). For bonus purposes we use prev_pos: if PPO held a long into
+        # this bar and chose HOLD here, that's an agreement signal even though
+        # `direction == FLAT`.
+        prev_pos_on_dev = prev_pos.to(direction.device)
+        prev_dir = torch.where(prev_pos_on_dev > 0, torch.full_like(direction, BUY),
+                  torch.where(prev_pos_on_dev < 0, torch.full_like(direction, SELL),
+                              torch.full_like(direction, FLAT)))
+
+        entry_mask = self._is_entry_step(direction, prev_pos_on_dev)
         diag["entry_step_mask"] = entry_mask
-        if not bool(entry_mask.any()):
-            return zero, diag
         diag["entry_step_count"] = int(entry_mask.sum().item())
 
         # DQN inference (one pass over the full batch — vectorized).
@@ -227,38 +252,47 @@ class DistPrePhaseWrapper:
         confident = top_conf >= self.confidence_threshold
 
         # Map DQN top column → DIRECTION_DIM code (BUY/SELL/HOLD→FLAT).
-        # We only ever award bonus for BUY/SELL agreement (HOLD/FLAT is
-        # not an entry by definition).
+        # HOLD/FLAT is not a directional opinion: no bonus when DQN says HOLD.
         dqn_dir = torch.full_like(direction, FLAT)
         dqn_dir = torch.where(top_col == _DQN_BUY_COL,
                               torch.full_like(direction, BUY), dqn_dir)
         dqn_dir = torch.where(top_col == _DQN_SELL_COL,
                               torch.full_like(direction, SELL), dqn_dir)
-        agreement = (direction == dqn_dir) & (dqn_dir != FLAT)
+        dqn_has_view = dqn_dir != FLAT
 
-        # Mask-aware: never reward agreement on a masked direction.
+        # ── Entry agreement: PPO's chosen direction == DQN's top action ──
+        entry_agree = entry_mask & (direction == dqn_dir) & dqn_has_view
         if self.masking_enabled and pre_mask is not None:
-            # pre_mask shape (B, DIRECTION_DIM) — 1.0 allowed, 0.0 masked.
             allowed = pre_mask.to(direction.device).gather(
                 -1, dqn_dir.clamp(min=0).unsqueeze(-1)
             ).squeeze(-1)
-            agreement = agreement & (allowed > 0.5)
+            entry_agree = entry_agree & (allowed > 0.5)
 
-        # Diagnostics: count confident DQN signals on entry steps.
+        # ── Hold agreement: PPO's current position direction matches DQN ──
+        in_position = prev_pos_on_dev != 0
+        # Exclude entry rows so a single bar can't be both entry-agree and
+        # hold-agree (would double-pay the same decision).
+        hold_agree = in_position & (~entry_mask) & (prev_dir == dqn_dir) & dqn_has_view
+
+        # Diagnostics
         confident_entry = entry_mask & confident
-        diag["agreement_count"] = int((entry_mask & agreement & confident).sum().item())
+        diag["agreement_count"] = int((entry_agree & confident).sum().item())
+        diag["hold_agreement_count"] = int((hold_agree & confident).sum().item())
         diag["confidence_sum"] = float(
             torch.where(confident_entry, top_conf, torch.zeros_like(top_conf)).sum().item()
         )
         diag["confidence_count"] = int(confident_entry.sum().item())
 
-        # Final bonus: weight * confidence, only on confident, agreeing, entry,
-        # unmasked rows.
-        award = entry_mask & agreement & confident
-        bonus = torch.where(
-            award,
-            dist_weight * top_conf,
-            torch.zeros_like(top_conf),
+        # Bonus assembly: entry takes precedence; hold uses fractional weight.
+        entry_award = entry_agree & confident
+        hold_award = hold_agree & confident
+        bonus = (
+            torch.where(entry_award, dist_weight * top_conf, torch.zeros_like(top_conf))
+            + torch.where(
+                hold_award,
+                dist_weight * HOLD_BONUS_FRACTION * top_conf,
+                torch.zeros_like(top_conf),
+            )
         ).to(base_state.dtype)
         return bonus, diag
 
@@ -269,6 +303,7 @@ class DistPrePhaseWrapper:
             "dist_bonus_sum": float(self.daily_dist_bonus),
             "entry_step_count": int(self.daily_entry_steps),
             "agreement_count": int(self.daily_agreement_hits),
+            "hold_agreement_count": int(self.daily_hold_agreement_hits),
             "avg_dqn_confidence": (
                 self.daily_confidence_sum / max(1, self.daily_confidence_count)
             ),
@@ -276,6 +311,7 @@ class DistPrePhaseWrapper:
         self.daily_dist_bonus = 0.0
         self.daily_entry_steps = 0
         self.daily_agreement_hits = 0
+        self.daily_hold_agreement_hits = 0
         self.daily_confidence_sum = 0.0
         self.daily_confidence_count = 0
         return snapshot

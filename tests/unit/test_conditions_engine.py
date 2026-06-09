@@ -107,9 +107,12 @@ def test_force_in_and_gate_blocks_entries_when_condition_false():
     mask, must = CE.compute_action_mask(phase, rows, DEV, is_flat=True)
     assert _mask_dirs(mask) == {FLAT}
     assert must is False
-    # in a trade + gate inactive -> can hold or close, but no new entry flip
+    # in a trade + gate inactive -> HOLD or EXIT only, no new entry, no flip.
+    # User rule: gate-off + in-trade restricts to {HOLD, EXIT}. The direction
+    # mask is pinned to {FLAT} so neither BUY nor SELL can re-enter; PPO still
+    # holds via EXIT_HOLD or flattens via EXIT_CLOSE through the exit head.
     mask2, must2 = CE.compute_action_mask(phase, rows, DEV, is_flat=False)
-    assert _mask_dirs(mask2) == {FLAT, BUY, SELL} and must2 is False
+    assert _mask_dirs(mask2) == {FLAT} and must2 is False
 
 
 def test_open_gate_allows_all_when_true_hold_only_when_false():
