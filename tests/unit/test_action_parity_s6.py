@@ -121,9 +121,14 @@ def test_lot_respects_window_upper_at_raw_one():
 # 3. Curriculum WIDENS narrow->wide across phase boundaries.
 # ════════════════════════════════════════════════════════════════════════════
 def test_curriculum_widens_across_phases():
+    """Curriculum widens across the LATER strategy phases (phase2 onward).
+    phase1_cci_align is the bootstrap learning phase: it gets a wider window
+    than phase2 so PPO can actually hit the \$250 daily target while it
+    learns direction, then later phases progressively expand toward the full
+    [0.01, 2.00] window in live_improve. The monotonic-widening invariant
+    therefore applies to phase2 → phase7, not from phase1."""
     cfg = _cfg()
-    order = ["phase1_cci_align", "phase2", "phase3", "phase4", "phase5",
-             "phase6", "phase7_full_ftmo"]
+    order = ["phase2", "phase3", "phase4", "phase5", "phase6", "phase7_full_ftmo"]
     his = [resolve_lot_window(cfg, p, cfg["MAX_LOT"])[1] for p in order]
     assert his == sorted(his), f"curriculum upper bound not monotonic: {his}"
     assert his[-1] >= his[0], "final phase must be at least as wide as the first"

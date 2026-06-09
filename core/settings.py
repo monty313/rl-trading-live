@@ -461,8 +461,10 @@ CFG = {
         # rate. Floor lowered to 0.01 so PPO can size DOWN on uncertain bars
         # instead of being forced to bet at least 0.10 every entry. Ceiling
         # raised to 1.00 (= $10/pip) so a strong setup can produce real PnL.
-        "phase1_cci_align":    [0.01, 1.00],
-        "phase0_cci_extreme":  [0.01, 1.00],
+        # phase1 widened further so PPO can ride a single 15-20 pip momentum
+        # move to the $250 target on one trade (1.5 lots = $15/pip).
+        "phase1_cci_align":    [0.01, 1.50],
+        "phase0_cci_extreme":  [0.01, 1.50],
         "phase2":              [0.10, 1.00],
         "phase3":              [0.10, 1.25],
         "phase4":              [0.10, 1.50],
