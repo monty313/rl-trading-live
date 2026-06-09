@@ -120,14 +120,14 @@ def main() -> int:
             ep_total_bars += env.B
             # Day-close detection: env exposes `closed` per-step in info when
             # a calendar day rolled over. Tally passes/fails on those bars.
-            if isinstance(info, dict) and "closed" in info:
-                closed = info["closed"]
-                if closed.any():
-                    idx = closed.nonzero(as_tuple=True)[0]
+            if isinstance(info, dict) and "day_closed" in info:
+                day_closed = info["day_closed"]
+                if day_closed.any():
+                    idx = day_closed.nonzero(as_tuple=True)[0]
                     passed = info["passed"][idx].bool()
-                    failed = (~passed) if "failed" not in info else info["failed"][idx].bool()
+                    failed = (~passed)
                     eq = info["equity"][idx].float()
-                    day_start = info.get("day_start_eq", info["equity"])[idx].float()
+                    day_start = info["day_start_eq"][idx].float() if "day_start_eq" in info else eq.clone()
                     pnl = (eq - day_start).cpu().tolist()
                     ep_passes += int(passed.sum().item())
                     ep_fails += int(failed.sum().item())
