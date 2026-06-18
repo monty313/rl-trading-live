@@ -84,14 +84,20 @@ def test_live_lot_mapping_matches_training_curriculum():
 def test_live_no_longer_uses_full_head_map_lot():
     """In a NARROW curriculum phase the old full-head mapping and the correct
     curriculum mapping must DIFFER for a mid raw — proving the fix actually
-    changed behaviour (regression guard against silently reverting)."""
+    changed behaviour (regression guard against silently reverting).
+
+    NOTE: phase1_cci_align's window was widened to [0.01, 1.00] so PPO has the
+    headroom to hit the $250 daily target. We pick phase3 here — still narrower
+    than the full head ([0.10, 1.25] vs [0.01, 2.00]) — so the regression guard
+    still proves curriculum != full-head sizing.
+    """
     cfg = _cfg()
-    lo, hi = resolve_lot_window(cfg, "phase1_cci_align", cfg["MAX_LOT"])  # [0.10,0.50]
+    lo, hi = resolve_lot_window(cfg, "phase3", cfg["MAX_LOT"])  # [0.10, 1.25]
     raw = 0.5
-    old_full_head = map_lot(raw, cfg["MAX_LOT"])      # 0.01 + 0.5*(2-0.01) ~ 1.0
-    correct = map_lot_curriculum(raw, lo, hi, 1.0)    # 0.10 + 0.5*0.40 = 0.30
-    assert abs(correct - 0.30) < 1e-9
-    assert abs(old_full_head - correct) > 0.5, "fix did not change live sizing"
+    old_full_head = map_lot(raw, cfg["MAX_LOT"])      # ~1.0
+    correct = map_lot_curriculum(raw, lo, hi, 1.0)    # 0.10 + 0.5*1.15 = 0.675 → rounded to 0.67
+    assert abs(correct - 0.67) < 1e-9
+    assert abs(old_full_head - correct) > 0.25, "fix did not change live sizing"
 
 
 # ════════════════════════════════════════════════════════════════════════════
@@ -115,9 +121,14 @@ def test_lot_respects_window_upper_at_raw_one():
 # 3. Curriculum WIDENS narrow->wide across phase boundaries.
 # ════════════════════════════════════════════════════════════════════════════
 def test_curriculum_widens_across_phases():
+    """Curriculum widens across the LATER strategy phases (phase2 onward).
+    phase1_cci_align is the bootstrap learning phase: it gets a wider window
+    than phase2 so PPO can actually hit the \$250 daily target while it
+    learns direction, then later phases progressively expand toward the full
+    [0.01, 2.00] window in live_improve. The monotonic-widening invariant
+    therefore applies to phase2 → phase7, not from phase1."""
     cfg = _cfg()
-    order = ["phase1_cci_align", "phase2", "phase3", "phase4", "phase5",
-             "phase6", "phase7_full_ftmo"]
+    order = ["phase2", "phase3", "phase4", "phase5", "phase6", "phase7_full_ftmo"]
     his = [resolve_lot_window(cfg, p, cfg["MAX_LOT"])[1] for p in order]
     assert his == sorted(his), f"curriculum upper bound not monotonic: {his}"
     assert his[-1] >= his[0], "final phase must be at least as wide as the first"

@@ -102,13 +102,33 @@ class MT5Adapter(BrokerAdapter):
         return self.initialize_with_retry(self._last_config, max_attempts, base_delay)
 
     def send_order(self, order: dict) -> dict:
-        # HARD RULE 5: gate FIRST, no bypass.
-        if self.gate is not None and not self.gate.approve(order):
-            return {"status": "BLOCKED", "fill_price": None, "order_id": None,
-                    "error": "trade_gate rejected"}
+        # IRAC 2 — NO DOUBLE GATING. The runner (broker/live_runner.py) is the
+        # single authoritative gate site. The adapter assumes upstream gating
+        # by default. If a caller bypasses the runner it must either pass
+        # `already_gated=True` in the order dict OR set adapter.gate to a real
+        # TradeGate and pass `already_gated=False` (or omit) so the adapter
+        # runs the gate exactly once on that path.
+        already_gated = bool(order.get("already_gated", True))
+        if not already_gated and self.gate is not None:
+            if not self.gate.approve(order):
+                return {"status": "BLOCKED", "fill_price": None, "order_id": None,
+                        "error": "trade_gate rejected"}
         mt5 = self._ensure_mt5()
-        otype = mt5.ORDER_TYPE_BUY if order.get("direction") in ("BUY", 1) \
-            else mt5.ORDER_TYPE_SELL
+
+        # IRAC 4 — STRICT DIRECTION VALIDATION. Anything other than the explicit
+        # BUY/SELL codes is rejected before any broker call. Previously, FLAT (0),
+        # None, or unrecognized strings silently became SELL orders — a real
+        # safety risk. We accept the spec set: BUY ∈ {"BUY", 1}, SELL ∈ {"SELL", -1, 2}.
+        d = order.get("direction")
+        if d in ("BUY", 1):
+            otype = mt5.ORDER_TYPE_BUY
+        elif d in ("SELL", -1, 2):
+            otype = mt5.ORDER_TYPE_SELL
+        else:
+            return {"status": "REJECTED", "fill_price": None, "order_id": None,
+                    "filled_volume": 0.0,
+                    "requested_volume": float(order.get("lot", 0.0)),
+                    "error": f"unknown direction: {d!r}"}
         req_vol = float(order.get("lot", 0.01))
         request = {"symbol": self.symbol or order.get("symbol"),
                    "volume": req_vol, "type": otype,
@@ -151,7 +171,59 @@ class MT5Adapter(BrokerAdapter):
                 "free_margin": getattr(a, "margin_free", 0.0)}
 
     def close_position(self, ticket: int) -> dict:
-        return {"status": "CLOSED", "ticket": ticket}
+        """Close an open position by ticket.
+
+        IRAC 3 — REAL CLOSE LOGIC. Previously this was a no-op stub that returned
+        CLOSED without transmitting anything, so positions remained open while
+        the rest of the system believed they were closed. Now:
+          1. positions_get(ticket=ticket) to retrieve the open position
+          2. determine the opposing close type (SELL closes a long, BUY closes a short)
+          3. build a TRADE_ACTION_DEAL request with the position ticket, symbol,
+             volume, and current market price
+          4. order_send + return CLOSED only on TRADE_RETCODE_DONE, else REJECTED.
+        """
+        mt5 = self._ensure_mt5()
+        positions = mt5.positions_get(ticket=ticket) or []
+        if not positions:
+            return {"status": "REJECTED", "ticket": ticket,
+                    "error": f"no open position for ticket {ticket}"}
+        pos = positions[0]
+        # Direction of the CLOSING leg is opposite the open leg.
+        # MT5 conventions: POSITION_TYPE_BUY = 0 (long)  → close with SELL
+        #                  POSITION_TYPE_SELL = 1 (short) → close with BUY
+        pos_type = getattr(pos, "type", None)
+        position_type_buy = getattr(mt5, "POSITION_TYPE_BUY", 0)
+        if pos_type == position_type_buy:
+            close_type = mt5.ORDER_TYPE_SELL
+            price_attr = "bid"
+        else:
+            close_type = mt5.ORDER_TYPE_BUY
+            price_attr = "ask"
+        symbol = getattr(pos, "symbol", self.symbol)
+        volume = float(getattr(pos, "volume", 0.0))
+        # Best available market price for the closing leg.
+        tick = mt5.symbol_info_tick(symbol)
+        market_price = float(getattr(tick, price_attr, 0.0)) if tick is not None else 0.0
+        request = {
+            "action":   getattr(mt5, "TRADE_ACTION_DEAL", 1),
+            "symbol":   symbol,
+            "volume":   volume,
+            "type":     close_type,
+            "position": int(ticket),
+            "price":    market_price,
+        }
+        try:
+            result = mt5.order_send(request)
+        except Exception as exc:
+            return {"status": "DISCONNECTED", "ticket": ticket,
+                    "error": str(exc)}
+        done = getattr(mt5, "TRADE_RETCODE_DONE", 10009)
+        if getattr(result, "retcode", None) == done:
+            return {"status": "CLOSED", "ticket": ticket,
+                    "fill_price": getattr(result, "price", market_price),
+                    "filled_volume": float(getattr(result, "volume", volume))}
+        return {"status": "REJECTED", "ticket": ticket,
+                "error": f"order_send retcode={getattr(result, 'retcode', None)}"}
 
     def shutdown(self) -> None:
         if self.mt5 is not None:

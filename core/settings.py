@@ -100,6 +100,19 @@ CFG = {
     "BATCH_SIZE_ENV":  64,        # parallel episodes on GPU (auto-tuned per device)
     "LOOKBACK":        20,        # bars of history in state
     "TF_FACTORS":      [1, 15, 60, 1440],   # resample factors from 1m
+    # ── Multi-TF observation toggle (Option 1 — DQN-era 2166-dim obs) ─────────────────────
+    # When True, _get_state() returns a (B, 2166) tensor matching the DQN
+    # checkpoint's exact input schema (lkbk=20 × 27 features × 4 TFs + 6 trailing).
+    # When False (default), the env uses the legacy single-TF 620-dim obs and
+    # behaves byte-for-byte as before. Enables warm-starting PPO from the DQN.
+    "MULTI_TF_OBS":    False,
+    # Path resolution: when MULTI_TF_OBS=True the env REQUIRES raw OHLCV data
+    # (cannot reconstruct legacy features from prebuilt feature matrices).
+    # If raw OHLCV is unavailable the env will fall back to single-TF with a warning.
+    # Warm-start PPO trunk from DQN: only effective with MULTI_TF_OBS=True.
+    # Copies trunk Linear layer 1 (2166→256) verbatim from the DQN; later layers
+    # diverge in shape and are re-initialized fresh.
+    "WARM_START_FROM_DQN": False,
 
     # ── FTMO / risk — RUNTIME-CONFIGURABLE RULE INPUTS ───────────────────────
     # (mirrors config/trading_policy.yaml; CLI flags --target-pct / --max-dd-pct /
@@ -442,8 +455,16 @@ CFG = {
     "BEAST_MAX_LOT":      2.0,    # normal-mode cap is configurable; beast lifts narrowing
     "LOT_CURRICULUM": {
         "_default":            [0.10, 0.50],   # narrow default (learn direction first)
-        "phase1_cci_align":    [0.10, 0.50],
-        "phase0_cci_extreme":  [0.10, 0.75],
+        # Early CCI phases widened so PPO can actually hit the $250 daily target.
+        # With phase1's old [0.10, 0.50] window, the ceiling was 0.5 lot = $5/pip,
+        # requiring ~50 net pips/day to pass — structurally hard on a 50% win
+        # rate. Floor lowered to 0.01 so PPO can size DOWN on uncertain bars
+        # instead of being forced to bet at least 0.10 every entry. Ceiling
+        # raised to 1.00 (= $10/pip) so a strong setup can produce real PnL.
+        # phase1 widened further so PPO can ride a single 15-20 pip momentum
+        # move to the $250 target on one trade (1.5 lots = $15/pip).
+        "phase1_cci_align":    [0.01, 1.50],
+        "phase0_cci_extreme":  [0.01, 1.50],
         "phase2":              [0.10, 1.00],
         "phase3":              [0.10, 1.25],
         "phase4":              [0.10, 1.50],
@@ -519,4 +540,57 @@ CFG = {
     "RUN_SHAP":               False,
     "SHAP_BACKGROUND_SAMPLES": 256,   # background obs for GradientExplainer (200-500)
     "SHAP_EXPLAIN_SAMPLES":    200,   # obs explained per head (<=500)
+
+    # [DIST PRE-PHASE START — REMOVE AT GRADUATION]
+    # ──────────────────────────────────────────────────────────────────────────
+    # DIST PRE-PHASE config (TEMPORARY — DQN→PPO direction distillation).
+    # Master kill switch: dist_prephase_enabled=False makes the entire system
+    # a no-op (byte-for-byte identical to base repo). See core/dist_teacher/
+    # and core/dist_phase/ for implementation. Remove this block at graduation
+    # per Section 9 of the spec — grep for "DIST PRE-PHASE" to find all
+    # touched lines.
+    # ──────────────────────────────────────────────────────────────────────────
+    "dist_prephase_enabled": False,        # MASTER kill switch — off by default
+    "dist_masking_enabled":  True,         # extend existing masking; A/B testable
+
+    "dist_teacher": {
+        "checkpoint_path": "/content/drive/MyDrive/checkpoints/eurusd_gpu_ph0_ep0120.pt",
+        "gdrive_file_id": "1s1sC0OFBnbEicgEnkhAzHcw4qiJt1Kvc",
+        # action_order MUST match the order of the DQN policy head's output dim.
+        # Confirm with checkpoint probe (Section 2 of spec) before training.
+        "action_order":   ["BUY", "SELL", "HOLD"],
+        "temperature":    1.0,             # softmax temp for Q→prob conversion
+        "confidence_threshold": 0.55,      # min DQN confidence to fire bonus
+        # Higher initial weight — the first overnight run showed PPO essentially
+        # ignoring the DQN's hints (gate agreement ~50%, no learning). Bigger
+        # bonus pulls PPO toward agreement early; gate-based fade still kicks
+        # in once PPO starts passing Signal 1 days.
+        "initial_distillation_weight": 0.60,
+    },
+
+    "dist_phase": {
+        # ── Temporary pre-phase risk window (wider while PPO learns direction) ──
+        "prephase_max_daily_dd": 0.05,     # 5% (vs normal 1%)
+        "prephase_daily_target": 0.02,     # 2% (vs normal 2.5%)
+        # ── Normal FTMO settings resume at DIST_PHASE_1 ──
+        "phase1_max_daily_dd":   0.01,     # 1% — normal FTMO
+        "phase1_daily_target":   0.025,    # 2.5% — normal target
+        # ── Graduation proof — Signal 1 thresholds (raised above noise floor) ──
+        "required_gate_days":      10,
+        "monotonic_fade":          True,
+        "gate_win_rate":           0.55,
+        "gate_profit_factor":      1.3,
+        "gate_expectancy_pips":    0.0,
+        "gate_min_trades_per_day": 3,
+        # ── Signal 2 — agreement (baseline-normalized; 0.30 == actual 65%) ──
+        "signal2_agreement_normalized_min": 0.30,
+        "signal2_rolling_window_days":      5,
+        # ── Signal 3 — solo dry run (independence proof) ──
+        "signal3_solo_days_required": 3,
+        "signal3_cooldown_days":      3,
+        # ── Where the permanent graduation record lives ──
+        "graduation_record_path":
+            "/content/drive/MyDrive/checkpoints/dist_graduation_record.json",
+    },
+    # [DIST PRE-PHASE END]
 }

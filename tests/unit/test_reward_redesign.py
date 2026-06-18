@@ -34,7 +34,8 @@ from core.reward.shaper import (
 )
 from core.env.environment import (
     BatchedFTMOEnv, OBS_SCHEMA_VERSION, N_POSITION_FEATS, N_FTMO_FEATS,
-    N_SESSION_FEATS, resolve_commission, classify_symbol, session_code_for_minute,
+    N_SESSION_FEATS, N_COST_FEATS, resolve_commission, classify_symbol,
+    session_code_for_minute,
 )
 from core.agent.action_space import FLAT, BUY, EXIT_HOLD
 from core.agent.ppo import PPOAgent
@@ -256,9 +257,10 @@ def test_session_code_maps_minutes_to_sessions():
 
 def test_obs_schema_v3_and_state_dim():
     env = _env()
-    assert env.obs_schema_version == OBS_SCHEMA_VERSION == 3
+    assert env.obs_schema_version == OBS_SCHEMA_VERSION == 4
     assert env.state_dim == (env.lkbk * env.F + N_POSITION_FEATS
-                             + N_FTMO_FEATS + N_SESSION_FEATS)
+                             + N_FTMO_FEATS + N_SESSION_FEATS
+                             + N_COST_FEATS)
     s = env.reset()
     assert s.shape == (env.B, env.state_dim)
 
@@ -266,7 +268,7 @@ def test_obs_schema_v3_and_state_dim():
 def test_seven_session_features_present_and_valued():
     env = _env()
     s = env.reset()
-    sess = s[:, -N_SESSION_FEATS:]
+    sess = s[:, -(N_SESSION_FEATS + N_COST_FEATS):-N_COST_FEATS]
     assert sess.shape == (env.B, N_SESSION_FEATS)
     assert torch.isfinite(sess).all()
     # commission feature (last col) is the per-1.0-lot RT commission / day_start_eq,
@@ -335,9 +337,14 @@ def test_speed_bonus_arms_on_fast_green_position():
 # SECTION 8 — LOT CURRICULUM WINDOW
 # ════════════════════════════════════════════════════════════════════════════
 def test_lot_curriculum_window_narrows_early_phase():
+    # phase1_cci_align was widened to [0.01, 1.00] so PPO has headroom to hit
+    # the $250 daily target. The intent of this test — 'early phases narrow vs
+    # the full [0.01, 2.00] head' — still holds (hi is half the full ceiling).
     env = _env(phase={"name": "phase1_cci_align",
                       "entry_conditions": {"buy": "any", "sell": "any"}})
-    assert (env._lot_lo, env._lot_hi) == (0.10, 0.50)   # early -> narrow
+    assert (env._lot_lo, env._lot_hi) == (0.01, 1.50)
+    # Still narrower than the full head: hi < env.max_lot.
+    assert env._lot_hi < env.max_lot
 
 
 def test_lot_curriculum_disabled_uses_full_head():

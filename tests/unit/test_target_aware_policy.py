@@ -23,7 +23,7 @@ import torch
 from core.settings import CFG, auto_tune_batch
 from core.env.environment import (BatchedFTMOEnv, OBS_SCHEMA_VERSION,
                                    N_POSITION_FEATS, N_FTMO_FEATS,
-                                   N_SESSION_FEATS,
+                                   N_SESSION_FEATS, N_COST_FEATS,
                                    proportional_lot_scale)
 from core.agent.ppo import PPOAgent, ActorCritic
 from core.agent.action_space import FLAT
@@ -64,17 +64,19 @@ def test_state_dim_includes_ftmo_feats():
     # lkbk*F + N_POSITION_FEATS + N_FTMO_FEATS + N_SESSION_FEATS (v3 schema adds
     # the session/streak/commission block AFTER the FTMO block).
     assert env.state_dim == (env.lkbk * env.F + N_POSITION_FEATS
-                             + N_FTMO_FEATS + N_SESSION_FEATS)
+                             + N_FTMO_FEATS + N_SESSION_FEATS
+                             + N_COST_FEATS)
     s = env.reset()
     assert s.shape == (env.B, env.state_dim)
 
 
 def _ftmo_slice(env, state):
     """The target/risk-aware FTMO features in the documented order: target, maxdd,
-    difficulty, progress, dd_headroom, day_remaining, account_log. v3 appends the
-    N_SESSION_FEATS block AFTER the FTMO block, so the FTMO columns are the slice
-    ending just before the trailing session block."""
-    return state[:, -(N_FTMO_FEATS + N_SESSION_FEATS):-N_SESSION_FEATS]
+    difficulty, progress, dd_headroom, day_remaining, account_log. v4 schema:
+    state ends with [... FTMO, SESSION, COST]. Slice the FTMO chunk by stepping
+    back from the END by (FTMO + SESSION + COST) and forward by (SESSION + COST)."""
+    tail = N_SESSION_FEATS + N_COST_FEATS
+    return state[:, -(N_FTMO_FEATS + tail):-tail]
 
 
 def test_obs_target_and_maxdd_features_present():
@@ -220,9 +222,9 @@ def test_state_dim_matches_actorcritic_input_dim():
     assert out["direction"].shape == (env.B,)
 
 
-def test_obs_schema_version_is_v3():
+def test_obs_schema_version_is_v4():
     env = _env()
-    assert env.obs_schema_version == OBS_SCHEMA_VERSION == 3
+    assert env.obs_schema_version == OBS_SCHEMA_VERSION == 4
 
 
 # ════════════════════════════════════════════════════════════════════════════

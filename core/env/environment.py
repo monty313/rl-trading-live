@@ -57,7 +57,8 @@ import torch
 import pandas as pd
 
 from core.agent.action_space import (DIRECTION_DIM, EXIT_DIM, FLAT, BUY, SELL,
-                                     HOLD, EXIT_REDUCE, EXIT_CLOSE, map_lot)
+                                     HOLD, EXIT_HOLD, EXIT_REDUCE, EXIT_CLOSE,
+                                     map_lot)
 from core.env.indicators import (build_feature_matrix, NUM_FEATURES, COL,
                                  feature_row_dict, compute_indicators,
                                  resample_ohlcv)
@@ -79,15 +80,21 @@ _NEG_INF = -1e9
 # input layer no longer matches the current state_dim is detected by
 # PPOAgent.load(), which reinitializes JUST the input layer (loud log) instead of
 # silently mis-loading — the existing partial-reinit-on-resume path is reused.
-OBS_SCHEMA_VERSION = 3
+OBS_SCHEMA_VERSION = 4
 
 # Number of features in each appended block (kept in sync with the blocks built in
-# _get_state(); state_dim = lkbk*F + N_POSITION_FEATS + N_FTMO_FEATS + N_SESSION_FEATS).
+# _get_state(); state_dim = lkbk*F + N_POSITION_FEATS + N_FTMO_FEATS
+#                          + N_SESSION_FEATS + N_COST_FEATS).
 N_POSITION_FEATS = 6     # position, unrealised, eq_chg, gap, dd_head, daily_ret (v1)
 N_FTMO_FEATS = 7         # target_pct, max_dd_pct, difficulty, progress, dd_headroom,
                          # frac_day_remaining, account_size_log (v2, item 1)
 N_SESSION_FEATS = 7      # cest_tod, progress_to_target, remaining_time, session_code,
                          # dd_budget_remaining, signed_streak, commission_cost (v3, S6)
+N_COST_FEATS = 3         # cost_basis_pct, net_unrealized_pct, dist_to_breakeven_pct (v4)
+                         # — gives PPO ECONOMIC MEMORY: it can SEE how much each
+                         # trade cost to open and exactly how far from breakeven
+                         # the position is, so churning many small flips becomes
+                         # visibly negative-EV instead of feeling free.
 
 # ── FTMO SESSION CLOCK (Section 6) ───────────────────────────────────────────
 # FTMO's trading day runs on CEST (Europe/Berlin). Our 1m bars carry no real
@@ -451,11 +458,47 @@ class BatchedFTMOEnv:
         self._start_lo_frac = 0.0
         self._start_hi_frac = 1.0
 
-        # state_dim = lookback window (lkbk*F) + v1 position/account features
-        # (N_POSITION_FEATS) + v2 target/risk-aware features (N_FTMO_FEATS, item 1)
-        # + v3 session/context features (N_SESSION_FEATS, Section 6).
-        self.state_dim = (self.lkbk * self.F + N_POSITION_FEATS + N_FTMO_FEATS
-                          + N_SESSION_FEATS)
+        # ── MULTI-TF OBSERVATION (Option 1 — DQN-era schema) ────────────────
+        # When cfg["MULTI_TF_OBS"] is True, route _get_state() through the
+        # legacy multi-TF provider so PPO sees [1m,15m,1h,1d] context. This is
+        # the schema the DQN checkpoint was trained on — enabling warm-start
+        # and native distillation. Falls back to single-TF if raw OHLCV is
+        # unavailable (logs a warning so the user knows).
+        self._multi_tf_obs = bool(cfg.get("MULTI_TF_OBS", False))
+        self._legacy_state_provider = None
+        if self._multi_tf_obs:
+            if self._raw_ohlcv is None:
+                print("[env] WARNING: MULTI_TF_OBS=True but no raw OHLCV available — "
+                      "falling back to single-TF obs. Pass raw (N,5) OHLCV to enable.",
+                      flush=True)
+                self._multi_tf_obs = False
+            else:
+                from core.env.legacy_multitf_state import (
+                    LegacyMultiTFStateProvider, LEGACY_STATE_DIM,
+                )
+                # Convert the stored raw OHLCV (DataFrame or ndarray) to ndarray.
+                raw = self._raw_ohlcv
+                if hasattr(raw, "values"):
+                    cols = ["open", "high", "low", "close", "volume"]
+                    raw = raw[cols].to_numpy() if all(c in raw.columns for c in cols) else raw.to_numpy()
+                self._legacy_state_provider = LegacyMultiTFStateProvider(
+                    raw_ohlcv=raw, device=device,
+                )
+                print(f"[env] MULTI_TF_OBS=True | legacy provider built | "
+                      f"state_dim={LEGACY_STATE_DIM} (DQN-era schema, 4 TFs)",
+                      flush=True)
+
+        if self._multi_tf_obs:
+            # 2166-dim: 20 × 27 × 4 + 6. FTMO/session blocks NOT appended in
+            # legacy mode — the DQN was trained without them.
+            self.state_dim = self._legacy_state_provider.state_dim
+        else:
+            # state_dim = lookback window (lkbk*F) + v1 position/account features
+            # (N_POSITION_FEATS) + v2 target/risk-aware features (N_FTMO_FEATS, item 1)
+            # + v3 session/context features (N_SESSION_FEATS, Section 6)
+            # + v4 cost-basis features (N_COST_FEATS).
+            self.state_dim = (self.lkbk * self.F + N_POSITION_FEATS + N_FTMO_FEATS
+                              + N_SESSION_FEATS + N_COST_FEATS)
         self._alloc_episode_tensors()
         self._refresh_lot_window()
 
@@ -568,6 +611,11 @@ class BatchedFTMOEnv:
         self._half_target_pct_t = self._derive_half_target_t(self._target_pct_t)
         self._position = torch.zeros(B, device=d)       # +lots buy / -lots sell / 0
         self._entry_px = torch.zeros(B, device=d)
+        # COST BASIS (v4 obs schema): $ commission paid to OPEN the current
+        # position (round-trip rate × lots). Resets to 0 on flat. Used both as
+        # an observation feature and to compute net unrealized after costs, so
+        # PPO knows exactly how far underwater it is on transaction cost alone.
+        self._pos_cost_basis = torch.zeros(B, device=d)
         self._dd_breached = torch.zeros(B, dtype=torch.bool, device=d)
         self._trades_today = torch.zeros(B, dtype=torch.long, device=d)
         # Per-day WIN / LOSS trade counters. A trade is counted the moment its PnL
@@ -615,6 +663,17 @@ class BatchedFTMOEnv:
         self._entry_bar = torch.zeros(B, dtype=torch.long, device=d)
         self._speed_pending = torch.zeros(B, device=d)
         self._speed_armed = torch.zeros(B, dtype=torch.bool, device=d)
+
+        # ── Per-episode diagnostic accumulators (visibility, not enforcement) ──────
+        # PPO is fully free over the exit head; we just count how it's using it so
+        # the training loop can print one line per episode (exit-action mix, avg
+        # bars in position) and we can see if the policy is converging on a useful
+        # holding pattern or still flickering.
+        self._diag_bars_in_pos = torch.zeros(B, dtype=torch.long, device=d)
+        self._diag_exit_close_fired = torch.zeros(B, dtype=torch.long, device=d)
+        self._diag_exit_reduce_fired = torch.zeros(B, dtype=torch.long, device=d)
+        self._diag_exit_hold_fired = torch.zeros(B, dtype=torch.long, device=d)
+        self._diag_total_steps = 0
         # GLOBAL day index — the calendar-day counter shared by ALL B episodes.
         # Because reset() zeroes _step_i for every episode and step() increments
         # it in lockstep, `new_day = (_step_i % bars_per_day) == 0` fires on the
@@ -745,6 +804,7 @@ class BatchedFTMOEnv:
         self._day_high_eq.fill_(self.initial_equity)
         self._position.zero_()
         self._entry_px.zero_()
+        self._pos_cost_basis.zero_()   # v4 obs schema: cost-basis tracker resets too
         self._dd_breached.zero_()
         self._trades_today.zero_()
         self._wins_today.zero_()
@@ -815,6 +875,23 @@ class BatchedFTMOEnv:
     # ── state ──────────────────────────────────────────────────────────────────
     def _get_state(self) -> torch.Tensor:
         abs_idx = self._abs_idx()
+
+        # ── LEGACY MULTI-TF PATH (Option 1 — DQN-era 2166-dim obs) ──────────────────
+        # Bypasses the single-TF feature matrix entirely. Falls through to the
+        # original single-TF path when self._multi_tf_obs is False.
+        if self._multi_tf_obs and self._legacy_state_provider is not None:
+            return self._legacy_state_provider.build_state(
+                abs_idx=abs_idx,
+                position=self._position,
+                entry_px=self._entry_px,
+                equity=self._equity,
+                initial_equity=self._initial_equity_t,
+                day_start_eq=self._day_start_eq,
+                day_high_eq=self._day_high_eq,
+                target_pct=self._target_pct_t,
+                max_dd_pct=self._max_dd_pct_t,
+            )
+        # ── Original single-TF path (unchanged) ─────────────────────────────────────────
         offsets = torch.arange(self.lkbk - 1, -1, -1, device=self.device)
         win_idx = (abs_idx.unsqueeze(1) - offsets.unsqueeze(0)).clamp(0, self.T - 1)
         window = self.features[win_idx]                       # (B, lkbk, F)
@@ -919,7 +996,31 @@ class BatchedFTMOEnv:
         s_comm = ref_comm / (self._day_start_eq + 1e-8)
         session_feat = torch.stack([s_tod, s_progress, s_remaining, s_session,
                                     s_dd_budget, s_streak, s_comm], dim=1)
-        return torch.cat([norm, pos_feat, ftmo_feat, session_feat], dim=1)
+
+        # ── (v4) COST-BASIS FEATURES — give PPO economic memory ──
+        # cost_basis_pct      : $ commission paid to open / day-start equity.
+        #                       (0 when flat; ~5e-4 per 1.0 lot on EURUSD.)
+        # net_unrealized_pct  : unrealized PnL minus cost basis, in % of
+        #                       day-start equity. Negative the moment a trade
+        #                       opens (basis paid, price hasn't moved yet);
+        #                       crosses zero when the trade has covered its costs.
+        # dist_to_breakeven   : how far in % of day-start equity the position
+        #                       still needs to gain to be net positive. Zero when
+        #                       already net positive (or when flat).
+        day_start_safe = self._day_start_eq + 1e-8
+        s_cost_basis = self._pos_cost_basis / day_start_safe
+        # Convert PnL to dollars. (close - entry) * position carries the side
+        # via sign(position); * 100000 turns price-diff into $ on 1.0 lot.
+        # Same scale as price_move0 / pnl_per_unit elsewhere in the env.
+        unreal_dollars = (close - self._entry_px) * self._position * 100000.0
+        net_unreal_dollars = torch.where(self._position != 0,
+                                         unreal_dollars - self._pos_cost_basis,
+                                         torch.zeros_like(unreal_dollars))
+        s_net_unreal = net_unreal_dollars / day_start_safe
+        s_to_breakeven = (-net_unreal_dollars).clamp(min=0.0) / day_start_safe
+        cost_feat = torch.stack([s_cost_basis, s_net_unreal, s_to_breakeven], dim=1)
+
+        return torch.cat([norm, pos_feat, ftmo_feat, session_feat, cost_feat], dim=1)
 
     # ── Section 8 lot curriculum mapping (head [0,1] -> [lot_lo, lot_hi]) ─────
     def _map_lot_curriculum(self, lot_raw: torch.Tensor) -> torch.Tensor:
@@ -1018,14 +1119,21 @@ class BatchedFTMOEnv:
             gate ON  + flat      -> {BUY, SELL}        must_enter=True
             gate ON  + in-trade  -> {FLAT, BUY, SELL}  must_enter=False
             gate OFF + flat      -> {FLAT}             must_enter=False
-            gate OFF + in-trade  -> {FLAT, BUY, SELL}  must_enter=False
+            gate OFF + in-trade  -> {FLAT}             must_enter=False
+
+        Note on the last row: gate-off + in-trade restricts the direction head
+        to FLAT only (HOLD or EXIT). PPO still closes via the exit head
+        (EXIT_CLOSE) or holds (EXIT_HOLD); only direction-flip BUY/SELL is
+        blocked so no new direction can be opened while the strategy is off.
+        (User rule: gate-off + in-trade restricts to {HOLD, EXIT}.)
         """
         B, dev = self.B, self.device
         # Column-wise allow flags (B,) for FLAT / BUY / SELL.
         on, off = gate_on, ~gate_on
         flat, intrade = is_flat, ~is_flat
         allow_flat = (on & intrade) | (off & flat) | (off & intrade)   # not (on&flat)
-        allow_buy = (on) | (off & intrade)
+        # Direction BUY/SELL only allowed when gate is ON.
+        allow_buy = on
         allow_sell = allow_buy
         mask = torch.zeros(B, DIRECTION_DIM, dtype=torch.float32, device=dev)
         mask[:, FLAT] = allow_flat.float()
@@ -1144,7 +1252,19 @@ class BatchedFTMOEnv:
         had_pos0 = self._position != 0
         price_move0 = (close - self._entry_px) * torch.sign(self._position)
         pnl_per_unit = price_move0 * self._position.abs() * 100000.0
-        do_close = had_pos0 & (exit_a == EXIT_CLOSE)
+
+        # ── DIAGNOSTICS (no enforcement) ────────────────────────────────────────────
+        # We track exit-action mix and bars-in-position purely for visibility so the
+        # training loop can print one line per episode showing how PPO is actually
+        # using the exit head. No cooldown / no suppression: PPO can exit anytime.
+        wanted_close = had_pos0 & (exit_a == EXIT_CLOSE)
+        self._diag_exit_close_fired += wanted_close.long()
+        self._diag_exit_reduce_fired += (had_pos0 & (exit_a == EXIT_REDUCE)).long()
+        self._diag_exit_hold_fired += (had_pos0 & (exit_a == EXIT_HOLD)).long()
+        self._diag_bars_in_pos += had_pos0.long()
+        self._diag_total_steps += 1
+
+        do_close = wanted_close
         do_reduce = had_pos0 & (exit_a == EXIT_REDUCE)
         # realize PnL on the closed (100%) and reduced (50%) fractions
         exit_realized = (do_close.float() * pnl_per_unit
@@ -1181,6 +1301,16 @@ class BatchedFTMOEnv:
         self._position = torch.where(do_close, torch.zeros_like(self._position),
                                      self._position)
         self._position = torch.where(do_reduce, self._position * 0.5, self._position)
+        # COST BASIS (v4): once a position is fully closed, zero its basis so
+        # the next open computes a fresh round-trip cost. Halved on partial
+        # reduce so the remaining lot proportion still owns its proportional
+        # share of the original commission — PPO sees breakeven shift correctly.
+        self._pos_cost_basis = torch.where(do_close,
+                                           torch.zeros_like(self._pos_cost_basis),
+                                           self._pos_cost_basis)
+        self._pos_cost_basis = torch.where(do_reduce,
+                                           self._pos_cost_basis * 0.5,
+                                           self._pos_cost_basis)
 
         # Realize PnL on existing position when direction flips (new entry).
         had_pos = self._position != 0
@@ -1235,6 +1365,12 @@ class BatchedFTMOEnv:
                                   torch.zeros_like(self._position))
         open_comm = self._commission_for_lots(opened_lots, close, side="open")
         self._balance = self._balance - open_comm
+        # COST BASIS (v4): stash the FULL round-trip commission PPO must overcome
+        # to be net-positive on this trade (open + future close). This is what
+        # the obs feature exposes so PPO sees "my trade is underwater by exactly
+        # the spread until price moves to cover it." Resets to 0 when closed below.
+        rt_open_comm = self._commission_for_lots(opened_lots, close, side="round_trip")
+        self._pos_cost_basis = torch.where(opening, rt_open_comm, self._pos_cost_basis)
         self._entry_bar = torch.where(opening, self._step_i, self._entry_bar)
         self._speed_armed = torch.where(opening, torch.zeros_like(self._speed_armed),
                                         self._speed_armed)
@@ -1621,7 +1757,15 @@ class BatchedFTMOEnv:
         if bool(rw.get("intraday_wipeout", True)):
             from_high = ((intraday_high_closing - equity_now)
                          / (day_start_closing + 1e-8)).clamp(min=0.0)
-            wipe = is_fail & day_closed
+            # Only fire the wipeout when the day actually CROSSED above target
+            # at some point and then gave it back. Below-target days should NOT
+            # punish PPO for letting a momentum runner breathe — the old policy
+            # made "close immediately after small profit" the safest move, which
+            # kills runners and forces the bot to over-trade for tiny edges.
+            # (User-requested change: only protect ALREADY-WON days.)
+            target_eq = day_start_closing * (1.0 + self._target_pct_t)
+            crossed_target = intraday_high_closing >= target_eq
+            wipe = is_fail & day_closed & crossed_target
             giveback = giveback + wipe.float() * (
                 -progress_reward_closing
                 - float(rw.get("giveback_from_high_scale", 1.0)) * from_high)

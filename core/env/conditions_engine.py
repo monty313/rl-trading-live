@@ -312,12 +312,12 @@ def compute_action_mask(phase: dict, rows_by_tf: Dict[int, dict], device: torch.
             #
             #   Gate OFF + already in a trade
             #       → strategy ended but position is still open.
-            #         Agent manages it however it wants — hold, add, or exit.
-            #         The agent decides when to close, not the gate.
-            if is_flat:
-                return _dir_mask({FLAT}, device), False
-            else:
-                return _dir_mask({FLAT, BUY, SELL}, device), False
+            #         HOLD or EXIT only — no flips. Direction head is pinned
+            #         to FLAT so neither BUY nor SELL can re-enter; PPO still
+            #         decides when to close via the exit head (EXIT_CLOSE)
+            #         or to hold until SL/TP fires (EXIT_HOLD).
+            #         (User rule: gate-off + in-trade restricts to {HOLD, EXIT}.)
+            return _dir_mask({FLAT}, device), False
 
         if mtype == "open_gate":
             # Same rules as force_in_and_gate (see above).
@@ -326,10 +326,9 @@ def compute_action_mask(phase: dict, rows_by_tf: Dict[int, dict], device: torch.
                     return _dir_mask({BUY, SELL}, device), True
                 else:
                     return _dir_mask({FLAT, BUY, SELL}, device), False
-            if is_flat:
-                return _dir_mask({FLAT}, device), False
-            else:
-                return _dir_mask({FLAT, BUY, SELL}, device), False
+            # Gate OFF: FLAT only whether or not we hold a position; exit head
+            # still controls whether to actually close (user rule, see above).
+            return _dir_mask({FLAT}, device), False
 
         return allow_all, False
 

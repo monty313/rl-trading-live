@@ -27,7 +27,7 @@ from collections import deque
 
 import torch
 
-from core.agent.action_space import map_lot_curriculum, FLAT
+from core.agent.action_space import map_lot_curriculum, FLAT, BUY, SELL
 from core.env.intrabar_fills import compute_fill
 
 log = logging.getLogger("live_runner")
@@ -88,6 +88,10 @@ class LiveRunner:
         # S9 DUPLICATE-ORDER PREVENTION: remember the last bar key we acted on so a
         # re-processed/duplicated bar can never fire a second identical order.
         self._last_order_key = None
+        # IRAC 1: track the most recent non-flat direction PPO chose so that when
+        # the gate is active and the bot is flat (but PPO sampled FLAT), we can
+        # default to PPO's last expressed bias rather than picking BUY arbitrarily.
+        self._last_nonflat_direction = BUY
         log.info("LiveRunner init: instrument=%s phase=%s mode=%s",
                  instrument, phase_name, "LIVE" if self.live else "DRY-RUN")
 
@@ -110,8 +114,26 @@ class LiveRunner:
         return f"{ts}|{direction}|{round(float(lot), 2)}"
 
     def step_bar(self, obs: torch.Tensor, bar: dict, max_lot: float = 2.0,
-                 atr_14: float = None, mask=None) -> dict:
-        """Process one closed M1 bar. Returns the order result dict."""
+                 atr_14: float = None, mask=None,
+                 gate_is_active: bool = False,
+                 position_is_open: bool = False) -> dict:
+        """Process one closed M1 bar. Returns the order result dict.
+
+        Args:
+            gate_is_active: True when the strategy gate is firing on this bar.
+            position_is_open: True when the account already holds an open
+                position for this instrument.
+
+        IRAC 1 — GATE-DRIVEN ENTRY ENFORCEMENT:
+          When the gate is active AND no position is open AND PPO sampled FLAT,
+          we override FLAT to PPO's most recent non-flat direction so the bot
+          actually enters one trade. PPO retains full lot-size control via the
+          lot_raw head — we only override direction, never lot. We do NOT force
+          a new entry on every gated bar; only when flat-and-needs-to-be-in.
+          When a position is already open, PPO's chosen action (including FLAT,
+          which here means 'hold / let the position run') is respected fully.
+          When the gate is inactive and PPO is flat, we stay flat.
+        """
         # S9 EMERGENCY KILL-SWITCH: absolute first gate — nothing is computed/sent.
         if self._killed:
             self._heartbeat()
@@ -120,9 +142,23 @@ class LiveRunner:
 
         direction, lot_raw, exit_act = self.agent.select_action(
             obs, deterministic=True, mask=mask)
+
+        # IRAC 1: gate-driven entry. Override FLAT → last non-flat direction ONLY
+        # when the gate is active AND the bot has no open position. Lot still comes
+        # from PPO's lot_raw via map_lot_curriculum below.
+        if direction == FLAT and gate_is_active and not position_is_open:
+            log.info("IRAC 1: gate active + flat + no position — forcing entry "
+                     "(last non-flat direction=%s)", self._last_nonflat_direction)
+            direction = self._last_nonflat_direction
+
+        # Remember the most recent non-flat direction PPO actually chose, for next bar.
+        if direction in (BUY, SELL):
+            self._last_nonflat_direction = direction
+
         if direction == FLAT:
             self._heartbeat()
-            return {"status": "FLAT", "direction": direction, "exit": exit_act}
+            return {"status": "FLAT", "direction": direction, "exit": exit_act,
+                    "gate_active": gate_is_active, "position_open": position_is_open}
 
         # S6 ZERO-DRIFT: identical lot mapping to training/eval. Resolve the active
         # phase's curriculum window and apply the item-6 proportional scaler (1.0 at

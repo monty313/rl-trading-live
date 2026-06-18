@@ -21,10 +21,15 @@ def test_symbol_alias_resolves():
 
 
 def test_send_order_calls_gate_and_blocks(tmp_path):
+    # IRAC 2: the adapter does NOT gate by default — the runner is the single
+    # authoritative gate site. Callers that bypass the runner opt into adapter
+    # gating by passing `already_gated=False` (or omitting the key in a fresh
+    # order dict where it defaults). Here we simulate a non-runner caller that
+    # asks the adapter to gate, against a halted DailyGuard → BLOCKED.
     g = DailyGuard("ftmo", 100000, dict(CFG)); g.force_halt()
     gate = TradeGate(g, log_path=str(tmp_path / "log.csv"))
     a = MT5Adapter(trade_gate=gate, mt5_module=MockMT5())
-    res = a.send_order(ORDER)
+    res = a.send_order({**ORDER, "already_gated": False})
     assert res["status"] == "BLOCKED"
     rows = list(csv.reader(open(tmp_path / "log.csv")))
     assert any("BLOCKED" in r for r in rows)

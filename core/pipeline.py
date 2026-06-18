@@ -207,8 +207,71 @@ def build_pipeline(cfg: dict, device: torch.device,
                          instrument=cfg.get("SYMBOL", "EURUSD"),
                          phase=phase, policy=policy)
 
+    # [DIST PRE-PHASE START — REMOVE AT GRADUATION]
+    # If the kill switch is on, wrap the env with the distillation wrapper.
+    # Everything downstream (PPOAgent, training loop) sees the wrapped
+    # state_dim (= base + 3 DQN slots). When the switch is off, this whole
+    # block is a no-op and pipeline behaves identically to base repo.
+    if cfg.get("dist_prephase_enabled", False):
+        from core.dist_teacher import DistDQNTeacher, DistPrePhaseWrapper
+        from core.dist_teacher.dist_obs_adapter import build_adapter_if_needed
+        from core.dist_phase import DistPhaseManager, DistPhase
+
+        print("[DIST] dist_prephase_enabled=True — wrapping env")
+        dist_mgr = DistPhaseManager(cfg, start_phase=DistPhase.PRE_PHASE)
+
+        # Probe-then-build pattern: load teacher with NO adapter first so we can
+        # read its detected input_dim, then decide whether to slice.
+        _probe_teacher = DistDQNTeacher(
+            checkpoint_path=cfg["dist_teacher"]["checkpoint_path"],
+            device=device,
+            action_order=cfg["dist_teacher"]["action_order"],
+            obs_adapter=None,
+            temperature=cfg["dist_teacher"]["temperature"],
+            gdrive_file_id=cfg["dist_teacher"].get("gdrive_file_id"),
+        )
+        dqn_in = int(_probe_teacher.input_dim or env.state_dim)
+        adapter = build_adapter_if_needed(env.state_dim, dqn_in)
+        dist_mgr.record_adapter_info(
+            used=adapter is not None,
+            dqn_input_dim=dqn_in,
+            ppo_obs_dim=env.state_dim,
+        )
+        # Re-bind the adapter onto the teacher we already loaded (zero re-load).
+        _probe_teacher.obs_adapter = adapter
+
+        env = DistPrePhaseWrapper(
+            env,
+            teacher=_probe_teacher,
+            dist_phase_manager=dist_mgr,
+            confidence_threshold=cfg["dist_teacher"]["confidence_threshold"],
+            masking_enabled=cfg.get("dist_masking_enabled", True),
+        )
+        # Expose the manager so the training loop can call on_dist_day_end().
+        cfg["_dist_phase_manager"] = dist_mgr
+        print(f"[DIST] env wrapped | state_dim={env.state_dim} "
+              f"(base={env.base_state_dim} + 3 DQN slots) "
+              f"| adapter={'YES' if adapter else 'NONE'}")
+    # [DIST PRE-PHASE END]
+
     cfg["STATE_DIM"] = env.state_dim
     agent = PPOAgent(env.state_dim, cfg, device)   # PURE PPO (DQN deprecated)
+
+    # ── OPTIONAL: warm-start PPO trunk from the DQN checkpoint ────────────────────
+    # Only fires when MULTI_TF_OBS=True (obs dims match the DQN's expectation)
+    # AND cfg["WARM_START_FROM_DQN"]=True. Best-effort: only layers with matching
+    # shapes are copied. Heads are always reinitialized. Logged loudly.
+    if cfg.get("WARM_START_FROM_DQN", False):
+        if not cfg.get("MULTI_TF_OBS", False):
+            print("[WARM-START] WARM_START_FROM_DQN=True ignored — requires "
+                  "MULTI_TF_OBS=True. Skipping.")
+        else:
+            from core.agent.dqn_warm_start import warm_start_ppo_from_dqn
+            warm_start_ppo_from_dqn(
+                ppo_net=agent.net,
+                dqn_checkpoint_path=cfg["dist_teacher"]["checkpoint_path"],
+                device=device,
+            )
 
     sizer = PositionSizer(cfg)
     mode = (policy or {}).get("mode", "ftmo") if policy else cfg.get("MODE", "ftmo")
